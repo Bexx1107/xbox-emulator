@@ -80,7 +80,7 @@ fn external_root_signature_binds_a_stripped_mesh_shader() {
     let Err(error) = translate(&ex) else {
         panic!("translation unexpectedly accepted the missing root descriptor");
     };
-    assert!(error.contains("base s16 is not a buffer descriptor"), "{error}");
+    assert!(error.contains("missing root signature for base s16 (root s16)"), "{error}");
 
     let body = [
         2u32, 1, 24, 0, 0, 0,
