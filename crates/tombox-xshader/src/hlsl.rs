@@ -355,6 +355,7 @@ struct Emitter<'a> {
     uav_uint: BTreeSet<u32>,
     /// The shader uses wave intrinsics (needs shader model 6: DXC only).
     uses_wave: bool,
+    wave64: bool,
     msel: HashMap<usize, MSel>,
     /// Buffer ops (MUBUF, s_buffer_load) whose descriptor register holds one of several
     /// descriptors: (register key, candidates as (descriptor id, resource)).
@@ -929,6 +930,7 @@ fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_for
         other => return Err(format!("stage {other:?} not supported yet")),
     };
     let mut insns = disassemble(&ex.isa);
+    let wave64 = mesh::wave_size(&insns) == 64;
     lower_wave_scans(&mut insns)?;
     lower_wave_reductions(&mut insns)?;
     lower_lane_spills(&mut insns)?;
@@ -968,6 +970,7 @@ fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_for
         multi_sets: Vec::new(),
         uav_uint: BTreeSet::new(),
         uses_wave: false,
+        wave64,
         msel: HashMap::new(),
         bsel: HashMap::new(),
         dsel_loads: HashMap::new(),
@@ -3310,7 +3313,8 @@ impl<'a> Emitter<'a> {
                             let src = match id {
                                 2 => {
                                     self.uses_wave = true;
-                                    "(scc | (tb_hw2 & 0x18u) | (WaveActiveAnyTrue((exec_lo & 1u) != 0u) ? 0u : 0x200u) | (WaveActiveAnyTrue((vcc_lo & 1u) != 0u) ? 0u : 0x400u) | 0x10000u)".to_string()
+                                    let (ez, vz) = (self.guest_any("(exec_lo & 1u) != 0u"), self.guest_any("(vcc_lo & 1u) != 0u"));
+                                    format!("(scc | (tb_hw2 & 0x18u) | ({ez} ? 0u : 0x200u) | ({vz} ? 0u : 0x400u) | 0x10000u)")
                                 }
                                 29 => {
                                     self.line("tb_hw29 = (tb_hw29 + 4u) & 0xfffffu;");
@@ -3828,6 +3832,24 @@ impl<'a> Emitter<'a> {
         Self::cmp_expr_mod(&format!("v_cmp_{base}"), &s[0], &s[1], mods, opsel)
     }
 
+    fn guest_lane(&self, lane: &str) -> String {
+        if self.wave64 {
+            format!("(({lane}) & 31u)")
+        } else {
+            format!("((WaveGetLaneIndex() & ~31u) | (({lane}) & 31u))")
+        }
+    }
+
+    fn guest_any(&mut self, cond: &str) -> String {
+        if self.wave64 {
+            return format!("WaveActiveAnyTrue({cond})");
+        }
+        let t = self.tmp;
+        self.tmp += 1;
+        self.line(&format!("uint4 t{t}b = WaveActiveBallot({cond}); uint t{t}h = WaveGetLaneIndex() >> 5;"));
+        format!("((t{t}h == 0u ? t{t}b.x : t{t}h == 1u ? t{t}b.y : t{t}h == 2u ? t{t}b.z : t{t}b.w) != 0u)")
+    }
+
     fn emit_dpp(&mut self, ins: &Insn) -> Result<(), String> {
         let code = match ins.src.first() {
             Some(Opnd::Raw(c)) => *c,
@@ -3857,7 +3879,8 @@ impl<'a> Emitter<'a> {
                 c => return Err(format!("{m}: DPP control {c:#x} is not valid on RDNA2")),
             };
             let (row_mask, bank_mask) = ((ext >> 28) & 15, (ext >> 24) & 15);
-            let write = format!("((({row_mask:#x}u >> ({l} >> 4)) & 1u) != 0u && (({bank_mask:#x}u >> (({l} >> 2) & 3u)) & 1u) != 0u)");
+            let row = if self.wave64 { format!("({l} >> 4)") } else { format!("(({l} >> 4) & 1u)") };
+            let write = format!("((({row_mask:#x}u >> {row}) & 1u) != 0u && (({bank_mask:#x}u >> (({l} >> 2) & 3u)) & 1u) != 0u)");
             (sl, inb, (ext >> 18) & 1 != 0, (ext >> 19) & 1 != 0, write, (ext >> 20) & 15)
         } else {
             (format!("(({l} & ~7u) | (({:#x}u >> (({l} & 7u) * 3u)) & 7u))", ext >> 8), "true".to_string(), code == 234, true, "true".to_string(), 0)
@@ -3911,7 +3934,9 @@ impl<'a> Emitter<'a> {
         }
         if ins.op == OP_WAVE_REDUCE && ins.enc == Enc::Vop3 {
             // See `lower_wave_reductions`. Every invocation computes the same value; lanes
-            // that were inactive contribute the identity.
+            if !self.wave64 {
+                return Err(format!("{m}: whole-wave reduction in a wave32 program"));
+            }
             self.uses_wave = true;
             let (f, kind) = m.strip_prefix("tb_wave_").and_then(wave_reduce_op).ok_or_else(|| format!("bad wave op {m}"))?;
             let cast = ["", "asfloat", "asint"][kind as usize];
@@ -3924,6 +3949,9 @@ impl<'a> Emitter<'a> {
             return self.ws(&d, &e);
         }
         if ins.op == OP_WAVE_SCAN && ins.enc == Enc::Vop3 {
+            if !self.wave64 {
+                return Err(format!("{m}: whole-wave scan in a wave32 program"));
+            }
             self.uses_wave = true;
             let (f, kind) = m.strip_prefix("tb_scan_").and_then(wave_scan_op).ok_or_else(|| format!("bad scan op {m}"))?;
             let x = r(&s[0])?;
@@ -3951,12 +3979,12 @@ impl<'a> Emitter<'a> {
                     Opnd::Vgpr(124) | Opnd::Null => return Ok(()),
                     other => return Err(format!("v_readlane: destination {other:?} unsupported")),
                 };
-                self.line(&format!("uint t{t} = WaveReadLaneAt({}, ({lane}) & 31u);", r(&s[0])?));
+                self.line(&format!("uint t{t} = WaveReadLaneAt({}, {});", r(&s[0])?, self.guest_lane(&lane)));
                 return self.ws(&sd, &format!("t{t}"));
             }
             self.touch(&d);
             let dn = name(&d)?;
-            self.line(&format!("uint t{t} = {}; if (WaveGetLaneIndex() == (({lane}) & 31u)) {dn} = t{t};", r(&s[0])?));
+            self.line(&format!("uint t{t} = {}; if (WaveGetLaneIndex() == {}) {dn} = t{t};", r(&s[0])?, self.guest_lane(&lane)));
             return Ok(());
         }
         if matches!(m.as_str(), "v_permlane16_b32" | "v_permlanex16_b32") {
