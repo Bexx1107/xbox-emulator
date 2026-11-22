@@ -64,7 +64,7 @@ struct State {
     qring: VecDeque<String>,
     cring: VecDeque<(u64, usize, String)>,
     draws: HashMap<u64, VecDeque<DrawSnap>>,
-    logged: HashMap<u64, usize>,
+    logged: HashMap<(u64, usize), usize>,
 }
 
 static ST: Mutex<Option<State>> = Mutex::new(None);
@@ -200,11 +200,14 @@ pub fn draw(list: usize, text: &str, params: &[(usize, u32, u32, u32)], mask: u6
         while q.len() > KEEP_DRAWS {
             q.pop_front();
         }
-        let n = s.logged.entry(ps).or_default();
+        let n = s.logged.entry((ps, pso)).or_default();
         *n += 1;
-        *n <= LOG_DRAWS
+        (*n <= LOG_DRAWS, *n == 1)
     });
-    if log {
+    if log.1 {
+        record("d3d12_xs", "hang_cap", &format!("pso {pso:#x} ps={ps:016x} desc {}", crate::device_wrap::pso_desc_text(pso).unwrap_or_else(|| "not in the PSO registry".into())));
+    }
+    if log.0 {
         record("d3d12_xs", "hang_cap", &snap_text(&d, true));
     }
 }
@@ -391,6 +394,22 @@ pub fn dump_on_removal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pso_desc_text_reads_the_graphics_desc_fields() {
+        let mut d = vec![0u8; 0x290];
+        d[0x240..0x244].copy_from_slice(&1u32.to_le_bytes());
+        d[0x244..0x248].copy_from_slice(&26u32.to_le_bytes());
+        d[0x264..0x268].copy_from_slice(&45u32.to_le_bytes());
+        d[0x268..0x26c].copy_from_slice(&4u32.to_le_bytes());
+        d[0x1e8..0x1ec].copy_from_slice(&8u32.to_le_bytes());
+        d[0x80 + 36] = 0xf;
+        let t = crate::device_wrap::desc_text(&d);
+        assert!(t.contains("rt0(fmt=26 "), "{t}");
+        assert!(t.contains("mask=0xf)"), "{t}");
+        assert!(t.contains("dsv=45 sample=4/0"), "{t}");
+        assert!(t.contains("forced=8 "), "{t}");
+    }
 
     #[test]
     fn mode_two_only_and_default_targets() {

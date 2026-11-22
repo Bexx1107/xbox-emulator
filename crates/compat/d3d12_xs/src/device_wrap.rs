@@ -1116,6 +1116,26 @@ pub(crate) unsafe fn real_device(this: *mut c_void) -> *mut c_void {
 }
 
 /// For the diagnostic draw trace: (translated VS pointer, translated PS pointer, state text).
+pub fn pso_desc_text(pso: usize) -> Option<String> {
+    let rec = crate::frame_ev::lock(pso_registry()).get(&pso).cloned()?;
+    Some(desc_text(&rec.desc))
+}
+
+pub fn desc_text(d: &[u8]) -> String {
+    let u = |o: usize| d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    let q = |o: usize| d.get(o..o + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    let mut t = format!("vs={}B ps={}B ds={}B hs={}B gs={}B so(n={} strides={} rast={}) a2c={} indep={}", q(0x10), q(0x20), q(0x30), q(0x40), q(0x50), u(0x60), u(0x70), u(0x74), u(0x78), u(0x7c));
+    let nrt = u(0x240).min(8) as usize;
+    for i in 0..nrt.max(1) {
+        let b = 0x80 + i * 40;
+        t.push_str(&format!(" rt{i}(fmt={} blend={} logic={} src={} dst={} op={} srcA={} dstA={} opA={} lop={} mask={:#x})", u(0x244 + i * 4), u(b), u(b + 4), u(b + 8), u(b + 12), u(b + 16), u(b + 20), u(b + 24), u(b + 28), u(b + 32), d.get(b + 36).copied().unwrap_or(0)));
+    }
+    t.push_str(&format!(" samplemask={:#x} raster(fill={} cull={} ccw={} bias={} biasclamp={} slope={} clip={} msaa={} aaline={} forced={} cons={})", u(0x1c0), u(0x1c4), u(0x1c8), u(0x1cc), u(0x1d0) as i32, f32::from_bits(u(0x1d4)), f32::from_bits(u(0x1d8)), u(0x1dc), u(0x1e0), u(0x1e4), u(0x1e8), u(0x1ec)));
+    t.push_str(&format!(" ds(en={} write={} func={} st={} rm={:#x} wm={:#x} front={}/{}/{}/{} back={}/{}/{}/{})", u(0x1f0), u(0x1f4), u(0x1f8), u(0x1fc), d.get(0x200).copied().unwrap_or(0), d.get(0x201).copied().unwrap_or(0), u(0x204), u(0x208), u(0x20c), u(0x210), u(0x214), u(0x218), u(0x21c), u(0x220)));
+    t.push_str(&format!(" layout(n={}) cut={} topo={} nrt={} dsv={} sample={}/{} node={:#x} cached={} flags={:#x} len={}", u(0x230), u(0x238), u(0x23c), u(0x240), u(0x264), u(0x268), u(0x26c), u(0x270), q(0x280), u(0x288), d.len()));
+    t
+}
+
 pub fn pso_summary(pso: usize) -> Option<(usize, usize, String)> {
     let rec = crate::frame_ev::lock(pso_registry()).get(&pso).cloned()?;
     let d = &rec.desc;
