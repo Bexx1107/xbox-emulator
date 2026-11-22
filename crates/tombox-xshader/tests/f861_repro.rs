@@ -3,6 +3,8 @@
 
 #[path = "../../tools/xreplay/src/d3d.rs"]
 mod d3d;
+#[path = "support/hw_lock.rs"]
+mod hw_lock;
 
 use core::ffi::c_void;
 use d3d::{Gpu, Guid};
@@ -75,11 +77,15 @@ unsafe fn root_sig(gpu: &Gpu, cbv: bool) -> Result<*mut c_void, String> {
     Ok(rs)
 }
 
+fn rt_size() -> u32 {
+    std::env::var("TOMBOX_F861_SIZE").ok().and_then(|v| v.parse().ok()).filter(|&n: &u32| (16..=4096).contains(&n)).unwrap_or(64)
+}
+
 fn tex(fmt: u32, samples: u32, flags: u32) -> [u8; 0x38] {
     let mut t = [0u8; 0x38];
     t[0..4].copy_from_slice(&3u32.to_le_bytes());
-    t[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
-    t[0x18..0x1c].copy_from_slice(&64u32.to_le_bytes());
+    t[0x10..0x18].copy_from_slice(&(rt_size() as u64).to_le_bytes());
+    t[0x18..0x1c].copy_from_slice(&rt_size().to_le_bytes());
     t[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
     t[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
     t[0x20..0x24].copy_from_slice(&fmt.to_le_bytes());
@@ -194,6 +200,14 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
         put64(&mut d, 32, eps.len() as u64);
         put64(&mut d, 0x228, lay.as_ptr() as u64);
         d[0x278..0x288].fill(0);
+        if std::env::var_os("TOMBOX_F861_CULLNONE").is_some() {
+            d[0x1c8..0x1cc].copy_from_slice(&1u32.to_le_bytes());
+            println!("diagnostic: cull forced to NONE (desc no longer byte-exact)");
+        }
+        if std::env::var_os("TOMBOX_F861_DEPTHOFF").is_some() {
+            d[0x1f0..0x1f4].copy_from_slice(&0u32.to_le_bytes());
+            println!("diagnostic: depth test off (desc no longer byte-exact)");
+        }
         println!("exact: desc/vs/ps/layout from {dir}_* (vs {}B ps {}B stride {stride} samples {})", evs.len(), eps.len(), u32::from_le_bytes(d[0x268..0x26c].try_into().unwrap()));
         exact_keep.extend([evs, eps, lay]);
     }
@@ -232,6 +246,7 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
         rc[i] = *v;
     }
     let mut keep: Vec<*mut c_void> = Vec::new();
+    let mut indexed = false;
     if full.is_some() {
         let (sh, scpu, sg, sinc) = gpu.heap(0, 256, true)?;
         if srvrt {
@@ -321,9 +336,14 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
         }
         let heaps = [sh, mh];
         vcall!(l, 28, fn(u32, *const *mut c_void) -> (), 2, heaps.as_ptr());
-        let r0 = [0u32; 21];
+        let hexes = |k: &str, n: usize| -> Vec<u32> {
+            let mut v: Vec<u32> = std::env::var(k).ok().map(|t| t.split(|c: char| c == ',' || c == ' ').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default();
+            v.resize(n, 0);
+            v
+        };
+        let r0 = hexes("TOMBOX_F861_RC0", 21);
         vcall!(l, 36, fn(u32, u32, *const u32, u32) -> (), 0, 21, r0.as_ptr(), 0);
-        let r1 = [0u32; 16];
+        let r1 = hexes("TOMBOX_F861_RC1", 16);
         vcall!(l, 36, fn(u32, u32, *const u32, u32) -> (), 1, 16, r1.as_ptr(), 0);
         vcall!(l, 36, fn(u32, u32, *const u32, u32) -> (), 2, 5, rc.as_ptr(), 0);
         vcall!(l, 32, fn(u32, u64) -> (), 3, mg);
@@ -343,13 +363,34 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
             None => va,
         };
         if real_vs.is_some() || exact.is_some() {
-            let n = 64u32;
+            let n = 4096u32;
+            let mut shift = [0f32; 3];
+            if let Some(p) = std::env::var("TOMBOX_F861_VB").ok().filter(|_| exact.is_some() && std::env::var_os("TOMBOX_F861_DIST").is_some()) {
+                let raw = std::fs::read(&p).map_err(|e| format!("real vb {e}"))?;
+                let cnt = raw.len() / stride.max(1) as usize;
+                let f = |o: usize| f32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
+                let mut c = [0f32; 3];
+                for v in 0..cnt {
+                    for k in 0..3 {
+                        c[k] += f(v * stride as usize + k * 4) / cnt.max(1) as f32;
+                    }
+                }
+                let dist: f32 = std::env::var("TOMBOX_F861_DIST").ok().and_then(|v| v.parse().ok()).unwrap_or(30.0);
+                let fwd = [-0.53999406f32, -0.1305262, -0.8314861];
+                let cam = [914.01276f32, 18.913355, 883.2228];
+                for k in 0..3 {
+                    shift[k] = cam[k] + fwd[k] * dist - c[k];
+                }
+                println!("instance stand-in: mesh centroid {c:?} moved {dist} units in front of the captured camera (translation {shift:?})");
+            }
             let idx = gpu.buffer(n as u64 * 16, 2, d3d::GENERIC_READ, false)?;
             let mut rows = vec![0u8; n as usize * 16 * 3];
             for k in 0..n as usize {
                 for r in 0..3usize {
                     let o = (k * 3 + r) * 16 + r * 4;
                     rows[o..o + 4].copy_from_slice(&1f32.to_le_bytes());
+                    let w = (k * 3 + r) * 16 + 12;
+                    rows[w..w + 4].copy_from_slice(&shift[r].to_le_bytes());
                 }
             }
             let mat = gpu.buffer(rows.len() as u64, 2, d3d::GENERIC_READ, false)?;
@@ -391,6 +432,23 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
                     }
                 }
             }
+            if let Some(p) = std::env::var("TOMBOX_F861_VB").ok().filter(|_| exact.is_some()) {
+                vb = std::fs::read(&p).map_err(|e| format!("real vb {e}"))?;
+                println!("real vb: {} bytes ({} vertices at stride {stride})", vb.len(), vb.len() / stride.max(1) as usize);
+            }
+            if let Some(p) = std::env::var("TOMBOX_F861_IB").ok().filter(|_| exact.is_some()) {
+                let ibd = std::fs::read(&p).map_err(|e| format!("real ib {e}"))?;
+                let fmt: u32 = std::env::var("TOMBOX_F861_IBFMT").ok().and_then(|v| v.parse().ok()).unwrap_or(57);
+                let ibuf = gpu.buffer(ibd.len() as u64, 2, d3d::GENERIC_READ, false)?;
+                if !Gpu::map_write(ibuf, &ibd) {
+                    return Err("map ib".into());
+                }
+                let iv = [Gpu::gpu_va(ibuf), (ibd.len() as u64) | ((fmt as u64) << 32)];
+                vcall!(l, 43, fn(*const u64) -> (), iv.as_ptr());
+                indexed = true;
+                println!("real ib: {} bytes fmt {fmt}", ibd.len());
+                keep.push(ibuf);
+            }
             let vbuf = gpu.buffer(vb.len() as u64, 2, d3d::GENERIC_READ, false)?;
             if !Gpu::map_write(vbuf, &vb) {
                 return Err("map vb".into());
@@ -410,9 +468,10 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
         vcall!(l, 36, fn(u32, u32, *const u32, u32) -> (), 0, 5, rc.as_ptr(), 0);
         vcall!(l, if cbv { 38 } else { 40 }, fn(u32, u64) -> (), 1, va);
     }
-    let vp = [0f32, 0., 64., 64., 0., 1.];
+    let sz = rt_size();
+    let vp = [0f32, 0., sz as f32, sz as f32, 0., 1.];
     vcall!(l, 21, fn(u32, *const f32) -> (), 1, vp.as_ptr());
-    let sc = [0i32, 0, 64, 64];
+    let sc = [0i32, 0, sz as i32, sz as i32];
     vcall!(l, 22, fn(u32, *const i32) -> (), 1, sc.as_ptr());
     vcall!(l, 20, fn(u32) -> (), 4);
     let qd = [2u32, 1, 0];
@@ -422,7 +481,14 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
     if qhr >= 0 {
         vcall!(l, 52, fn(*mut c_void, u32, u32) -> (), qh, 3, 0);
     }
-    vcall!(l, 12, fn(u32, u32, u32, u32) -> (), 3, 2, 0, 0);
+    if indexed {
+        let a: Vec<i64> = std::env::var("TOMBOX_F861_ARGS").unwrap_or_else(|_| "312,2,0,0,0".into()).split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        let g = |i: usize, d: i64| a.get(i).copied().unwrap_or(d);
+        println!("DrawIndexedInstanced(idx={} inst={} startIdx={} baseVtx={} startInst={})", g(0, 312), g(1, 2), g(2, 0), g(3, 0), g(4, 0));
+        vcall!(l, 13, fn(u32, u32, u32, i32, u32) -> (), g(0, 312) as u32, g(1, 2) as u32, g(2, 0) as u32, g(3, 0) as i32, g(4, 0) as u32);
+    } else {
+        vcall!(l, 12, fn(u32, u32, u32, u32) -> (), 3, 2, 0, 0);
+    }
     if qhr >= 0 {
         vcall!(l, 53, fn(*mut c_void, u32, u32) -> (), qh, 3, 0);
         vcall!(l, 54, fn(*mut c_void, u32, u32, u32, *mut c_void, u64) -> (), qh, 3, 0, 1, qrb, 0);
@@ -443,6 +509,7 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
 #[test]
 #[ignore]
 fn f861_one_draw_repro() {
+    hw_lock::require_free_gpu();
     let src = std::fs::read_to_string(std::env::var("TOMBOX_F861_HLSL").expect("TOMBOX_F861_HLSL")).expect("hlsl");
     let b13 = std::fs::read(std::env::var("TOMBOX_F861_B13").expect("TOMBOX_F861_B13")).expect("b13");
     let modes: Vec<String> = std::env::var("TOMBOX_F861_MODES").unwrap_or_else(|_| "raw,cbv".into()).split(',').map(|s| s.trim().to_string()).collect();

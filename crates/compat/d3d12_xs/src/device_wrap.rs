@@ -1000,7 +1000,7 @@ unsafe extern "system" fn create_gfx_pso_sync(
                     via_ext = true;
                     h
                 }
-                None => f(real, desc.as_ptr(), riid, ppv),
+                None => crate::pso_lib::gfx(real, &desc, riid, ppv, &|d| f(real, d, riid, ppv)),
             }
         });
         if hr >= 0 && !ppv.is_null() {
@@ -1478,7 +1478,7 @@ unsafe extern "system" fn create_derived_pso_x(
                 via_ext = true;
                 h
             }
-            None => f(real, desc.as_ptr(), riid, ppv),
+            None => crate::pso_lib::gfx(real, &desc, riid, ppv, &|d| f(real, d, riid, ppv)),
         }
     };
     if hr >= 0 && !ppv.is_null() {
@@ -1587,6 +1587,7 @@ unsafe fn root_from_shaders(real: *mut c_void, desc: &[u8], stages: &[usize]) ->
             let _ = std::fs::write(std::env::temp_dir().join("tombox").join("psodump").join(format!("rts0_{key:016x}.bin")), rts);
         }
         if hr >= 0 && !rs.is_null() {
+            crate::pso_lib::note_root(rs as usize, crate::pso_lib::fnv64(&container));
             m.insert(key, rs as usize);
             return rs as usize;
         }
@@ -1663,7 +1664,7 @@ unsafe extern "system" fn create_compute_pso_sync(
     desc[16..24].copy_from_slice(&(code.len() as u64).to_le_bytes());
     let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(11)) }; // PC CreateComputePipelineState
-    let hr = unsafe { f(real, desc.as_ptr(), riid, ppv) };
+    let hr = unsafe { crate::pso_lib::compute(real, &desc, riid, ppv, &|d| f(real, d, riid, ppv)) };
     if hr == 0 && !ppv.is_null() && crate::rtcap::enabled() {
         crate::rtcap::note_compute_pso(unsafe { *ppv } as usize, code.as_ptr() as usize);
     }
@@ -2041,6 +2042,7 @@ pub(crate) fn vtable() -> *const usize {
         crate::depth_uav::hook_device(&mut v);
         crate::ecl_probe::install_device(&mut v);
         crate::cbv_raw::hook_device(&mut v);
+        crate::pso_lib::hook_device(&mut v);
         Box::leak(v.into_boxed_slice()).as_ptr() as usize
     }) as *const usize
 }
@@ -2050,6 +2052,7 @@ pub fn wrap_device(real: *mut c_void) -> *mut c_void {
     if crate::rtcap::enabled() && !real.is_null() {
         unsafe { patch_real_device(real) };
     }
+    crate::pso_lib::warm(real);
     let w = Box::new(DeviceWrapper { vtable: vtable(), real, refs: AtomicU32::new(1) });
     let p = Box::into_raw(w) as *mut c_void;
     WRAPPED.lock().unwrap_or_else(|e| e.into_inner()).push((real as usize, p as usize));

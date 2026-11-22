@@ -794,6 +794,7 @@ unsafe fn present_x_body(queue: *mut c_void, plane_count: u32, planes: *const u8
                 crate::frame_csv::present_done(st.frames, entry);
             }
             *shown = true;
+            crate::pso_lib::on_present();
         }
         Err(e) => {
             if n < 8 {

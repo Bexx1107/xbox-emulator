@@ -226,11 +226,11 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
 }
 
 pub fn hook_device(v: &mut [usize]) {
-    if v.len() <= 16 || v[16] == 0 || v[16] == create_root_signature as usize {
+    if v.len() <= 16 || v[16] == 0 || v[16] == create_root_signature as *const () as usize {
         return;
     }
     PREV_RS.store(v[16], Relaxed);
-    v[16] = create_root_signature as usize;
+    v[16] = create_root_signature as *const () as usize;
 }
 
 fn mode_tag() -> &'static str {
@@ -540,10 +540,18 @@ pub unsafe fn stream(real: *mut c_void, desc: &[u8], extra: &str, sd: *const [us
     unsafe { run(key, real, desc, None, ppv, &load, &|_| create()) }
 }
 
-fn save() -> Result<String, String> {
+fn save(exiting: bool) -> Result<String, String> {
     let Some(Some(l)) = LIB.get() else { return Err("no library".into()) };
     let blob = {
-        let _w = l.rw.write().unwrap_or_else(|e| e.into_inner());
+        let _w = if exiting {
+            match l.rw.try_write() {
+                Ok(g) => g,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Err("a PSO thread held the library at exit; keeping the last periodic save".into()),
+            }
+        } else {
+            l.rw.write().unwrap_or_else(|e| e.into_inner())
+        };
         let size: unsafe extern "system" fn(*mut c_void) -> usize = unsafe { core::mem::transmute(vslot(l.lib as *mut c_void, LIB_SIZE)) };
         let n = unsafe { size(l.lib as *mut c_void) };
         if n == 0 {
@@ -576,7 +584,7 @@ fn save_logged(why: &str) {
         return;
     }
     let stored = STORED.load(Relaxed);
-    let r = save();
+    let r = save(why == "process exit");
     SAVING.store(false, Relaxed);
     match r {
         Ok(m) => record("d3d12_xs", "pso_lib", &format!("{m} ({why}; {stored} PSOs stored this run); {}", summary())),
@@ -699,6 +707,65 @@ mod tests {
         assert_eq!(on_create_hr(ADAPTER_NOT_FOUND, true), OnCreate::RebuildEmpty);
         assert_eq!(on_create_hr(E_INVALIDARG, true), OnCreate::RebuildEmpty);
         assert_eq!(on_create_hr(E_INVALIDARG, false), OnCreate::Unavailable);
+    }
+
+    #[test]
+    #[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_pso_lib -- --ignored"]
+    fn hw_pso_lib_store_serialize_reload_and_rebuild() {
+        const IID_DEVICE: Guid = Guid { d1: 0x1898_19f1, d2: 0x1db6, d3: 0x4b57, d4: [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7] };
+        const IID_PSO: Guid = Guid { d1: 0x765a_30f3, d2: 0xf624, d3: 0x4c6f, d4: [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45] };
+        unsafe {
+            let p = crate::host_proc(b"D3D12CreateDevice ");
+            let create: extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(p);
+            let mut dev: *mut c_void = core::ptr::null_mut();
+            assert!(create(core::ptr::null_mut(), 0xb000, &IID_DEVICE, &mut dev) >= 0 && !dev.is_null());
+            let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(vslot(dev, 0));
+            let mut dev1: *mut c_void = core::ptr::null_mut();
+            assert!(qi(dev, &IID_DEVICE1, &mut dev1) >= 0);
+            let code = tombox_xshader::dxc::compile("#define RS \"UAV(u0)\"
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { o.Store(0, 5u); }
+", "cs_6_0").expect("dxc");
+            let mut desc = [0u8; CS_DESC];
+            desc[8..16].copy_from_slice(&(code.as_ptr() as u64).to_le_bytes());
+            desc[16..24].copy_from_slice(&(code.len() as u64).to_le_bytes());
+            let mk: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(vslot(dev, 11));
+            let mut pso: *mut c_void = core::ptr::null_mut();
+            assert!(mk(dev, desc.as_ptr(), &IID_PSO, &mut pso) >= 0);
+            let (hr, lib) = create_library(dev1, &[]);
+            assert!(hr >= 0 && lib != 0, "empty library hr={hr:#010x}");
+            let k = compute_key(&desc, 0, "cbraw=0").unwrap();
+            let w = wide(k);
+            let st: unsafe extern "system" fn(*mut c_void, *const u16, *mut c_void) -> i32 = core::mem::transmute(vslot(lib as *mut c_void, LIB_STORE));
+            assert!(st(lib as *mut c_void, w.as_ptr(), pso) >= 0);
+            assert!(st(lib as *mut c_void, w.as_ptr(), pso) < 0, "a second store under the same name must be refused");
+            let size: unsafe extern "system" fn(*mut c_void) -> usize = core::mem::transmute(vslot(lib as *mut c_void, LIB_SIZE));
+            let n = size(lib as *mut c_void);
+            let mut blob = vec![0u8; n];
+            let ser: unsafe extern "system" fn(*mut c_void, *mut u8, usize) -> i32 = core::mem::transmute(vslot(lib as *mut c_void, LIB_SERIALIZE));
+            assert!(ser(lib as *mut c_void, blob.as_mut_ptr(), n) >= 0);
+            let file = file_bytes("test ident", &blob);
+            let FileCheck::Blob(b) = check_file(Some(&file), "test ident") else { panic!("round trip") };
+            let (hr2, lib2) = create_library(dev1, b);
+            assert!(hr2 >= 0 && lib2 != 0, "reload hr={hr2:#010x}");
+            let ld: unsafe extern "system" fn(*mut c_void, *const u16, *const u8, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(vslot(lib2 as *mut c_void, LIB_LOAD_CS));
+            let mut got: *mut c_void = core::ptr::null_mut();
+            assert!(ld(lib2 as *mut c_void, w.as_ptr(), desc.as_ptr(), &IID_PSO, &mut got) >= 0 && !got.is_null(), "load from the reloaded library");
+            let other = wide(k ^ 1);
+            let mut none: *mut c_void = core::ptr::null_mut();
+            assert!(ld(lib2 as *mut c_void, other.as_ptr(), desc.as_ptr(), &IID_PSO, &mut none) < 0, "unknown names miss");
+            let mut junk = b.to_vec();
+            for x in junk.iter_mut().take(64) {
+                *x ^= 0x5a;
+            }
+            let (hr3, _) = create_library(dev1, &junk);
+            assert_eq!(on_create_hr(hr3, true), OnCreate::RebuildEmpty, "corrupt blob hr={hr3:#010x}");
+            for o in [got, pso, lib2 as *mut c_void, lib as *mut c_void, dev1, dev] {
+                release(o);
+            }
+        }
     }
 
     #[test]

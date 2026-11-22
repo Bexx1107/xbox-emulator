@@ -458,6 +458,10 @@ pub fn parse_src_name(name: &str) -> Option<(u64, [u8; 8])> {
     Some((hash, rt))
 }
 
+pub(crate) fn title_name_pub() -> String {
+    title_name()
+}
+
 fn title_name() -> String {
     std::env::current_exe().ok().and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned())).unwrap_or_else(|| "title".into())
 }

@@ -18,8 +18,10 @@ pub const IO: usize = 10;
 pub const IO_BG: usize = 11;
 pub const LOCK: usize = 12;
 pub const FRAME_WAIT: usize = 13;
-pub const N: usize = 14;
-pub const NAMES: [&str; N] = ["pso_sync", "pso_inline", "pso_async", "pso_bind_wait", "xlat", "dxc", "committed", "placed", "heap", "upload", "io_read", "io_read_bg", "lock_wait", "frame_wait"];
+pub const PSO_LIB_HIT: usize = 14;
+pub const PSO_LIB_MISS: usize = 15;
+pub const N: usize = 16;
+pub const NAMES: [&str; N] = ["pso_sync", "pso_inline", "pso_async", "pso_bind_wait", "xlat", "dxc", "committed", "placed", "heap", "upload", "io_read", "io_read_bg", "lock_wait", "frame_wait", "pso_lib_hit", "pso_lib_miss"];
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static CNT: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];

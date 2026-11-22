@@ -13,8 +13,8 @@
   },
   "rdna2_instructions": {
    "done": 768,
-   "total": 794,
-   "pct": 96.73
+   "total": 797,
+   "pct": 96.36
   },
   "shaders_translated": {
    "done": 105506,

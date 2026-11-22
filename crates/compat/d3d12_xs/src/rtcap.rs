@@ -626,6 +626,10 @@ pub unsafe fn on_set_targets(list: usize, n: u32, handles: *const usize, single_
         s.dsv = d;
     });
 }
+pub fn bound_vbs(list: usize) -> Vec<(u32, u64, u32, u32)> {
+    with_trace(|t| t.vbs.get(&list_key(list)).cloned().unwrap_or_default())
+}
+
 pub unsafe fn on_set_vbs(list: usize, start: u32, n: u32, views: *const u8) {
     with_trace(|t| {
         let v = t.vbs.entry(list_key(list)).or_default();

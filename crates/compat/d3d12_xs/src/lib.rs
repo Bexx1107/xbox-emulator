@@ -20,6 +20,7 @@ mod xone_queue;
 mod ecl_probe;
 mod cbv_raw;
 mod hang_cap;
+mod hang_snap;
 mod bl_alias;
 mod vs_snorm;
 mod pso_async;
@@ -44,6 +45,7 @@ mod overlay;
 mod frame_csv;
 mod frame_ev;
 mod xlat_index;
+mod pso_lib;
 mod overlay_font;
 mod overlay_sensors;
 #[cfg(test)]

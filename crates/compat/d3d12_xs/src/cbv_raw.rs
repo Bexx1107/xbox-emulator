@@ -548,13 +548,15 @@ fn check_draw(list: usize, text: &dyn Fn() -> String) {
 unsafe extern "system" fn draw_indexed_checked(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
     check_draw(this as usize, &|| format!("DrawIndexedInstanced(idx={a} inst={b} startIdx={c} baseVtx={d} startInst={e})"));
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32) = unsafe { core::mem::transmute(PREV_DRAW_IDX.load(Ordering::Relaxed)) };
-    unsafe { f(this, a, b, c, d, e) }
+    unsafe { f(this, a, b, c, d, e) };
+    unsafe { crate::hang_snap::after_draw(this as usize) }
 }
 
 unsafe extern "system" fn draw_checked(this: *mut c_void, a: u32, b: u32, c: u32, d: u32) {
     check_draw(this as usize, &|| format!("DrawInstanced(vtx={a} inst={b} startVtx={c} startInst={d})"));
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = unsafe { core::mem::transmute(PREV_DRAW.load(Ordering::Relaxed)) };
-    unsafe { f(this, a, b, c, d) }
+    unsafe { f(this, a, b, c, d) };
+    unsafe { crate::hang_snap::after_draw(this as usize) }
 }
 
 pub fn install_draw_check(xbox_vt: &[AtomicUsize]) {

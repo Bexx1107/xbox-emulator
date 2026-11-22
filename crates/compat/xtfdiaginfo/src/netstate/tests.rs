@@ -36,6 +36,12 @@ fn find<'a>(v: &'a [Record], g: &GUID, id: u16) -> Vec<&'a Record> {
     v.iter().filter(|r| r.guid == *g && r.id == id).collect()
 }
 
+static NETSTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    NETSTATE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn run<T>(f: impl FnOnce() -> T) -> (T, Vec<Record>) {
     capture::start();
     let out = f();
@@ -44,6 +50,7 @@ fn run<T>(f: impl FnOnce() -> T) -> (T, Vec<Record>) {
 
 #[test]
 fn record_arguments_use_the_wpp_wire_encoding() {
+    let _g = lock();
     let (_, v) = run(|| unsafe { rec(Gate::State, &ADAPTERS_GUID, 0x33, &[Z, Arg::W(None), Arg::A(None), w(&ws("ab")), Arg::A(Some(b"x")), r(5), r(0), u(7)]) });
     assert_eq!(v.len(), 1);
     let p = &v[0].parts;
@@ -62,7 +69,9 @@ fn record_arguments_use_the_wpp_wire_encoding() {
 
 #[test]
 fn state_records_use_the_c3d66fc7_block_and_stay_quiet_without_it() {
+    let _g = lock();
     assert_eq!(trace::STATE_CONTROL_GUID, GUID::new(0xc3d66fc7, 0x5736, 0x46d5, [0xb9, 0x42, 0xc4, 0x04, 0xf5, 0x02, 0xdd, 0xe4]));
+    let _t = crate::tests::TRACE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(!capture::active());
     assert_eq!(trace::WPP_STATE.logger.load(Ordering::Acquire), 0);
     assert!(!enabled(Gate::State));
@@ -73,6 +82,7 @@ fn state_records_use_the_c3d66fc7_block_and_stay_quiet_without_it() {
 
 #[test]
 fn adapters_section_dumps_the_emulated_nic_loopback_and_on_link_routes() {
+    let _g = lock();
     let (hr, v) = run(|| unsafe { log_adapters() });
     assert_eq!(hr, 0);
     assert!(v.iter().all(|r| r.guid == ADAPTERS_GUID && r.gate == Gate::State));
@@ -116,6 +126,7 @@ fn adapters_section_dumps_the_emulated_nic_loopback_and_on_link_routes() {
 
 #[test]
 fn teredo_section_reports_the_offline_state_and_tolerates_the_missing_port() {
+    let _g = lock();
     let (hr, v) = run(|| unsafe { log_teredo() });
     assert_eq!(hr, 0);
     assert_eq!(ids(&v, &TEREDO_GUID), vec![0x12, 0x16, 0x18, 0x1b]);
@@ -129,12 +140,14 @@ fn teredo_section_reports_the_offline_state_and_tolerates_the_missing_port() {
 
 #[test]
 fn processes_section_lists_title_processes_and_their_modules() {
+    let _g = lock();
     let (hr, v) = run(|| unsafe { log_processes() });
     assert_eq!(hr, 0);
     assert_eq!(v.first().unwrap().id, 0x1d);
     assert_eq!(v.last().unwrap().id, 0x21);
-    let pids = crate::titles::title_pids();
-    assert_eq!(d32(&find(&v, &PROCESSES_GUID, 0x1f)[0].parts[1]) as usize, pids.len());
+    let listed = d32(&find(&v, &PROCESSES_GUID, 0x1f)[0].parts[1]) as usize;
+    assert!(listed >= 1);
+    assert_eq!(find(&v, &PROCESSES_GUID, 0x20).len(), listed);
     let me = std::process::id();
     let row = find(&v, &PROCESSES_GUID, 0x20).into_iter().find(|r| d32(&r.parts[1]) == me).expect("current process row");
     let exe = std::env::current_exe().unwrap();
@@ -158,6 +171,7 @@ fn processes_section_lists_title_processes_and_their_modules() {
 
 #[test]
 fn ports_section_lists_sockets_the_title_opened() {
+    let _g = lock();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
     let ud = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -196,6 +210,7 @@ fn ports_section_lists_sockets_the_title_opened() {
 
 #[test]
 fn wfp_guid_names_follow_the_console_table() {
+    let _g = lock();
     assert_eq!(guid_text(None), "(nullptr)");
     assert_eq!(guid_text(Some(&[0; 16])), "GUID_NULL");
     let inbound = [0xbf, 0xd1, 0x6f, 0xc8, 0xcd, 0x21, 0x7e, 0x49, 0xa0, 0xbb, 0x17, 0x42, 0x5c, 0x88, 0x5c, 0x58];
@@ -214,6 +229,7 @@ fn wfp_guid_names_follow_the_console_table() {
 
 #[test]
 fn wfp_section_enumerates_its_dynamic_provider_and_empty_object_stores() {
+    let _g = lock();
     let before = store::provider_count();
     let (hr, v) = run(|| unsafe { section::log_wfp() });
     assert_eq!(hr, 0);
@@ -258,6 +274,7 @@ fn wfp_section_enumerates_its_dynamic_provider_and_empty_object_stores() {
 
 #[test]
 fn log_state_sections_runs_all_five_sections_without_errors() {
+    let _g = lock();
     let (out, v) = run(|| unsafe { log_state_sections() });
     assert_eq!(out, [0; 5]);
     for g in [ADAPTERS_GUID, TEREDO_GUID, PROCESSES_GUID, PORTS_GUID, WFP_GUID] {

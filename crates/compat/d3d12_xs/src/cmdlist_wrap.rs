@@ -34,6 +34,10 @@ const N: usize = 128;
 static XBOX_VT: [AtomicUsize; N] = [const { AtomicUsize::new(0) }; N];
 static BUILT: AtomicBool = AtomicBool::new(false);
 static mut REAL_VT_PTR: *const usize = core::ptr::null();
+pub(crate) unsafe fn real_list_slot(slot: usize) -> usize {
+    let p = unsafe { REAL_VT_PTR };
+    if p.is_null() { 0 } else { unsafe { *p.add(slot) } }
+}
 static INSERTED_HITS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) const CONSOLE_NULL_SLOT: usize = 66;
 

@@ -370,6 +370,7 @@ pub fn draw(list: usize, text: &str, params: &[(usize, u32, u32, u32)], mask: u6
     if log.0 {
         record("d3d12_xs", "hang_cap", &snap_text(&d, true));
     }
+    unsafe { crate::hang_snap::before_draw(list, ps, pso, text, &d.roots, d.seq) };
     if log.1 {
         record("d3d12_xs", "hang_cap", &format!("pso bytes at draw of ps={ps:016x}: {}", dump_pso(pso, ps)));
         let b = unsafe { crate::bindtrace::dump(list, false, &res_text) };
@@ -435,6 +436,7 @@ pub fn install_cmdlist(vt: &[AtomicUsize]) {
     vt[XBOX_SLOT_RESOURCE_BARRIER].store(resource_barrier as usize, Ordering::Relaxed);
     vt[XBOX_SLOT_COPY_RESOURCE].store(copy_resource as usize, Ordering::Relaxed);
     record("d3d12_xs", "hang_cap", "command-list SetPipelineState/ResourceBarrier/CopyResource capture installed");
+    crate::hang_snap::install_cmdlist(vt);
 }
 
 unsafe fn queue_type(queue: *mut c_void) -> u32 {
@@ -524,6 +526,7 @@ pub fn dump_on_removal() {
     if !on() {
         return;
     }
+    crate::hang_snap::dump();
     let (q, fences, draws, cmds) = with(|s| {
         let draws: Vec<DrawSnap> = s.draws.values().flat_map(|d| d.iter().cloned()).collect();
         (s.qring.iter().cloned().collect::<Vec<_>>(), s.fences.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(), draws, s.cring.iter().cloned().collect::<Vec<_>>())
