@@ -752,6 +752,8 @@ elease`, the log shows one install and every interface is emulated.
       - 15 need relay-3 entry bytes;
       - 3 need relay-3 entry plus convert q6/q7.
       The 19041 relay entry locals (channel and colour) and the decoder frame locals are not modelled. This is the largest remaining gap.
+    - 19041 encoder bug (pre-existing, independent of the convert model): oracle_dcc_enc_e2e under the Fortnite DLL finds 153 blocks where native returns S_OK with meta ff and size 256 but the console compresses (meta 66/f6/d6/5b/6f, size 128..224). It is mostly format 5, sw 0/1, dims 0/3/4. The 3000-case generator in the invariance and sequence oracles does not reach these inputs, so they stay at 0 divergences. Native gives wrong S_OK output here, so the 19041 encoder choose/plan path must be diffed against 0x70a0 before any implemented status.
+    - Twelve 22000-RVA-hardcoded DCC stage oracles (dcc_oracle, oracle_dec, oracle_enc, oracle_px) now skip on other builds instead of crashing. Non-DCC oracle tests (oracle_all_formats, oracle_bvh_computer, oracle_3d_random, oracle_optimal_swizzle_and_buffer) still crash or fail under the 22621 DLL. That is outside these rows.
     - Pre-existing: exports_table::export_table_matches_source fails while these rows say stub, because the exports are real fns. It passes once the rows become implemented.
 
 ## RDNA2 s_sendmsghalt / s_trap (tombox-xshader, all titles) - 2026-11-21, scalar
@@ -1056,3 +1058,17 @@ Headless runs straight into each title's test scene, on the staged release of 11
   - Next: dump the MSAA source (rtcap skips multisampled targets), and run once with the window size held fixed so both sizes match.
   - Note: TOMBOX_PRESENT_PROBE=30 always samples the same one of the 3 present buffers (30 is a multiple of 3); use a period that is not a multiple of 3.
   - Suspect 3: Minecraft Maps all 3 present buffers (map_x: committed RT textures given console CPU memory, served through the placed-texture uploader). The uploader logs them as "NOT mirrored (render target)", so CPU zeros should not overwrite the resolve, but this path is not ruled out.
+
+### Update 2026-11-22 10:07 (Trackmania hang agent)
+- Trackmania Training: still DEVICE_HUNG in the first lighting PS draw (f861c56a34758d84, VS 5cba0860bcfa69b1), with no page fault.
+- What the cb13 values do:
+  - TOMBOX_CBRAW_CLAMP=13:z keeps every cb13 read but zeroes the values. That run has no hang but is black (fast_20261122_100442_trackmania_cbtouch).
+  - Zeroing past 0x470 does not help (cbclamp).
+  - So the constant VALUES drive the hang, not the memory read.
+  - But a single dispatcher loop capped at 64 steps, with all vector reads dropped, still hangs (dropall64).
+  - Open question: which bounded path hangs. Next step: WARP one-draw replay with the real cb13 bytes.
+- Console behaviour gap, root CBV inheritance:
+  - Many draws use a root signature whose b13 root CBV was never set after the last SetGraphicsRootSignature. Seen with TOMBOX_CBRAW_CHECK=1 in fast_20261122_095850_trackmania_rsunset.
+  - On the console the user-data registers keep their values; on PC the bindings are undefined.
+  - cbv_raw::install_draw_check re-applies the value last set at each param index. It is opt-in with TOMBOX_CBRAW_INHERIT=1 and not yet proven. It does not fix the hang (fast_20261122_100119_trackmania_a6f3c23d).
+- gpu_va gap: many root CBV VAs (0x80xxxxx..0x82xxxxx) are missing from gpu_va's GPU ranges, while bindtrace finds them inside buffer 0x67bf6e80. The overlap eviction in gpu_va::insert_into may be dropping big buffers.

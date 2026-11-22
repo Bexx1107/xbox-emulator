@@ -281,7 +281,8 @@ pub fn clamp_knob() -> Option<(u32, u32)> {
         let v = std::env::var("TOMBOX_CBRAW_CLAMP").ok()?;
         let (a, b) = v.split_once(':')?;
         let lim = b.trim().trim_start_matches("0x");
-        Some((a.trim().parse().ok()?, u32::from_str_radix(lim, 16).ok()?))
+        let lim = if lim == "z" { u32::MAX } else { u32::from_str_radix(lim, 16).ok()? };
+        Some((a.trim().parse().ok()?, lim))
     })
 }
 
@@ -290,6 +291,9 @@ pub fn clamp_reads(h: &str, slot: u32, lim: u32) -> String {
     let Some(at) = h.find(&decl) else { return h.to_string() };
     let eol = h[at..].find('\n').map(|i| at + i + 1).unwrap_or(h.len());
     let body = h[eol..].replace(&format!("tb_cbr{slot}.Load4("), &format!("tb_cbc{slot}("));
+    if lim == u32::MAX {
+        return format!("{}uint4 tb_cbc{slot}(uint o) {{ uint4 v = tb_cbr{slot}.Load4(o); return (v.x == 0x7fc1d00du && v.y == 0x7fc1d00du) ? v : uint4(0u, 0u, 0u, 0u); }}\n{}", &h[..eol], body);
+    }
     format!("{}uint4 tb_cbc{slot}(uint o) {{ return o < {lim:#x}u ? tb_cbr{slot}.Load4(o) : uint4(0u, 0u, 0u, 0u); }}\n{}", &h[..eol], body)
 }
 
@@ -359,7 +363,7 @@ unsafe extern "system" fn set_graphics_rs_checked(this: *mut c_void, rs: *mut c_
 
 fn inherit_on() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| enabled() && std::env::var("TOMBOX_CBRAW_INHERIT").map(|v| v != "0").unwrap_or(true))
+    *E.get_or_init(|| enabled() && (check_on() || std::env::var("TOMBOX_CBRAW_INHERIT").map(|v| v == "1").unwrap_or(false)))
 }
 
 unsafe extern "system" fn reset_checked(this: *mut c_void, alloc: *mut c_void, pso: *mut c_void) -> i32 {
@@ -413,7 +417,7 @@ fn check_draw(list: usize) {
         }
         let n = INHERITED.fetch_add(plan.len(), Ordering::Relaxed);
         if n == 0 {
-            record("d3d12_xs", "cbv_raw", "a draw used a root signature whose root CBV was not set since SetGraphicsRootSignature; the value last set at that parameter index on this list is re-applied, as console user-data registers keep it (TOMBOX_CBRAW_INHERIT=0 disables)");
+            record("d3d12_xs", "cbv_raw", "a draw used a root signature whose root CBV was not set since SetGraphicsRootSignature; the value last set at that parameter index on this list is re-applied, as console user-data registers keep it (TOMBOX_CBRAW_INHERIT=1)");
         }
     }
     if let Some(m) = msg {
@@ -507,6 +511,17 @@ mod tests {
         assert!(patch_rts0(&mut b).is_err());
         let b = rts0(2, &[[3, 1, 0, 0]], false);
         assert_eq!(patch_blob(&b).unwrap(), None);
+    }
+
+    #[test]
+    fn unset_root_cbvs_inherit_the_value_last_set_at_their_index() {
+        let regs = vec![(0usize, 1u32, 0u32), (5, 13, 0), (6, 13, 0)];
+        let last: std::collections::HashMap<u32, u64> = [(0u32, 0x1000u64), (5, 0x2000), (6, 0x3000), (7, 0x4000)].into_iter().collect();
+        assert_eq!(inherit_plan(&regs, 1 << 0 | 1 << 5, &last), vec![(6, 0x3000)]);
+        assert_eq!(inherit_plan(&regs, 0, &last), vec![(0, 0x1000), (5, 0x2000), (6, 0x3000)]);
+        assert!(inherit_plan(&regs, 1 | 1 << 5 | 1 << 6, &last).is_empty());
+        let partial: std::collections::HashMap<u32, u64> = [(5u32, 0x2000u64)].into_iter().collect();
+        assert_eq!(inherit_plan(&regs, 0, &partial), vec![(5, 0x2000)]);
     }
 
     #[test]

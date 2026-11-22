@@ -57,6 +57,7 @@ struct Target {
     order: usize,
 }
 static TARGETS: Mutex<Vec<Target>> = Mutex::new(Vec::new());
+static SRV_SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Last known state per resource (from creation, then the title's transition barriers).
 static STATES: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 
@@ -283,7 +284,18 @@ pub unsafe fn maybe_capture(queue: *mut c_void, presented: *mut c_void) {
     vcall!(list, 9, fn() -> i32);
     let mut fence_value = 0u64;
 
-    let targets: Vec<(usize, [u8; 0x38], usize)> = TARGETS.lock().unwrap().iter().map(|t| (t.res, t.desc, t.order)).collect();
+    let mut targets: Vec<(usize, [u8; 0x38], usize)> = TARGETS.lock().unwrap().iter().map(|t| (t.res, t.desc, t.order)).collect();
+    for (i, r) in SRV_SEEN.lock().unwrap().iter().enumerate() {
+        if targets.iter().any(|t| t.0 == *r) {
+            continue;
+        }
+        let mut d = [0u8; 0x38];
+        let p = *r as *mut c_void;
+        vcall!(p, 10, fn(*mut u8) -> *mut u8, d.as_mut_ptr());
+        if u32::from_le_bytes(d[0..4].try_into().unwrap()) == 3 {
+            targets.push((*r, d, 900 + i));
+        }
+    }
     let states = STATES.lock().unwrap().clone().unwrap_or_default();
     let _ = writeln!(report, "{} render-target/depth textures known", targets.len());
     let presented_order = targets.iter().find(|t| t.0 == presented as usize).map(|t| format!("#{:03}", t.2)).unwrap_or_else(|| format!("{presented:p}"));
@@ -310,6 +322,7 @@ pub unsafe fn maybe_capture(queue: *mut c_void, presented: *mut c_void) {
         let (res, state, resolved) = if samples != 1 {
             const RESOLVE_DEST: u32 = 0x1000;
             const RESOLVE_SOURCE: u32 = 0x2000;
+            pc_desc[0x08..0x10].fill(0);
             pc_desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             pc_desc[0x28..0x2c].copy_from_slice(&0u32.to_le_bytes());
             let dheap: [u32; 5] = [1, 0, 0, 1, 1];
@@ -634,6 +647,17 @@ pub fn trace_draw(list: usize, compute: bool, text: &str) {
         let rts: Vec<String> = rtv.iter().map(|r| if *r == 0 { "-".into() } else { name(*r) }).collect();
         let ds = if dsv == 0 { "-".to_string() } else { name(dsv) };
         let b = unsafe { crate::bindtrace::dump(list, compute, &name) };
+        {
+            let mut seen = SRV_SEEN.lock().unwrap();
+            for part in b.split("SRV res 0x").skip(1) {
+                let hex: String = part.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                if let Ok(r) = usize::from_str_radix(&hex, 16) {
+                    if r != 0 && !seen.contains(&r) && seen.len() < 16 {
+                        seen.push(r);
+                    }
+                }
+            }
+        }
         record("d3d12_xs", "drawtrace", &format!("{l} rt=[{}] ds={ds}\n{b}", rts.join(" | ")));
     }
 }

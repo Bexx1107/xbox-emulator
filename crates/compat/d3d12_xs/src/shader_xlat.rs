@@ -250,7 +250,10 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
             return Err("edited translation needs DXC".to_string());
         }
         let h = edit(&t.hlsl)?;
-        return tombox_xshader::dxc::compile(&h, &profile);
+        if !edited_pack() {
+            return tombox_xshader::dxc::compile(&h, &profile);
+        }
+        return tombox_xshader::shader_cache::compile_cached_with(&h, &profile, fma_mode(), &["edited-plain-compile"], || tombox_xshader::dxc::compile(&h, &profile)).map(|c| c.code);
     }
     if use_dxc {
         let xlat_ms = t_start.elapsed().as_secs_f64() * 1000.0;
@@ -465,6 +468,15 @@ fn write_atomic(p: &std::path::Path, data: &[u8]) {
 
 static PREWARMED: AtomicUsize = AtomicUsize::new(0);
 
+fn edited_pack() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("TOMBOX_EDITED_PACK").map(|v| v != "0").unwrap_or(true);
+        record("d3d12_xs", "shader_xlat", if on { "edited variants (vs_snorm, ps depth/stencil, dbcount strip) are compiled through the shader pack keyed by their final HLSL (TOMBOX_EDITED_PACK=0 compiles them every time)" } else { "TOMBOX_EDITED_PACK=0: edited variants are compiled every time" });
+        on
+    })
+}
+
 fn index_ctx() -> &'static str {
     static C: OnceLock<String> = OnceLock::new();
     C.get_or_init(|| {
@@ -546,6 +558,28 @@ fn finish_with(res: Result<Vec<u8>, String>, hash: u64, len: usize, origin_blob:
 extern "system" {
     fn GetCurrentThread() -> *mut c_void;
     fn SetThreadPriority(h: *mut c_void, p: i32) -> i32;
+    fn GetThreadPriority(h: *mut c_void) -> i32;
+    fn GetCurrentThreadId() -> u32;
+    fn OpenThread(access: u32, inherit: i32, id: u32) -> *mut c_void;
+}
+
+const PREWARM_PRIORITY: i32 = -1;
+const THREAD_SET_QUERY: u32 = 0x0020 | 0x0040;
+static BOOSTS: AtomicUsize = AtomicUsize::new(0);
+
+fn prewarm_busy() -> &'static Mutex<HashMap<u64, usize>> {
+    static M: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn boost_prewarm(key: u64) {
+    let Some(h) = prewarm_busy().lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied() else { return };
+    let want = unsafe { GetThreadPriority(GetCurrentThread()) }.clamp(0, 2);
+    unsafe { SetThreadPriority(h as *mut c_void, want) };
+    let n = BOOSTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n % 50 == 0 {
+        record("d3d12_xs", "shader_xlat", &format!("a waiting thread boosted the prewarm worker translating key {key:016x} to priority {want} (#{n})"));
+    }
 }
 
 pub fn start_prewarm() {
@@ -607,7 +641,15 @@ pub fn start_prewarm() {
                     let mut ran = false;
                     c.get_or_init(|| {
                         ran = true;
-                        finish(produce(&blob, h, &rt, &InputInterp::default(), key), h, blob.len(), &blob)
+                        if me != 0 {
+                            prewarm_busy().lock().unwrap_or_else(|e| e.into_inner()).insert(key, me);
+                        }
+                        let r = finish(produce(&blob, h, &rt, &InputInterp::default(), key), h, blob.len(), &blob);
+                        if me != 0 {
+                            prewarm_busy().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                            unsafe { SetThreadPriority(GetCurrentThread(), PREWARM_PRIORITY) };
+                        }
+                        r
                     });
                     if ran {
                         done += 1;
@@ -688,6 +730,7 @@ pub unsafe fn translate_for_targets(ptr: *const u8, len: usize, rtfmt: [u8; 8], 
         }
     }
     let t0 = std::time::Instant::now();
+    boost_prewarm(key);
     let entry = c.get_or_init(|| crate::perf::timed(crate::perf::SHADER, || finish(produce(blob, hash, &rtfmt, link, key), hash, len, blob))).clone();
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     if ms > 1.0 {

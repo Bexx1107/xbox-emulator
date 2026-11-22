@@ -352,6 +352,10 @@ fn caller_outputs(c: &Con, s: &Dcc) -> Vec<(Vec<u8>, u8)> {
 fn oracle_dcc_enc_undefined_classes() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_enc_undefined_classes: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let st = states();
     let mut r = Rng(0x0dd_e4c_5eed);
     let mut seen: std::collections::BTreeMap<&'static str, (u64, u64)> = std::collections::BTreeMap::new();

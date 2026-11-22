@@ -1628,3 +1628,375 @@ fn conndiag_real_system_pipe_is_not_served_on_pc() {
         SysFreeString(pipe);
     }
 }
+
+use crate::trace;
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(process: HANDLE, access: u32, token: *mut HANDLE) -> BOOL;
+    fn GetTokenInformation(token: HANDLE, class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> BOOL;
+}
+
+fn is_elevated() -> bool {
+    unsafe {
+        let mut t: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), 8, &mut t) == 0 {
+            return false;
+        }
+        let mut e = 0u32;
+        let mut n = 0u32;
+        let ok = GetTokenInformation(t, 20, &mut e as *mut u32 as *mut c_void, 4, &mut n);
+        CloseHandle(t);
+        ok != 0 && e != 0
+    }
+}
+
+static TRACE_LOCK: Mutex<()> = Mutex::new(());
+static XCRD_OPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static XCRD_DIR: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+static XCRD_FAIL: Mutex<Vec<(&'static str, HRESULT)>> = Mutex::new(Vec::new());
+
+fn xrec(s: String) {
+    XCRD_OPS.lock().unwrap_or_else(|e| e.into_inner()).push(s);
+}
+
+fn xfail(op: &str) -> Option<HRESULT> {
+    XCRD_FAIL.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(o, _)| *o == op).map(|(_, h)| *h)
+}
+
+fn xops() -> Vec<String> {
+    XCRD_OPS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn xclear() {
+    XCRD_OPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    XCRD_FAIL.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+fn xset_fail(op: &'static str, hr: HRESULT) {
+    XCRD_FAIL.lock().unwrap_or_else(|e| e.into_inner()).push((op, hr));
+}
+
+unsafe extern "system" fn fx_open(out: *mut *mut c_void) -> HRESULT {
+    xrec("open".into());
+    if let Some(h) = xfail("open") {
+        return h;
+    }
+    *out = 0x1000 as *mut c_void;
+    S_OK
+}
+
+unsafe extern "system" fn fx_close(a: *mut c_void) -> HRESULT {
+    xrec(format!("close {:#x}", a as usize));
+    S_OK
+}
+
+unsafe extern "system" fn fx_build(out: *mut *mut u16, index: i32, name: *const u16, flags: u32) -> HRESULT {
+    xrec(format!("build {} {} {}", index, String::from_utf16_lossy(wslice(name)), flags));
+    *out = SysAllocString(wz("T:\\XtfTitleTraceStorage.xvd").as_ptr());
+    S_OK
+}
+
+unsafe extern "system" fn fx_delete(_a: *mut c_void, _p: *const u16, flags: u32) -> HRESULT {
+    xrec(format!("delete {}", flags));
+    xfail("delete").unwrap_or(trace::HR_FILE_NOT_FOUND)
+}
+
+unsafe extern "system" fn fx_create(_a: *mut c_void, _p: *const u16, id: *const u8, flags: u32, size: u64, t: u32, c: u32, out_id: *mut u8, id2: *const u8, sb: *const u8, sbl: u32, p2: *const u16) -> HRESULT {
+    assert!(id.is_null() && out_id.is_null() && id2.is_null() && sb.is_null() && sbl == 0 && p2.is_null());
+    xrec(format!("create {} {:#x} {} {}", flags, size, t, c));
+    xfail("create").unwrap_or(S_OK)
+}
+
+unsafe extern "system" fn fx_mount(out: *mut *mut c_void, _a: *mut c_void, _p: *const u16, flags: u32) -> HRESULT {
+    xrec(format!("mount {:#x}", flags));
+    if let Some(h) = xfail("mount") {
+        return h;
+    }
+    *out = 0x2000 as *mut c_void;
+    S_OK
+}
+
+unsafe extern "system" fn fx_unmount(_a: *mut c_void, h: *mut c_void) -> HRESULT {
+    xrec(format!("unmount {:#x}", h as usize));
+    S_OK
+}
+
+unsafe extern "system" fn fx_query(out: *mut *mut u16, _h: *const c_void) -> HRESULT {
+    xrec("query".into());
+    if let Some(h) = xfail("query") {
+        return h;
+    }
+    let mut d = XCRD_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    d.push(0);
+    *out = SysAllocString(d.as_ptr());
+    S_OK
+}
+
+unsafe extern "system" fn fx_free(p: *mut c_void) -> HRESULT {
+    xrec("free".into());
+    SysFreeString(p as BSTR);
+    S_OK
+}
+
+fn fake_xcrd() -> trace::XCrd {
+    trace::XCrd { open_adapter: fx_open, close_adapter: fx_close, build_path: fx_build, delete_xvd: fx_delete, create_xvd: fx_create, mount: fx_mount, unmount: fx_unmount, query_device_path: fx_query, free_device_path_buffer: fx_free, resolve_path: None }
+}
+
+struct TraceSessions;
+
+impl Drop for TraceSessions {
+    fn drop(&mut self) {
+        unsafe {
+            trace::stop_etw_trace(&[], &trace::TRACE_SESSION_GUID, trace::TRACE_SESSION_NAME, None);
+            trace::stop_etw_trace(&[], &trace::STATE_SESSION_GUID, trace::STATE_SESSION_NAME, None);
+        }
+        let mut x = trace::XVD.lock().unwrap_or_else(|e| e.into_inner());
+        x.handle = usize::MAX;
+        x.directory = None;
+        trace::SERVER.lock().unwrap_or_else(|e| e.into_inner()).trace_type = 0;
+    }
+}
+
+fn trace_setup(tag: &str) -> (std::sync::MutexGuard<'static, ()>, std::path::PathBuf, TraceSessions) {
+    let g = TRACE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("xtfdiag_trace_{}_{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    *XCRD_DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir.to_string_lossy().encode_utf16().collect();
+    xclear();
+    trace::bind_xcrd(Some(fake_xcrd()));
+    {
+        let mut x = trace::XVD.lock().unwrap_or_else(|e| e.into_inner());
+        x.handle = usize::MAX;
+        x.directory = None;
+        let mut s = trace::SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        s.trace_type = 0;
+        s.start_tick = 0;
+    }
+    (g, dir, TraceSessions)
+}
+
+fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+fn mount_ops() -> Vec<String> {
+    strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "delete 0", "create 0 0x44000 0 0", "mount 0x0", "query", "free", "free", "close 0x1000"])
+}
+
+fn unmount_ops() -> Vec<String> {
+    strs(&["open", "unmount 0x2000", "close 0x1000"])
+}
+
+fn state_files(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir.join("GameCoreTrace")).map(|r| r.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("xbtitlestate_") && n.ends_with(".etl")).collect()).unwrap_or_default()
+}
+
+#[test]
+fn trace_route_guards_and_unknown_operations() {
+    let (_g, _dir, _s) = trace_setup("route");
+    unsafe {
+        let mut r: Obj = null_mut();
+        assert_eq!(trace::TRACE_SERVER.route(3, null_mut(), null_mut()), E_POINTER);
+        assert_eq!(trace::TRACE_SERVER.route(99, null_mut(), &mut r), S_OK);
+        assert!(r.is_null());
+        let mut b = Bstr::null();
+        process_operation_request(&trace::TRACE_SERVER, wz("{\"version\":1,\"opid\":7}").as_ptr(), b.out());
+        assert_eq!(num(&parse(&bstr_text(&b)), "opresult"), Some(0.0));
+        process_operation_request(&trace::TRACE_SERVER, wz("{\"version\":1,\"opid\":4}").as_ptr(), b.out());
+        assert_eq!(num(&parse(&bstr_text(&b)), "opresult"), Some(trace::E_ILLEGAL_STATE_CHANGE as f64));
+        assert!(xops().is_empty());
+    }
+}
+
+#[test]
+fn trace_start_validates_trace_type_before_touching_the_xvd() {
+    let (_g, _dir, _s) = trace_setup("types");
+    unsafe {
+        assert_eq!(trace::trace_start(null_mut()), E_INVALIDARG);
+        assert_eq!(trace::trace_start(parse("{\"TraceType\":0}").0), E_INVALIDARG);
+        assert_eq!(trace::trace_start(parse("{\"TraceType\":4}").0), E_INVALIDARG);
+        assert!(trace::trace_start(parse("{}").0) < 0);
+        assert!(xops().is_empty());
+        trace::SERVER.lock().unwrap().trace_type = 2;
+        assert_eq!(trace::trace_start(parse("{\"TraceType\":2}").0), trace::E_ILLEGAL_STATE_CHANGE);
+        assert!(xops().is_empty());
+    }
+}
+
+#[test]
+fn xbox_live_trace_type_creates_the_xvd_then_unmounts_it() {
+    let (_g, dir, _s) = trace_setup("xbl");
+    unsafe {
+        let mut r: Obj = null_mut();
+        assert_eq!(trace::TRACE_SERVER.route(3, parse("{\"TraceType\":3}").0, &mut r), trace::E_ILLEGAL_METHOD_CALL);
+        let mut want = mount_ops();
+        want.extend(unmount_ops());
+        assert_eq!(xops(), want);
+        assert_eq!(trace::xvd_handle(), usize::MAX);
+        assert!(trace::trace_directory().is_none());
+        assert_eq!(trace::trace_type(), 0);
+        assert_eq!(trace::trace_stop(&mut r), trace::E_ILLEGAL_STATE_CHANGE);
+        assert!(r.is_null());
+        assert_eq!(trace::trace_stop(null_mut()), E_POINTER);
+        assert!(!dir.join("GameCoreTrace").exists());
+    }
+}
+
+#[test]
+fn create_and_mount_failures_release_what_they_took() {
+    let (_g, dir, _s) = trace_setup("mountfail");
+    unsafe {
+        xset_fail("mount", 0x8007_0005u32 as i32);
+        assert_eq!(trace::create_and_mount_trace_xvd(), 0x8007_0005u32 as i32);
+        assert_eq!(xops(), strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "delete 0", "create 0 0x44000 0 0", "mount 0x0", "free", "close 0x1000"]));
+        assert_eq!(trace::xvd_handle(), usize::MAX);
+        xclear();
+        xset_fail("query", E_OUTOFMEMORY);
+        assert_eq!(trace::create_and_mount_trace_xvd(), E_OUTOFMEMORY);
+        assert_eq!(xops(), strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "delete 0", "create 0 0x44000 0 0", "mount 0x0", "query", "unmount 0x2000", "free", "close 0x1000"]));
+        xclear();
+        xset_fail("delete", trace::HR_SHARING_VIOLATION);
+        assert_eq!(trace::create_and_mount_trace_xvd(), trace::HR_SHARING_VIOLATION);
+        assert_eq!(xops(), strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "delete 0", "free", "close 0x1000"]));
+        xclear();
+        assert_eq!(trace::create_and_mount_trace_xvd(), S_OK);
+        assert_eq!(trace::xvd_handle(), 0x2000);
+        assert_eq!(trace::trace_directory().unwrap(), dir.to_string_lossy().encode_utf16().collect::<Vec<u16>>());
+        xclear();
+        assert_eq!(trace::create_and_mount_trace_xvd(), trace::HR_SHARING_VIOLATION);
+        assert_eq!(trace::mount_trace_xvd(), trace::HR_SHARING_VIOLATION);
+        assert!(xops().is_empty());
+        trace::unmount_trace_xvd();
+        assert_eq!(xops(), unmount_ops());
+        assert_eq!(trace::xvd_handle(), usize::MAX);
+        assert!(trace::trace_directory().is_none());
+        xclear();
+        trace::unmount_trace_xvd();
+        assert!(xops().is_empty());
+    }
+}
+
+#[test]
+fn advanced_multiplayer_trace_runs_real_etw_or_returns_the_access_error() {
+    let (_g, dir, _s) = trace_setup("amp");
+    unsafe {
+        let mut none: Obj = null_mut();
+        let hr = trace::TRACE_SERVER.route(3, parse("{\"TraceType\":2}").0, &mut none);
+        assert!(dir.join("GameCoreTrace").is_dir());
+        if is_elevated() {
+            assert_eq!(hr, S_OK);
+            assert_eq!(trace::trace_type(), 2);
+            assert_eq!(xops(), mount_ops());
+            assert!(dir.join("GameCoreTrace").join("xbtitletrace.etl").is_file());
+            assert_eq!(state_files(&dir).len(), 1);
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            let mut r = Ptr::null();
+            assert_eq!(trace::TRACE_SERVER.route(4, null_mut(), r.out()), S_OK);
+            assert!(!r.is_null());
+            assert_eq!(num(&r, "TraceType"), Some(2.0));
+            assert!(num(&r, "TraceEventsLost").unwrap() >= 0.0);
+            assert!(num(&r, "TraceDurationMs").unwrap() >= 1000.0);
+            assert_eq!(trace::trace_type(), 0);
+            assert_eq!(trace::xvd_handle(), usize::MAX);
+            assert!(xops().ends_with(&unmount_ops()));
+        } else {
+            assert_eq!(hr, 0x8007_0005u32 as i32);
+            let mut want = mount_ops();
+            want.extend(unmount_ops());
+            assert_eq!(xops(), want);
+            assert_eq!(trace::trace_type(), 0);
+            assert_eq!(trace::xvd_handle(), usize::MAX);
+            assert!(state_files(&dir).is_empty());
+            let mut r: Obj = null_mut();
+            assert_eq!(trace::trace_stop(&mut r), trace::E_ILLEGAL_STATE_CHANGE);
+        }
+    }
+}
+
+#[test]
+fn log_network_state_succeeds_with_or_without_session_rights() {
+    let (_g, dir, _s) = trace_setup("state");
+    unsafe {
+        assert_eq!(trace::create_and_mount_trace_xvd(), S_OK);
+        let mut none: Obj = null_mut();
+        assert_eq!(trace::TRACE_SERVER.route(12, null_mut(), &mut none), S_OK);
+        assert!(dir.join("GameCoreTrace").is_dir());
+        assert_eq!(state_files(&dir).len(), if is_elevated() { 1 } else { 0 });
+        {
+            let mut x = trace::XVD.lock().unwrap();
+            x.handle = usize::MAX;
+            x.directory = None;
+        }
+        assert_eq!(trace::log_network_state(), S_OK);
+    }
+}
+
+#[test]
+fn pending_trace_xvd_restarts_the_recorded_trace_type() {
+    let (_g, dir, _s) = trace_setup("pending");
+    unsafe {
+        let pending = dir.join("PendingGameCoreTrace");
+        std::fs::write(&pending, 3u32.to_le_bytes()).unwrap();
+        assert_eq!(trace::TRACE_SERVER.check_pending(), trace::E_ILLEGAL_METHOD_CALL);
+        assert!(!pending.exists());
+        let mut want = strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "mount 0x40", "query", "free", "free", "close 0x1000"]);
+        want.extend(unmount_ops());
+        assert_eq!(xops(), want);
+        assert_eq!(trace::xvd_handle(), usize::MAX);
+        xclear();
+        assert_eq!(trace::TRACE_SERVER.check_pending(), trace::HR_FILE_NOT_FOUND);
+        assert!(xops().ends_with(&unmount_ops()));
+        xclear();
+        std::fs::write(&pending, [1u8, 0]).unwrap();
+        assert_eq!(trace::TRACE_SERVER.check_pending(), trace::E_UNEXPECTED);
+        assert!(!pending.exists());
+        assert!(xops().ends_with(&unmount_ops()));
+        xclear();
+        xset_fail("mount", HR_PATH_NOT_FOUND);
+        assert_eq!(trace::TRACE_SERVER.check_pending(), HR_PATH_NOT_FOUND);
+        assert_eq!(xops(), strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "mount 0x40", "free", "close 0x1000"]));
+        assert_eq!(trace::trace_type(), 0);
+    }
+}
+
+#[test]
+fn etw_properties_match_the_console_layout() {
+    unsafe {
+        let file = wz("C:\\t\\x.etl");
+        let p = trace::build_properties(&file[..file.len() - 1], 0x200, 16, 0x400, &trace::TRACE_SESSION_GUID);
+        let b = &p.bytes;
+        let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        assert_eq!(b.len(), 0x4b8);
+        assert_eq!(u(0), 0x4b8);
+        assert_eq!(&b[0x18..0x1c], &0xcff86b4cu32.to_le_bytes());
+        assert_eq!((u(0x28), u(0x2c), u(0x30), u(0x34), u(0x38), u(0x3c), u(0x40)), (2, 0x20000, 0x200, 16, 36, 0x400, 2));
+        assert_eq!(u(0x48), 0x80ff_0480);
+        assert_eq!((u(0x480), u(0x484), u(0x488)), (0x2000d, 0x10009, 0x50007));
+        assert_eq!(u16::from_le_bytes([b[0x4a8], b[0x4a9]]), 3);
+        assert_eq!((u(0x70), u(0x74)), (0x78, 0x280));
+        let name: Vec<u16> = b[0x78..0x78 + 20].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(String::from_utf16_lossy(&name), "C:\\t\\x.etl");
+        let q = trace::build_properties(&[], 0x400, 4, 0, &trace::STATE_SESSION_GUID);
+        assert_eq!(u32::from_le_bytes(q.bytes[0x40..0x44].try_into().unwrap()), 0);
+        assert_eq!(trace::TRACE_PROVIDERS.len(), 64);
+        assert_eq!(trace::TRACE_PROVIDERS[0].guid, trace::WPP_CONTROL_GUID);
+        assert_eq!(trace::TRACE_PROVIDERS[8].any, 0x00ff_ffff_ffff_ffbe);
+        let t = trace::SystemTime { year: 2026, month: 3, day_of_week: 0, day: 4, hour: 5, minute: 6, second: 7, milliseconds: 0 };
+        assert_eq!(trace::state_file_name(&t), "xbtitlestate_20260304_050607.etl");
+    }
+}
+
+#[test]
+fn wpp_control_guid_registers_and_stays_quiet_until_enabled() {
+    let (_g, _dir, _s) = trace_setup("wpp");
+    unsafe {
+        assert_eq!(trace::wpp_init(), 0);
+        assert_ne!(trace::WPP.registration.load(Ordering::Acquire), 0);
+        assert_eq!(trace::wpp_init(), 0);
+        assert!(!trace::wpp_message(&trace::STATE_HEADER_GUID, 0xe, 0));
+        trace::wpp_cleanup();
+        assert_eq!(trace::WPP.registration.load(Ordering::Acquire), 0);
+    }
+}
