@@ -4289,7 +4289,7 @@ impl<'a> Emitter<'a> {
             };
             return self.wv(&d, &hres(e));
         }
-        if let Some(op) = crate::trans16::op_index(m.as_str()) {
+        if let Some(op) = crate::trans16::op_index(m.as_str()).filter(|_| !f16_native()) {
             self.uses_trans16 = true;
             let o = &s[0];
             let hi_sel = ins.enc == Enc::Vop3 && (ins.raw[0] >> 11) & 1 != 0;
@@ -4312,9 +4312,12 @@ impl<'a> Emitter<'a> {
             }
             return self.wv(&d, &e);
         }
-        if matches!(m.as_str(), "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_fract_f16") {
+        if matches!(m.as_str(), "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_fract_f16") {
             let a = h16(&s[0])?;
             let e = match m.as_str() {
+                "v_rcp_f16" => format!("1.0 / {a}"),
+                "v_sqrt_f16" => format!("sqrt({a})"),
+                "v_rsq_f16" => format!("rsqrt({a})"),
                 "v_floor_f16" => format!("floor({a})"),
                 "v_ceil_f16" => format!("ceil({a})"),
                 "v_trunc_f16" => format!("trunc({a})"),
@@ -4414,6 +4417,16 @@ impl<'a> Emitter<'a> {
         }
         if m == "v_pipeflush" {
             return Ok(());
+        }
+        if matches!(m.as_str(), "v_log_f16" | "v_exp_f16" | "v_sin_f16" | "v_cos_f16") {
+            let a = h16(&s[0])?;
+            let e = match m.as_str() {
+                "v_log_f16" => format!("log2({a})"),
+                "v_exp_f16" => format!("exp2({a})"),
+                "v_sin_f16" => format!("sin({a} * 6.28318530718)"),
+                _ => format!("cos({a} * 6.28318530718)"),
+            };
+            return self.wv(&d, &hres(e));
         }
         if m == "v_ldexp_f16" {
             let e = format!("ldexp({}, (float)clamp(asint(({}) << 16) >> 16, -64, 64))", h16(&s[0])?, r(&s[1])?);
@@ -6566,6 +6579,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         h.push_str(if no_out || self.is_gs { "}\n" } else { "    return o;\n}\n" });
         Ok(h)
     }
+}
+
+fn f16_native() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("TOMBOX_XS_F16_NATIVE").map(|v| v.trim() == "1").unwrap_or(false))
 }
 
 pub fn loop_guard(default: u32) -> u32 {
