@@ -549,6 +549,7 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
     crate::gpuprof::on_present();
     crate::hot_reload::on_present();
     crate::present_probe::on_present(src, plane_count, planes);
+    crate::upload::register_direct_queue(queue);
     crate::slowcall::time("PresentX upload pump", || crate::perf::timed(crate::perf::UPLOAD, || crate::upload::pump(queue)));
     crate::slowcall::time("PresentX replay/rtcap", || crate::perf::timed(crate::perf::RTCAP, || {
         crate::replay::on_present(queue);
