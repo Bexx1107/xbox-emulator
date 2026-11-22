@@ -125,6 +125,7 @@ pub fn decode(count: u32, src: &[u8], meta: &[u8], dst: &mut [u8], fmt: u32, sw:
     if let Err(e) = d.init(fmt, sw, dim, p0, p1) {
         return e;
     }
+    dec::begin();
     for i in 0..count as usize {
         d.b[1].copy_from_slice(&src[i * 256..i * 256 + 256]);
         d.w32(0x58, meta[i] as u32);
@@ -253,10 +254,18 @@ fn enc_block(d: &mut Dcc) -> Result<u32, i32> {
     for k in 0..SAMPLES {
         let q = |b: u32, x: u64| if vary >> b & 1 != 0 { x } else { 7 };
         let fills = [unknowns(q(0, 3 * k)), unknowns(q(1, 3 * k + 1)), unknowns(q(2, 3 * k + 2))];
-        let conv = match (vary >> 3 & 1 != 0, k) {
+        let mut conv = match (vary >> 3 & 1 != 0, k) {
             (false, _) | (true, 0) => seen,
             (true, k) => unknowns(100 + k),
         };
+        if vary >> 3 & 1 == 0 && vary >> 8 & 0xff != 0 && k > 0 {
+            let r = unknowns(100 + k);
+            for qd in 0..8 {
+                if vary >> (8 + qd) & 1 != 0 {
+                    conv[qd * 8..qd * 8 + 8].copy_from_slice(&r[qd * 8..qd * 8 + 8]);
+                }
+            }
+        }
         runs.push(enc_try(&pre, &fills, &conv)?);
     }
     if runs[1..].iter().all(|r| same(r, &runs[0])) {
