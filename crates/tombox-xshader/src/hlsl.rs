@@ -2052,7 +2052,7 @@ impl<'a> Emitter<'a> {
                         written.insert(d);
                     }
                 }
-                Enc::Sop1 if ins.mnemonic == "s_swappc_b64" && self.durango.is_some() => {}
+                Enc::Sop1 if ins.mnemonic == "s_swappc_b64" && (self.durango.is_some() || crate::gcn::is_durango(&self.ex.fssm)) => {}
                 Enc::Sop1 if ins.mnemonic == "s_getpc_b64" => {
                     if let Some(d) = ins.dst.first().and_then(sg) {
                         sym.insert(d, Sym::Code);
@@ -6500,9 +6500,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let _ = writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;");
         }
         if !is_ps && !self.is_gs {
+            let is_durango = self.durango.is_some() || crate::gcn::is_durango(&self.ex.fssm);
             let mut group = 0usize;
             for reg in distinct_regs(ex.input_sig.iter().filter(|e| e.sysval == 0)) {
-                let read = ex.input_sig.iter().any(|e| e.sysval == 0 && e.register == reg && e.rw_mask != 0);
+                let read = ex.input_sig.iter().any(|e| e.sysval == 0 && e.register == reg && (e.rw_mask != 0 || (is_durango && e.mask != 0)));
                 if ex.stage == Stage::Vertex && !read {
                     continue;
                 }
