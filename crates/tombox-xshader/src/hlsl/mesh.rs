@@ -156,7 +156,7 @@ impl<'a> Emitter<'a> {
         Ok(true)
     }
 
-    pub(super) fn finish_mesh(&mut self, mut h: String) -> Result<String, String> {
+    pub(super) fn finish_mesh(&mut self, mut h: String, static_init: &str) -> Result<String, String> {
         let m = self.mesh_info()?;
         let n = self.ms_threads()?;
         let passes: u32 = if n > 128 { 2 } else { 1 };
@@ -260,6 +260,7 @@ impl<'a> Emitter<'a> {
             let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
             let _ = writeln!(h, "{}", self.reg_decls());
             h.push_str(&self.ud_init());
+            h.push_str(static_init);
             if has_prim_attrs {
                 let _ = writeln!(h, "    SOut o = (SOut)0; uint tb_prim = 0u; SPrim tb_pout = (SPrim)0;");
             } else {
@@ -303,6 +304,7 @@ impl<'a> Emitter<'a> {
             let _ = writeln!(h, "        uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
             let _ = writeln!(h, "{}", self.reg_decls());
             h.push_str(&self.ud_init());
+            h.push_str(static_init);
             if has_prim_attrs {
                 let _ = writeln!(h, "        SOut o = (SOut)0; uint tb_prim = 0u; SPrim tb_pout = (SPrim)0;");
             } else {
