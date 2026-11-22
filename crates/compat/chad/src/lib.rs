@@ -1,4 +1,4 @@
-use compat_common::{record, E_NOTIMPL, S_OK};
+use compat_common::{record, S_OK};
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -16,6 +16,10 @@ pub const XDSP_E_TOO_MANY_ACTIVATIONS: i32 = 0x8AC8_10A6u32 as i32;
 pub const XDSP_E_IR_SIZE: i32 = 0x8AC8_10A7u32 as i32;
 
 const IR_METADATA_MARKER: u32 = 0xFFFF_ACE1;
+pub const KIND_CONVOLUTION: u32 = 1;
+pub const KIND_FFT: u32 = 2;
+pub const KIND_IFFT: u32 = 3;
+pub const OPT_POLAR: u32 = 4;
 const MAX_CLIENTS: u32 = 8;
 const MAX_ACTIVATIONS: u32 = 0x80;
 const MAX_CONTEXTS: u32 = 0x100;
@@ -121,6 +125,20 @@ fn unpack_inverse(fft: &Fft, spec: &[C32], work: &mut [C32]) {
     }
 }
 
+fn to_polar(spec: &mut [C32]) {
+    for c in spec.iter_mut().skip(1) {
+        let (m, a) = ((c.re as f64).hypot(c.im as f64), (c.im as f64).atan2(c.re as f64));
+        *c = C32 { re: m as f32, im: a as f32 };
+    }
+}
+
+fn from_polar(spec: &mut [C32]) {
+    for c in spec.iter_mut().skip(1) {
+        let (m, a) = (c.re as f64, c.im as f64);
+        *c = C32 { re: (m * a.cos()) as f32, im: (m * a.sin()) as f32 };
+    }
+}
+
 fn spectral_mac(acc: &mut [C32], x: &[C32], h: &[C32], g: f32) {
     acc[0].re += x[0].re * h[0].re * g;
     acc[0].im += x[0].im * h[0].im * g;
@@ -138,6 +156,8 @@ struct Channel {
 pub struct Context {
     status: [u32; 4],
     client: *mut Client,
+    kind: u32,
+    polar: bool,
     block: usize,
     partitions: usize,
     irs: Vec<Vec<Vec<C32>>>,
@@ -185,6 +205,8 @@ impl Context {
         Context {
             status: [0; 4],
             client,
+            kind: KIND_CONVOLUTION,
+            polar: false,
             block,
             partitions: used,
             irs,
@@ -196,6 +218,55 @@ impl Context {
             envelope_count: partitions,
             envelope: None,
             group: 0,
+        }
+    }
+
+    fn new_transform(client: *mut Client, kind: u32, block: usize, polar: bool) -> Context {
+        Context {
+            status: [0; 4],
+            client,
+            kind,
+            polar,
+            block,
+            partitions: 0,
+            irs: Vec::new(),
+            chans: Vec::new(),
+            pos: 0,
+            fft: Fft::new(block),
+            work: vec![C32 { re: 0.0, im: 0.0 }; block],
+            acc: vec![C32 { re: 0.0, im: 0.0 }; block / 2],
+            envelope_count: 0,
+            envelope: None,
+            group: 0,
+        }
+    }
+
+    fn transform(&mut self, input: *const f32, mult: *const f32, output: *mut f32) {
+        let n = self.block;
+        let rd = |p: *const f32, i: usize| unsafe { core::ptr::read_unaligned(p.add(i)) };
+        if self.kind == KIND_FFT {
+            let t: Vec<f32> = (0..n).map(|i| sanitize(if mult.is_null() { rd(input, i) } else { rd(input, i) * rd(mult, i) })).collect();
+            pack_forward(&self.fft, &t, &mut self.work, &mut self.acc);
+            if self.polar {
+                to_polar(&mut self.acc);
+            }
+            for (k, c) in self.acc.iter().enumerate() {
+                unsafe {
+                    core::ptr::write_unaligned(output.add(2 * k), c.re);
+                    core::ptr::write_unaligned(output.add(2 * k + 1), c.im);
+                }
+            }
+        } else {
+            for k in 0..n / 2 {
+                self.acc[k] = C32 { re: sanitize(rd(input, 2 * k)), im: sanitize(rd(input, 2 * k + 1)) };
+            }
+            if self.polar {
+                from_polar(&mut self.acc);
+            }
+            unpack_inverse(&self.fft, &self.acc, &mut self.work);
+            for i in 0..n {
+                unsafe { core::ptr::write_unaligned(output.add(i), sanitize(self.work[i].re)) };
+            }
         }
     }
 
@@ -311,9 +382,19 @@ pub extern "system" fn XDspActivate(client: *mut Client, desc: *const u8, status
     if !block_ok {
         return E_INVALIDARG;
     }
-    if kind != 1 {
-        record(M, "XDspActivate", &format!("type={kind} not implemented -> E_NOTIMPL"));
-        return E_NOTIMPL;
+    if kind != KIND_CONVOLUTION {
+        let cl = unsafe { &mut *client };
+        if cl.active >= cl.max_act || cl.active >= MAX_CONTEXTS {
+            return XDSP_E_TOO_MANY_CONTEXTS;
+        }
+        let ctx = Box::into_raw(Box::new(Context::new_transform(client, kind, block as usize, flags & OPT_POLAR != 0)));
+        cl.active += 1;
+        unsafe {
+            *ctx_out = ctx;
+            *status_out = (*ctx).status.as_mut_ptr();
+        }
+        record(M, "XDspActivate", &format!("{} block={block} polar={} -> {ctx:p}", if kind == KIND_FFT { "fft" } else { "ifft" }, flags & OPT_POLAR != 0));
+        return S_OK;
     }
     let partitions = (len / 2 / block) as usize;
     let fdl = (partitions + 7) & !7;
@@ -366,13 +447,32 @@ fn submit(ctx: *mut Context, cmd: *const u8, envelope: *const f32, out_seq: *mut
     let g1 = unsafe { core::ptr::read_unaligned(cmd.add(4) as *const f32) };
     let input = unsafe { core::ptr::read_unaligned(cmd.add(8) as *const usize) } as *const f32;
     let output = unsafe { core::ptr::read_unaligned(cmd.add(0x10) as *const usize) } as *mut f32;
+    let mult = unsafe { core::ptr::read_unaligned(cmd.add(0x18) as *const usize) } as *const f32;
+    let (mem, size) = unsafe { ((*c.client).mem, (*c.client).mem_size) };
+    let inside = |p: usize| p >= mem && p - mem < size;
+    if c.kind != KIND_CONVOLUTION {
+        if !inside(input as usize) || !inside(output as usize) || (c.kind == KIND_FFT && !mult.is_null() && !inside(mult as usize)) {
+            return E_INVALIDARG;
+        }
+        c.status[0] = c.status[0].wrapping_add(1);
+        c.transform(input, if c.kind == KIND_FFT { mult } else { core::ptr::null() }, output);
+        c.status[1] = c.status[0];
+        if !out_seq.is_null() {
+            unsafe { *out_seq = c.status[0] };
+        }
+        if LOG.fetch_add(1, Ordering::Relaxed) < 4 {
+            record(M, name, &format!("seq={} {} -> S_OK", c.status[0], if c.kind == KIND_FFT { "fft" } else { "ifft" }));
+        }
+        return S_OK;
+    }
+    if !inside(input as usize) || !inside(output as usize) {
+        return E_INVALIDARG;
+    }
     if c.group == 0 {
         if envelope.is_null() {
             c.envelope = None;
         } else {
-            let (mem, size) = unsafe { ((*c.client).mem, (*c.client).mem_size) };
-            let a = envelope as usize;
-            if a < mem || a - mem >= size {
+            if !inside(envelope as usize) {
                 return E_INVALIDARG;
             }
             let n = ((c.envelope_count + 3) & !3) * (c.irs.len() - 1) + c.envelope_count;

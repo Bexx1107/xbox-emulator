@@ -760,15 +760,10 @@ pub unsafe fn stop_trace_session(out: Option<&mut [u8; 0x78]>) {
     stop_etw_trace(&[], &TRACE_SESSION_GUID, TRACE_SESSION_NAME, out);
 }
 
+pub const STATE_SECTIONS: [(&GUID, &[u16]); 5] = [(&ADAPTERS_GUID, &[0x92, 0x97]), (&TEREDO_GUID, &[0x12, 0x16]), (&PROCESSES_GUID, &[0x1e]), (&PORTS_GUID, &[0x3b, 0x3e, 0x40, 0x42, 0x3c]), (&WFP_GUID, &[0xa6])];
+
 pub unsafe fn log_state_sections() {
-    let sections: [(&GUID, &[u16], &[u8]); 5] = [
-        (&ADAPTERS_GUID, &[0x92, 0x97], b"Couldn't do IP config adapters and routes display (err 0x%08x)!  Continuing.\0"),
-        (&TEREDO_GUID, &[0x12, 0x16], b"Couldn't do Teredo display (err 0x%08x)!  Continuing.\0"),
-        (&PROCESSES_GUID, &[0x1e], b"Couldn't do processes display (err 0x%08x)!  Continuing.\0"),
-        (&PORTS_GUID, &[0x3b, 0x3e, 0x40, 0x42, 0x3c], b"Couldn't do TCP/UDP port display (err 0x%08x)!  Continuing.\0"),
-        (&WFP_GUID, &[0xa6], b"Couldn't perform WFP enumeration (err 0x%08x)!  Continuing.\0"),
-    ];
-    for (g, ids, _msg) in sections.iter() {
+    for (g, ids) in STATE_SECTIONS.iter() {
         for id in ids.iter() {
             wpp_message(g, *id, 0);
         }

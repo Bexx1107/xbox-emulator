@@ -1072,3 +1072,22 @@ Headless runs straight into each title's test scene, on the staged release of 11
   - On the console the user-data registers keep their values; on PC the bindings are undefined.
   - cbv_raw::install_draw_check re-applies the value last set at each param index. It is opt-in with TOMBOX_CBRAW_INHERIT=1 and not yet proven. It does not fix the hang (fast_20261122_100119_trackmania_a6f3c23d).
 - gpu_va gap: many root CBV VAs (0x80xxxxx..0x82xxxxx) are missing from gpu_va's GPU ranges, while bindtrace finds them inside buffer 0x67bf6e80. The overlap eviction in gpu_va::insert_into may be dropping big buffers.
+
+### Minecraft menu: 2026-11-22 10:15 update (scenes sub-chat)
+- MSAA source dumped (rtcap now resolves multisampled colour targets into a temp texture before readback). After A, MSAA RT #007 (1920x1049 fmt 28, state RESOLVE_SOURCE) is black (mean 0.0001), and so is UI RT #005. So this is a DRAW problem, not resolve/present. The title already moves #007 to RESOLVE_SOURCE itself.
+- Per-frame draws: 18+14+1 UI draws (vs 4136d92c5e55f52b/ps ed2309978e8f4716, vs b7819bcf1fc39494/ps 77a9f399ce47b46a, vs 15fe4d6dcf3d7d52) into #005 with SRC_ALPHA/INV_SRC_ALPHA blend, then one composite (vs d3a4d755cc0790c5) samples #005 into #007, then a fullscreen draw (vs e1a5c5c48979aa58).
+- Their inputs look valid. Textures read back with content (logo 1936x365, font atlas 128x128, 9-slice pieces). The CB holds sane GUI ortho matrices (2/640, -2/349.7, translation -1,+1) and colour rows of 1.0. All draws use DrawIndexedInstanced startIdx=1110 with a different VB per draw (stride 12 and 16).
+- Still to check: VB contents, viewport/scissor on the list, and the VS translation (per-draw CB indexing).
+- Harness bug found and fixed: TbFrame2.Backbuffer scaled the 1904x1041 backbuffer to whatever client Find() returned (once 2560x1440), which broke screen matches. It now scales to a fixed per-title size (fast_run sets [TbFrame2]::OutW/OutH from the title's refs).
+
+
+### XTF diagnostics extensions (xtfdiaginfo / xtfeventserver), 2026-11-22
+- xbtp in-process link fabric ignores the address: XbtpLinkConnectByName in device mode (XbtpLinkInitializeSystem returns 0) returns S_OK after the 5000 ms connect loop for any literal, remote ones included, with 0/0 TCP/XTD paths. Nothing leaves the machine, but a remote literal should get the offline unreachable result (offline.rs classes) instead of S_OK. Seen through ConnectionDiagnostic 0x32 test 0xd. Fix belongs in xbtp link.rs.
+- The real system pipe \\.\SEVPIPE\XTF_TITLE_TO_SYSTEM is not served on PC: XbtpOpenPipeSession returns 0x8C110303. So XtfOpenPipeToSystem fails and ConnectionDiagnostic's GetVMProcessList (0xcd88, op 6 ConsoleGetRunningProcesses) ends the operation with 0x8C110303. That matches the console with the system VM down. Missing: an in-process system-VM endpoint that answers op 6 with the emulated process list.
+- xtfdiaginfo #10 LogNetworkState state sections are only WPP marker records: 0x1bdd0 adapters/routes, 0x1c3b4 Teredo, 0x1cee8 processes, 0x1e238 TCP/UDP ports, 0x20644 WFP/IPsec. The emulator has no emulated network view to port them against. What is missing:
+  - an in-process adapter/address/route table for the emulated console, standing in for GetAdaptersAddresses / GetIpForwardTable2 / NsiGetAllParameters;
+  - Teredo state (the NSI Teredo parameters);
+  - TCP/UDP endpoint tables (GetExtendedTcpTable / UDP) built from the sockets the titles opened through the emulator;
+  - an emulated WFP/IPsec object store (providers, sublayers, filters, SAs).
+  - Today the only network model is the address classifier in xbtp/src/offline.rs (loopback real, remote literal unreachable, remote name not found). Host tables must not be read (offline rule), so until that view exists the sections send only their begin/end WPP records (ids 0x92/0x97, 0x12/0x16, 0x1e, 0x3b/0x3e/0x40/0x42/0x3c, 0xa6).
+- ETW elevation: xtfeventserver #4 and xtfdiaginfo #10 TraceStart call the real StartTraceW, which returns 0x80070005 for a non-elevated token. One elevated `cargo test -p xtfeventserver -p xtfdiaginfo` run would verify both. If it returns 0x80070057 instead, the Xbox EVENT_TRACE_FLAG_EXTENSION block in the trace properties (0x19220) is what the PC kernel rejects.

@@ -21,6 +21,10 @@ fn setup() -> std::path::PathBuf {
     dir
 }
 
+fn lock_free_pool_is_none() -> bool {
+    context().pool.lock().unwrap().is_none()
+}
+
 fn wait_until(f: impl Fn() -> bool) -> bool {
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(5) {
@@ -183,6 +187,29 @@ fn from_title_builds_the_runtime_once_listens_on_0x1080_and_idles() {
 
         assert_eq!(install_df_pmc(1, 2, 3, 4), E_ACCESSDENIED);
         assert_eq!(install_l2i_pmc(0x10001, 2, 3, 4), E_ACCESSDENIED);
+
+        assert_eq!(context().state.load(Ordering::SeqCst), 1);
+        assert_eq!(event_buffer(), [0, 0, 0]);
+        assert_eq!(thread_event_buffer(0), 0);
+        assert_eq!(event_buffer(), [0, 0, usize::MAX]);
+        assert_eq!(thread_event_buffer(1), 0);
+        assert_eq!(event_buffer(), [0, 0, usize::MAX]);
+        assert!(lock_free_pool_is_none());
+        std::thread::spawn(|| assert_eq!(event_buffer(), [0, 0, 0])).join().unwrap();
+
+        assert_eq!(XMON_GEN.load(Ordering::SeqCst), 0x15);
+        assert_eq!(slot8(0x1f, 0, 0, 0), E_INVALIDARG);
+        assert_eq!(slot8(0, 0, 0, 0x1f), E_INVALIDARG);
+        assert_eq!(slot8(0, 1, 2, 0x1e), E_ACCESSDENIED);
+        assert_eq!(XMON_GEN.load(Ordering::SeqCst), 0x15);
+        assert_eq!(driver_gen(), 0x15);
+        XMON_GEN.store(0x18, Ordering::SeqCst);
+        assert_eq!(slot8(0x1000, 0, 0, 0), E_ACCESSDENIED);
+        assert_eq!(XMON_GEN.load(Ordering::SeqCst), 0x15);
+        XMON_GEN.store(0x18, Ordering::SeqCst);
+        assert!(!xmon_tables_valid());
+        XMON_GEN.store(0x15, Ordering::SeqCst);
+        assert!(xmon_tables_valid());
 
         assert_eq!(PROVIDER_STATE.bits.load(Ordering::SeqCst), 0);
         let name: Vec<u16> = "fps".encode_utf16().chain(Some(0)).collect();

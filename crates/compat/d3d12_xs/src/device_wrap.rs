@@ -803,6 +803,32 @@ unsafe extern "system" fn create_gfx_pso_sync(
         return E_FAIL;
     }
     let mut desc = unsafe { core::slice::from_raw_parts(pdesc, DESC_SIZE).to_vec() };
+    if std::env::var_os("TOMBOX_DBG_CULL_NONE").is_some() {
+        desc[0x1c8..0x1cc].copy_from_slice(&1u32.to_le_bytes());
+    }
+    if crate::rtcap::enabled() {
+        let ptr = u64::from_le_bytes(desc[0x228..0x230].try_into().unwrap()) as *const u8;
+        let n = u32::from_le_bytes(desc[0x230..0x234].try_into().unwrap()) as usize;
+        if !ptr.is_null() && n > 0 && n <= 16 {
+            let src = unsafe { core::slice::from_raw_parts(ptr, n * 32) };
+            let els: Vec<String> = (0..n).map(|i| {
+                let e = &src[i * 32..i * 32 + 32];
+                let u = |o: usize| u32::from_le_bytes(e[o..o + 4].try_into().unwrap());
+                let np = u64::from_le_bytes(e[0..8].try_into().unwrap()) as *const u8;
+                let mut name = String::new();
+                let mut k = 0;
+                while !np.is_null() && k < 64 && unsafe { *np.add(k) } != 0 {
+                    name.push(unsafe { *np.add(k) } as char);
+                    k += 1;
+                }
+                format!("{name}{} fmt={} slot={} off={} class={} step={}", u(8), u(12), u(16), u(20), u(24), u(28))
+            }).collect();
+            let vs = u64::from_le_bytes(desc[0x08..0x10].try_into().unwrap()) as *const u8;
+            let vn = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap()) as usize;
+            let h = if vs.is_null() || vn == 0 { 0 } else { crate::shader_xlat::fnv1a(unsafe { core::slice::from_raw_parts(vs, vn) }) };
+            record("d3d12_xs", "psolayout", &format!("vs={h:016x} elements: {}", els.join(" | ")));
+        }
+    }
     let rd = |d: &[u8], o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
     // Keep translated bytecode alive until the PSO is created.
     let mut keep: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
@@ -1093,8 +1119,9 @@ pub fn pso_summary(pso: usize) -> Option<(usize, usize, String)> {
     let q = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap()) as usize;
     let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
     // D3D12_BLEND_DESC at 0x78: AlphaToCoverage, IndependentBlend, then RT0 {BlendEnable, LogicOpEnable, Src, Dest, Op, SrcA, DestA, OpA, LogicOp, WriteMask}
-    let state = format!("depth(en={} write={} func={}) blend0(en={} src={} dst={} op={} srcA={} dstA={} mask={:#x}) nRT={}",
-        u(0x1f0), u(0x1f4), u(0x1f8), u(0x80), u(0x88), u(0x8c), u(0x90), u(0x94), u(0x98), d[0xa4], u(0x240));
+    let state = format!("depth(en={} write={} func={}) stencil(en={} rmask={:#x} wmask={:#x}) raster(fill={} cull={} ccw={} clip={}) samplemask={:#x} topo={} blend0(en={} src={} dst={} op={} srcA={} dstA={} mask={:#x}) nRT={}",
+        u(0x1f0), u(0x1f4), u(0x1f8), u(0x1fc), d[0x200], d[0x201], u(0x1c4), u(0x1c8), u(0x1cc), u(0x1dc), u(0x1c0), u(0x23c),
+        u(0x80), u(0x88), u(0x8c), u(0x90), u(0x94), u(0x98), d[0xa4], u(0x240));
     Some((q(0x08), q(0x18), state))
 }
 

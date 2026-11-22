@@ -13,8 +13,8 @@
   },
   "rdna2_instructions": {
    "done": 768,
-   "total": 783,
-   "pct": 98.08
+   "total": 794,
+   "pct": 96.73
   },
   "shaders_translated": {
    "done": 105506,
@@ -47,9 +47,9 @@
  },
  "extra": {
   "console_exports": {
-   "done": 2142,
+   "done": 2143,
    "total": 2155,
-   "pct": 99.4
+   "pct": 99.44
   },
   "shader_compile_lobby_frame": {
    "done": 139,
@@ -97,9 +97,9 @@
    "pct": 97.14
   },
   "console_exports_targeted": {
-   "done": 2142,
+   "done": 2143,
    "total": 2154,
-   "pct": 99.44
+   "pct": 99.49
   },
   "console_exports_not_targeted": {
    "done": null,
@@ -111,14 +111,14 @@
  "all_including_pc": {
   "note": "previous definition, kept for history: every export of every console OS DLL and every title import, PC-provided ones included",
   "console_exports": {
-   "done": 21799,
+   "done": 21800,
    "total": 23743,
-   "pct": 91.81
+   "pct": 91.82
   },
   "xbox_only_exports": {
-   "done": 2066,
+   "done": 2067,
    "total": 2078,
-   "pct": 99.42
+   "pct": 99.47
   },
   "title_import_status": {
    "Fortnite": {

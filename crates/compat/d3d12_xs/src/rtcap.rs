@@ -658,8 +658,75 @@ pub fn trace_draw(list: usize, compute: bool, text: &str) {
                 }
             }
         }
-        record("d3d12_xs", "drawtrace", &format!("{l} rt=[{}] ds={ds}\n{b}", rts.join(" | ")));
+        let f32s = |v: &[u8]| -> String { v.chunks_exact(4).map(|c| format!("{}", f32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>().join(",") };
+        let i32s = |v: &[u8]| -> String { v.chunks_exact(4).map(|c| format!("{}", i32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>().join(",") };
+        let rs = [list, list_key(list)].iter().find_map(|&k| crate::cl2_state::raster_snapshot(k).map(|r| (k, r)));
+        let rs = match rs {
+            Some((k, (vp, sc, st, pso))) => format!("list {k:#x} viewports=[{}] scissors=[{}] stencilRef={st:?} cl2pso={pso:x?}", f32s(&vp), i32s(&sc)),
+            None => "no cl2 raster state for this list".to_string(),
+        };
+        let mem = dump_vertices(list, &l);
+        record("d3d12_xs", "drawtrace", &format!("{l} rt=[{}] ds={ds} | {rs}\n{mem}{b}", rts.join(" | ")));
     }
+}
+
+fn read_self(addr: u64, n: usize) -> Option<Vec<u8>> {
+    extern "system" {
+        fn ReadProcessMemory(p: *mut c_void, base: *const c_void, buf: *mut c_void, n: usize, read: *mut usize) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+    }
+    let mut v = vec![0u8; n];
+    let mut got = 0usize;
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), addr as *const c_void, v.as_mut_ptr() as *mut c_void, n, &mut got) };
+    if ok != 0 && got == n {
+        return Some(v);
+    }
+    let (e, off) = crate::gpu_va::lookup(addr).or_else(|| crate::gpu_va::lookup_gpu(addr))?;
+    if !e.buffer || off + n as u64 > e.len {
+        return None;
+    }
+    let r = e.res as *mut c_void;
+    let mut p: *mut u8 = core::ptr::null_mut();
+    let hr = unsafe { vcall!(r, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut p) };
+    if hr < 0 || p.is_null() {
+        return None;
+    }
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), p.add(off as usize) as *const c_void, v.as_mut_ptr() as *mut c_void, n, &mut got) };
+    unsafe { vcall!(r, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null()) };
+    if ok != 0 && got == n { Some(v) } else { None }
+}
+
+fn dump_vertices(list: usize, text: &str) -> String {
+    let num = |key: &str| -> Option<i64> {
+        let p = text.find(key)? + key.len();
+        let s: String = text[p..].chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+        s.parse().ok()
+    };
+    let (Some(start), Some(base)) = (num("startIdx="), num("baseVtx=")) else { return String::new() };
+    let vb = text.find("vb=[0:0x").and_then(|p| {
+        let r = &text[p + 8..];
+        let hex: String = r.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        let st = r.find('/')?;
+        let stride: String = r[st + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        Some((u64::from_str_radix(&hex, 16).ok()?, stride.parse::<u64>().ok()?))
+    });
+    let Some((vb, stride)) = vb else { return "  vertices: no vb0\n".into() };
+    let ib = [list, list_key(list)].iter().find_map(|&k| crate::console_slots::bound_ib(k));
+    let Some(ib) = ib else { return "  vertices: no index buffer view recorded\n".into() };
+    let isz = if ib.format == 57 { 2u64 } else { 4 };
+    let mut out = format!("  ib va={:#x} size={} fmt={}\n", ib.va, ib.size, ib.format);
+    let Some(raw) = read_self(ib.va + start as u64 * isz, (6 * isz) as usize) else { return out + "  ib not CPU-readable at that VA\n" };
+    for i in 0..6 {
+        let idx = if isz == 2 { u16::from_le_bytes(raw[i * 2..i * 2 + 2].try_into().unwrap()) as i64 } else { u32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap()) as i64 };
+        let at = vb as i64 + (idx + base) * stride as i64;
+        let v = read_self(at as u64, stride as usize).map(|b| {
+            let f: Vec<String> = b.chunks_exact(4).map(|c| format!("{:.4}", f32::from_le_bytes(c.try_into().unwrap()))).collect();
+            let h: Vec<String> = b.chunks_exact(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
+            format!("[{}] hex[{}]", f.join(", "), h.join(" "))
+        }).unwrap_or_else(|| "unreadable".into());
+        out.push_str(&format!("  v{i} idx={idx} {v}\n"));
+    }
+    out
 }
 
 /// kind: 0 draw, 1 indexed draw, 2 dispatch, 3 indirect. Returns false when the draw must

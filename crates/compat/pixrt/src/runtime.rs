@@ -117,6 +117,11 @@ extern "system" {
     fn GetModuleHandleW(n: *const u16) -> usize;
     fn LoadLibraryW(n: *const u16) -> usize;
     fn GetProcAddress(m: usize, n: *const u8) -> usize;
+    fn GetCurrentThreadId() -> u32;
+    fn VirtualAlloc(a: usize, size: usize, kind: u32, prot: u32) -> usize;
+    fn VirtualFree(a: usize, size: usize, kind: u32) -> i32;
+    fn CreateEventA(sa: *mut c_void, manual: i32, initial: i32, name: *const u8) -> Handle;
+    fn CloseHandle(h: Handle) -> i32;
 }
 
 #[link(name = "ntdll")]
@@ -241,6 +246,8 @@ pub struct Context {
     pub version: AtomicU32,
     pub capture_if: AtomicUsize,
     pub capture_arg: AtomicUsize,
+    pub state: AtomicU32,
+    pub pool: Mutex<Option<Box<BlockPool>>>,
 }
 
 static CONTEXT: OnceLock<Context> = OnceLock::new();
@@ -261,6 +268,8 @@ pub fn context() -> &'static Context {
             version: AtomicU32::new(0),
             capture_if: AtomicUsize::new(0),
             capture_arg: AtomicUsize::new(0),
+            state: AtomicU32::new(1),
+            pool: Mutex::new(None),
         }
     })
 }
@@ -783,14 +792,313 @@ pub unsafe extern "system" fn capture_state() -> u32 {
     CAPTURE.state.load(Ordering::SeqCst)
 }
 
-pub unsafe extern "system" fn thread_event_buffer(_rdtsc_once: u8) -> u64 {
-    record("thread event buffer", "slot 7 (0x22570 -> 0x2cf30: per-thread CPU event buffer flush to context+0x468 and refill via 0x2c9dc) is not ported");
-    0
+pub const POOL_GROW: usize = 0x10_0000;
+pub const EVENT_BUFFER_BYTES: usize = 0x3e00;
+pub const EVENT_BUFFER_HEADER: usize = 0x20;
+pub const EVENT_BUFFER_FIRST: u64 = 0xfff80;
+pub const HR_NO_CAPTURE: i32 = 0x8abc_01fbu32 as i32;
+pub const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+
+struct PoolInner {
+    base: usize,
+    reserved: usize,
+    block: usize,
+    committed: usize,
+    free: std::collections::VecDeque<usize>,
+    full: std::collections::VecDeque<usize>,
+    in_use: Vec<u32>,
+    in_use_count: usize,
+    blocks: usize,
 }
 
-pub unsafe extern "system" fn slot8(_a: u32, _b: u32, _c: u32, _d: u32) -> i32 {
-    record("slot 8", "slot 8 (0x22f70: limit check on 0x5f994, 0x44dd0/0x45764/0x453a4) is not ported");
-    E_NOTIMPL
+pub struct BlockPool {
+    inner: Mutex<PoolInner>,
+    recycle: bool,
+    event: Handle,
+    owned: bool,
+}
+
+unsafe impl Send for BlockPool {}
+unsafe impl Sync for BlockPool {}
+
+impl BlockPool {
+    pub unsafe fn new(base: usize, reserved: usize, committed: usize, block: usize) -> Option<BlockPool> {
+        if block == 0 || committed > reserved {
+            return None;
+        }
+        let owned = base == 0;
+        let base = if owned { VirtualAlloc(0, reserved, 0x2000, 4) } else { base };
+        if base == 0 {
+            return None;
+        }
+        if committed != 0 && VirtualAlloc(base, committed, 0x1000, 4) == 0 {
+            if owned {
+                VirtualFree(base, 0, 0x8000);
+            }
+            return None;
+        }
+        let blocks = reserved / block;
+        let mut free = std::collections::VecDeque::new();
+        let mut b = base;
+        while b + block <= base + committed {
+            free.push_back(b);
+            b += block;
+        }
+        let event = CreateEventA(core::ptr::null_mut(), 0, 0, core::ptr::null());
+        Some(BlockPool {
+            inner: Mutex::new(PoolInner { base, reserved, block, committed, free, full: Default::default(), in_use: vec![0; blocks.div_ceil(32).max(1)], in_use_count: 0, blocks }),
+            recycle: true,
+            event,
+            owned,
+        })
+    }
+
+    pub fn full_event(&self) -> Handle {
+        self.event
+    }
+
+    pub fn in_use(&self) -> usize {
+        lock(&self.inner).in_use_count
+    }
+
+    pub fn full_len(&self) -> usize {
+        lock(&self.inner).full.len()
+    }
+
+    pub fn free_len(&self) -> usize {
+        lock(&self.inner).free.len()
+    }
+
+    pub fn take_full(&self) -> Option<usize> {
+        lock(&self.inner).full.pop_front()
+    }
+
+    pub fn give_back(&self, b: usize) {
+        lock(&self.inner).free.push_back(b);
+    }
+
+    unsafe fn grow(p: &mut PoolInner) -> usize {
+        if p.committed + POOL_GROW > p.reserved {
+            return 0;
+        }
+        let at = p.base + p.committed;
+        if VirtualAlloc(at, POOL_GROW, 0x1000, 4) == 0 {
+            return 0;
+        }
+        p.committed += POOL_GROW;
+        at
+    }
+
+    pub unsafe fn acquire(&self) -> usize {
+        let mut p = lock(&self.inner);
+        let mut got = p.free.pop_front().unwrap_or(0);
+        if got == 0 && p.block < POOL_GROW {
+            let at = Self::grow(&mut p);
+            if at != 0 {
+                let end = at + POOL_GROW;
+                let mut b = at;
+                while b + p.block < end {
+                    p.free.push_back(b);
+                    b += p.block;
+                }
+                got = p.free.pop_front().unwrap_or(0);
+            }
+        }
+        if got == 0 && self.recycle {
+            got = p.full.pop_front().unwrap_or(0);
+        }
+        if got != 0 {
+            let i = (got - p.base) / p.block;
+            let bit = 1u32 << (i & 0x1f);
+            if p.in_use[i >> 5] & bit == 0 {
+                p.in_use[i >> 5] |= bit;
+                p.in_use_count += 1;
+            }
+        }
+        got
+    }
+
+    pub unsafe fn release(&self, b: usize) {
+        let mut p = lock(&self.inner);
+        let i = (b - p.base) / p.block;
+        let bit = 1u32 << (i & 0x1f);
+        if p.in_use[i >> 5] & bit == 0 {
+            return;
+        }
+        p.in_use[i >> 5] &= !bit;
+        p.in_use_count -= 1;
+        p.full.push_back(b);
+        if p.full.len() > p.blocks >> 1 && self.event != 0 {
+            SetEvent(self.event);
+        }
+    }
+}
+
+impl Drop for BlockPool {
+    fn drop(&mut self) {
+        unsafe {
+            if self.event != 0 {
+                CloseHandle(self.event);
+            }
+            if self.owned {
+                VirtualFree(lock(&self.inner).base, 0, 0x8000);
+            }
+        }
+    }
+}
+
+pub unsafe fn create_capture_pool(base: usize, reserved: usize, committed: usize, block: usize) -> i32 {
+    let c = context();
+    let mut slot = lock(&c.pool);
+    if slot.is_some() {
+        return S_OK;
+    }
+    match BlockPool::new(base, reserved, committed, block) {
+        Some(p) => {
+            *slot = Some(Box::new(p));
+            S_OK
+        }
+        None => E_OUTOFMEMORY,
+    }
+}
+
+thread_local! {
+    static EVENT_BUFFER: core::cell::Cell<[usize; 3]> = const { core::cell::Cell::new([0; 3]) };
+}
+
+pub fn event_buffer() -> [usize; 3] {
+    EVENT_BUFFER.with(|c| c.get())
+}
+
+pub fn set_event_buffer_cursor(cursor: usize) {
+    EVENT_BUFFER.with(|c| {
+        let mut t = c.get();
+        t[2] = cursor;
+        c.set(t)
+    })
+}
+
+fn rdtsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+unsafe fn acquire_event_buffer(c: &Context) -> Result<usize, i32> {
+    if c.state.load(Ordering::SeqCst) == 1 {
+        return Err(HR_NO_CAPTURE);
+    }
+    match lock(&c.pool).as_ref() {
+        Some(p) => match p.acquire() {
+            0 => Err(E_OUTOFMEMORY),
+            b => Ok(b),
+        },
+        None => Err(E_UNEXPECTED),
+    }
+}
+
+pub unsafe extern "system" fn thread_event_buffer(once: u8) -> u64 {
+    let mut ts = if once != 0 { rdtsc() } else { 0 };
+    let c = context();
+    let t = event_buffer();
+    if t[0] != 0 {
+        let b = t[0] as *mut u8;
+        let used = (t[2].wrapping_sub(t[0]).wrapping_sub(EVENT_BUFFER_HEADER) as u32) & 0xffff_fff8;
+        (b.add(8) as *mut u32).write_unaligned(used);
+        (b.add(0x18) as *mut u64).write_unaligned(if once != 0 { ts } else { rdtsc() });
+        if let Some(p) = lock(&c.pool).as_ref() {
+            p.release(t[0]);
+        }
+    }
+    match acquire_event_buffer(c) {
+        Ok(b) => {
+            let cur = b + EVENT_BUFFER_HEADER;
+            EVENT_BUFFER.with(|x| x.set([b, b + EVENT_BUFFER_BYTES, cur]));
+            (cur as *mut u64).write_unaligned(EVENT_BUFFER_FIRST);
+            let p = b as *mut u8;
+            p.write(0);
+            (p.add(8) as *mut u32).write_unaligned(0);
+            (p.add(4) as *mut u32).write_unaligned(GetCurrentThreadId());
+            (p.add(0x18) as *mut u64).write_unaligned(u64::MAX);
+            if once == 0 {
+                ts = rdtsc();
+            }
+            (p.add(0x10) as *mut u64).write_unaligned(ts);
+            ts
+        }
+        Err(_) => {
+            EVENT_BUFFER.with(|x| x.set([0, 0, usize::MAX]));
+            0
+        }
+    }
+}
+
+pub const XMON_TABLE_ROWS: u32 = 0x1f;
+pub const IOCTL_XMON_QUERY: u32 = 0x8fff_2058;
+pub const IOCTL_CORE_PMC: u32 = 0x8fff_2094;
+pub const CORE_PMC_GUID: [u32; 4] = [0, 1, 1, 1];
+pub static XMON_GEN: AtomicU32 = AtomicU32::new(0x15);
+static DRIVER_GEN: OnceLock<u32> = OnceLock::new();
+const MSG_XMON_DEVICE: &[u8] = b"Error installing performance monitor configuration device.\n\0";
+const MSG_XMON_COUNT: &[u8] = b"!!! XMon: Number of element unmatched between xMonPMCEventID enum and g_xMonPMC\n\0";
+
+pub fn xmon_limit(gen: u32) -> u32 {
+    match gen {
+        0x15..=0x17 => XMON_TABLE_ROWS,
+        _ => 0xffff,
+    }
+}
+
+unsafe fn close_xmon(h: Handle) {
+    if h.wrapping_sub(1) <= usize::MAX - 3 {
+        NtClose(h);
+    }
+}
+
+pub unsafe fn xmon_query() -> Result<u32, i32> {
+    let h = open_xmon();
+    if h == 0 {
+        OutputDebugStringA(MSG_XMON_DEVICE.as_ptr());
+        return Err(E_ACCESSDENIED);
+    }
+    let mut out = [0u8; 0x10c];
+    let mut ret = 0u32;
+    let ok = DeviceIoControl(h, IOCTL_XMON_QUERY, core::ptr::null_mut(), 0, out.as_mut_ptr() as *mut c_void, 0x10c, &mut ret, core::ptr::null_mut()) != 0;
+    close_xmon(h);
+    if !ok || ret != 0x10c {
+        return Err(E_ACCESSDENIED);
+    }
+    Ok(u32::from_le_bytes([out[0x108], out[0x109], out[0x10a], out[0x10b]]))
+}
+
+pub fn driver_gen() -> u32 {
+    *DRIVER_GEN.get_or_init(|| unsafe { xmon_query().unwrap_or(0x15) })
+}
+
+pub unsafe fn xmon_tables_valid() -> bool {
+    let gen = XMON_GEN.load(Ordering::SeqCst);
+    let mut ok = true;
+    if !(0x15..=0x17).contains(&gen) {
+        OutputDebugStringA(MSG_XMON_COUNT.as_ptr());
+        ok = false;
+    }
+    if !(0x15..=0x17).contains(&driver_gen()) {
+        record("slot 8", "the xmon driver reported a PMC generation outside 0x15..0x17; the console reads a null g_xMonPMC table there (0x45868)");
+        return false;
+    }
+    ok
+}
+
+pub unsafe extern "system" fn slot8(a: u32, b: u32, c: u32, d: u32) -> i32 {
+    let lim = xmon_limit(XMON_GEN.load(Ordering::SeqCst));
+    if a >= lim || b >= lim || c >= lim || d >= lim {
+        return E_INVALIDARG;
+    }
+    driver_gen();
+    XMON_GEN.store(xmon_query().unwrap_or(0x15), Ordering::SeqCst);
+    if !xmon_tables_valid() {
+        return E_UNEXPECTED;
+    }
+    let g = CORE_PMC_GUID;
+    install_pmc_input(IOCTL_CORE_PMC, MSG_XMON_DEVICE, [0, g[0], g[1], g[2], g[3], a & 0xffff, b & 0xffff, c & 0xffff, d & 0xffff])
 }
 
 static PMC_EVENT_HANDLE: AtomicUsize = AtomicUsize::new(0);
@@ -817,12 +1125,15 @@ unsafe fn open_xmon() -> Handle {
 }
 
 unsafe fn install_pmc(code: u32, msg: &[u8], a: u32, b: u32, c: u32, d: u32) -> i32 {
+    install_pmc_input(code, msg, [1, 0, 0, 0, 0, a & 0xffff, b & 0xffff, c & 0xffff, d & 0xffff])
+}
+
+unsafe fn install_pmc_input(code: u32, msg: &[u8], mut inb: [u32; 9]) -> i32 {
     let h = open_xmon();
     if h == 0 {
         OutputDebugStringA(msg.as_ptr());
         return E_ACCESSDENIED;
     }
-    let mut inb: [u32; 9] = [1, 0, 0, 0, 0, a & 0xffff, b & 0xffff, c & 0xffff, d & 0xffff];
     let mut out = 0u64;
     let mut ret = 0u32;
     let ok = DeviceIoControl(h, code, inb.as_mut_ptr() as *mut c_void, 0x24, &mut out as *mut u64 as *mut c_void, 8, &mut ret, core::ptr::null_mut()) != 0;
@@ -835,9 +1146,7 @@ unsafe fn install_pmc(code: u32, msg: &[u8], a: u32, b: u32, c: u32, d: u32) -> 
         SetEvent(ev);
     }
     let ok2 = DeviceIoControl(h, IOCTL_PMC_APPLY, core::ptr::null_mut(), 0, &mut out as *mut u64 as *mut c_void, 8, &mut ret, core::ptr::null_mut()) != 0;
-    if h != usize::MAX {
-        NtClose(h);
-    }
+    close_xmon(h);
     if ok2 {
         hr
     } else {

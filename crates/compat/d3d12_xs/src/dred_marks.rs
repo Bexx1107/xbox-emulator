@@ -129,6 +129,13 @@ pub fn inherit(new: *mut c_void, base: *mut c_void) {
     }
 }
 
+pub fn hashes(pso: usize) -> Option<Hashes> {
+    if !enabled() {
+        return None;
+    }
+    table().lock().unwrap_or_else(|e| e.into_inner()).get(&pso).map(|e| e.0)
+}
+
 pub fn forget(pso: usize) {
     if !enabled() {
         return;

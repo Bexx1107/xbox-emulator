@@ -407,6 +407,12 @@ pub(crate) fn clone_state(from: *mut c_void, to: *mut c_void) {
     }
 }
 
+pub fn raster_snapshot(list: usize) -> Option<(Vec<u8>, Vec<u8>, Option<u32>, Option<usize>)> {
+    let g = STATES[shard_of(list)].lock().unwrap_or_else(|e| e.into_inner());
+    let s = g.as_ref()?.get(&list)?;
+    Some((s.viewports.clone().unwrap_or_default(), s.scissors.clone().unwrap_or_default(), s.stencil, s.pso))
+}
+
 fn rec<R>(list: *mut c_void, f: impl FnOnce(&mut ListState) -> R) -> R {
     with(list, |s| {
         s.open = true;
