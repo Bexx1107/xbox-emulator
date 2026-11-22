@@ -256,12 +256,14 @@ struct Object {
     volumes: Option<Vec<f32>>,
     properties: Option<[u32; 4]>,
     notify: bool,
+    notify_id: u32,
+    watch: Option<String>,
     list_cursor: usize,
 }
 
 impl Object {
     fn new(kind: u32, parent: u32, device: Option<String>) -> Self {
-        Object { kind, parent, device, stream: None, gain: 1.0, mute: false, volumes: None, properties: None, notify: false, list_cursor: 0 }
+        Object { kind, parent, device, stream: None, gain: 1.0, mute: false, volumes: None, properties: None, notify: false, notify_id: 0, watch: None, list_cursor: 0 }
     }
 }
 
@@ -650,10 +652,8 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
             let b: u32 = rd(a, 0);
             wasapi::session_set_ducking(device_for(object).as_deref(), &session_guid(), b != 0)
         }
-        SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER | ENDPOINT_REGISTER => register(object, true),
-        SESSION_MANAGER_UNREGISTER | ENDPOINT_UNREGISTER => register(object, false),
-        ENUMERATOR_SUBSCRIBE => register(object, true),
-        ENUMERATOR_UNSUBSCRIBE => register(object, false),
+        SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER | ENDPOINT_REGISTER | ENUMERATOR_SUBSCRIBE => subscribe(object, id, true),
+        SESSION_MANAGER_UNREGISTER | ENDPOINT_UNREGISTER | ENUMERATOR_UNSUBSCRIBE => subscribe(object, id, false),
         ENDPOINT_HOST_STREAM_MODES => {
             wr(a, 0, 0u32);
             wr(a, 4, 0u32);
@@ -934,15 +934,146 @@ unsafe fn session_volume(id: u32, object: u32, a: *mut u8) -> i32 {
     }
     r
 }
-fn register(object: u32, on: bool) -> i32 {
+fn subscribe(object: u32, id: u32, on: bool) -> i32 {
+    if !state().objects.contains_key(&object) {
+        return E_INVALIDARG;
+    }
+    let mut watch = None;
+    if on {
+        wasapi::set_event_sink(pc_event);
+        let hr = match id {
+            ENUMERATOR_SUBSCRIBE => wasapi::watch_devices(),
+            ENDPOINT_REGISTER => {
+                watch = Some(endpoint_key(&device_for(object)));
+                S_OK
+            }
+            _ => S_OK,
+        };
+        if hr < 0 {
+            return hr;
+        }
+    }
     let mut s = state();
     match s.objects.get_mut(&object) {
         Some(o) => {
             o.notify = on;
-            compat_common::record_raw("crossvm-audio", "notify", &format!("object {object:#x} notifications {}", if on { "registered" } else { "unregistered" }));
+            o.notify_id = if on { id } else { 0 };
+            o.watch = watch;
+            compat_common::record_raw("crossvm-audio", "notify", &format!("object {object:#x} notifications {} by {id:#x}", if on { "registered" } else { "unregistered" }));
             S_OK
         }
         None => E_INVALIDARG,
+    }
+}
+
+pub const NOTIFY_RECORD: usize = 0xc;
+pub const DEVICE_RECORD_ID: usize = 0x34;
+pub const DEVICE_RECORD_MAX_CHARS: usize = (gchost_frame() - NOTIFY_RECORD - DEVICE_RECORD_ID) / 2;
+pub const VOLUME_RECORD_CHANNELS: usize = 0x38;
+
+const fn gchost_frame() -> usize {
+    crate::gchost::AUDIO_FRAME
+}
+
+pub fn device_record(kind: u32, id: &str, a: u32, b: u32, key: Option<&wasapi::PropertyKey>) -> Option<Vec<u8>> {
+    let w: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+    if w.len() > DEVICE_RECORD_MAX_CHARS {
+        return None;
+    }
+    let mut r = vec![0u8; DEVICE_RECORD_ID + w.len() * 2];
+    let n = r.len() as u32;
+    r[0..4].copy_from_slice(&n.to_le_bytes());
+    r[0x18..0x1c].copy_from_slice(&kind.to_le_bytes());
+    match kind {
+        1 => r[0x1c..0x20].copy_from_slice(&a.to_le_bytes()),
+        4 => {
+            r[0x1c..0x20].copy_from_slice(&a.to_le_bytes());
+            r[0x20..0x24].copy_from_slice(&b.to_le_bytes());
+        }
+        5 => {
+            let k = key?;
+            r[0x1c..0x2c].copy_from_slice(&k.fmtid);
+            r[0x2c..0x30].copy_from_slice(&k.pid.to_le_bytes());
+        }
+        _ => {}
+    }
+    for (i, c) in w.iter().enumerate() {
+        r[DEVICE_RECORD_ID + 2 * i..DEVICE_RECORD_ID + 2 * i + 2].copy_from_slice(&c.to_le_bytes());
+    }
+    Some(r)
+}
+
+pub fn volume_record(ctx: &[u8; 16], muted: bool, master: f32, channels: &[f32]) -> Option<Vec<u8>> {
+    let mut r = vec![0u8; VOLUME_RECORD_CHANNELS + 4 * channels.len()];
+    if NOTIFY_RECORD + r.len() > gchost_frame() {
+        return None;
+    }
+    r[0x18..0x28].copy_from_slice(ctx);
+    r[0x28..0x2c].copy_from_slice(&(muted as u32).to_le_bytes());
+    r[0x2c..0x30].copy_from_slice(&master.to_le_bytes());
+    r[0x30..0x34].copy_from_slice(&(channels.len() as u32).to_le_bytes());
+    for (i, c) in channels.iter().enumerate() {
+        r[VOLUME_RECORD_CHANNELS + 4 * i..VOLUME_RECORD_CHANNELS + 4 * i + 4].copy_from_slice(&c.to_le_bytes());
+    }
+    Some(r)
+}
+
+pub fn notify_frame(listener: u32, record: &[u8]) -> Vec<u8> {
+    let mut f = vec![0u8; gchost_frame()];
+    f[4..8].copy_from_slice(&listener.to_le_bytes());
+    f[NOTIFY_RECORD..NOTIFY_RECORD + record.len()].copy_from_slice(record);
+    f
+}
+
+fn sent() -> std::sync::MutexGuard<'static, Vec<(i32, Vec<u8>)>> {
+    static S: std::sync::OnceLock<Mutex<Vec<(i32, Vec<u8>)>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn sent_notifications() -> Vec<(i32, Vec<u8>)> {
+    sent().clone()
+}
+
+fn pc_event(e: wasapi::PcEvent) {
+    let mut frames = Vec::new();
+    {
+        let s = state();
+        for (&k, o) in s.objects.iter().filter(|(_, o)| o.notify) {
+            let rec = match (&e, o.notify_id) {
+                (wasapi::PcEvent::Device { kind, id, a, b, key }, ENUMERATOR_SUBSCRIBE) => device_record(*kind, id, *a, *b, key.as_ref()),
+                _ => None,
+            };
+            if let Some(r) = rec {
+                frames.push(notify_frame(k, &r));
+            }
+        }
+    }
+    deliver(frames);
+}
+
+fn endpoint_changed(object: u32, ctx: &[u8; 16]) {
+    let key = endpoint_key(&device_for(object));
+    let mut frames = Vec::new();
+    {
+        let s = state();
+        let Some(e) = s.endpoints.get(&key) else { return };
+        let Some(r) = volume_record(ctx, e.mute, e.scalar, &e.channels) else { return };
+        for (&k, _) in s.objects.iter().filter(|(_, o)| o.notify && o.notify_id == ENDPOINT_REGISTER && o.watch.as_deref() == Some(key.as_str())) {
+            frames.push(notify_frame(k, &r));
+        }
+    }
+    deliver(frames);
+}
+
+fn deliver(frames: Vec<Vec<u8>>) {
+    for f in frames {
+        let hr = crate::gchost::push_audio(&f);
+        compat_common::record_raw("crossvm-audio", "notify", &format!("host->guest notification to listener {:#x}, record kind {:#x} -> {hr:#010x}", u32::from_le_bytes(f[4..8].try_into().unwrap()), u32::from_le_bytes(f[0x24..0x28].try_into().unwrap())));
+        let mut l = sent();
+        if l.len() >= 256 {
+            l.remove(0);
+        }
+        l.push((hr, f));
     }
 }
 
@@ -1056,6 +1187,26 @@ pub fn plain_format(f: &[u8]) -> [u8; PLAIN_FORMAT] {
 }
 
 unsafe fn endpoint_volume(id: u32, object: u32, a: *mut u8) -> i32 {
+    let ctx_at = match id {
+        SET_ENDPOINT_VOLUME_LEVEL | SET_ENDPOINT_VOLUME_SCALAR => Some(4),
+        SET_ENDPOINT_CHANNEL_LEVEL | SET_ENDPOINT_CHANNEL_SCALAR => Some(8),
+        SET_ENDPOINT_MUTE => Some(1),
+        ENDPOINT_STEP_UP | ENDPOINT_STEP_DOWN => Some(0),
+        _ => None,
+    };
+    let ctx = ctx_at.map(|o| {
+        let mut g = [0u8; 16];
+        core::ptr::copy_nonoverlapping(a.add(o), g.as_mut_ptr(), 16);
+        g
+    });
+    let hr = endpoint_volume_call(id, object, a);
+    if let (Some(g), S_OK) = (ctx, hr) {
+        endpoint_changed(object, &g);
+    }
+    hr
+}
+
+unsafe fn endpoint_volume_call(id: u32, object: u32, a: *mut u8) -> i32 {
     let dev = device_for(object);
     let caps = match wasapi::endpoint_caps(dev.as_deref()) {
         Ok(c) => c,

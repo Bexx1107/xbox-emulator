@@ -1254,3 +1254,122 @@ unsafe fn run_capture(o: Open, ring: Ring, q: CaptureQueue, s: Arc<Shared>, tx: 
     slot::<unsafe extern "system" fn(*mut c_void) -> i32>(c.0, 11)(c.0);
     s.client.store(0, Ordering::SeqCst);
 }
+
+const IID_IUNKNOWN: Guid = Guid { data1: 0, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+const IID_IMM_NOTIFICATION_CLIENT: Guid = Guid { data1: 0x7991EEC9, data2: 0x7E89, data3: 0x4D85, data4: [0x83, 0x90, 0x6C, 0x70, 0x3C, 0xEC, 0x60, 0xC0] };
+
+pub enum PcEvent {
+    Device { kind: u32, id: String, a: u32, b: u32, key: Option<PropertyKey> },
+}
+
+static EVENT_SINK: std::sync::OnceLock<fn(PcEvent)> = std::sync::OnceLock::new();
+
+pub fn set_event_sink(f: fn(PcEvent)) {
+    let _ = EVENT_SINK.set(f);
+}
+
+fn emit(e: PcEvent) {
+    if let Some(f) = EVENT_SINK.get() {
+        f(e);
+    }
+}
+
+unsafe fn wide_str(p: *const u16) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let mut n = 0;
+    while *p.add(n) != 0 {
+        n += 1;
+    }
+    String::from_utf16_lossy(core::slice::from_raw_parts(p, n))
+}
+
+fn same_guid(a: &Guid, b: &Guid) -> bool {
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
+}
+
+#[repr(C)]
+struct Callback {
+    vtbl: *const *const (),
+    iid: Guid,
+}
+
+unsafe extern "system" fn cb_qi(this: *mut Callback, riid: *const Guid, out: *mut *mut c_void) -> i32 {
+    if same_guid(&*riid, &IID_IUNKNOWN) || same_guid(&*riid, &(*this).iid) {
+        *out = this as *mut c_void;
+        0
+    } else {
+        *out = core::ptr::null_mut();
+        -2147467262
+    }
+}
+
+unsafe extern "system" fn cb_ref(_this: *mut Callback) -> u32 {
+    1
+}
+
+unsafe extern "system" fn dev_state(_this: *mut Callback, id: *const u16, state: u32) -> i32 {
+    emit(PcEvent::Device { kind: 1, id: wide_str(id), a: state, b: 0, key: None });
+    0
+}
+
+unsafe extern "system" fn dev_added(_this: *mut Callback, id: *const u16) -> i32 {
+    emit(PcEvent::Device { kind: 2, id: wide_str(id), a: 0, b: 0, key: None });
+    0
+}
+
+unsafe extern "system" fn dev_removed(_this: *mut Callback, id: *const u16) -> i32 {
+    emit(PcEvent::Device { kind: 3, id: wide_str(id), a: 0, b: 0, key: None });
+    0
+}
+
+unsafe extern "system" fn dev_default(_this: *mut Callback, flow: u32, role: u32, id: *const u16) -> i32 {
+    emit(PcEvent::Device { kind: 4, id: wide_str(id), a: flow, b: role, key: None });
+    0
+}
+
+unsafe extern "system" fn dev_property(_this: *mut Callback, id: *const u16, key: *const PropertyKey) -> i32 {
+    let k = PropertyKey { fmtid: (*key).fmtid, pid: (*key).pid };
+    emit(PcEvent::Device { kind: 5, id: wide_str(id), a: 0, b: 0, key: Some(k) });
+    0
+}
+
+struct Vtbl([*const (); 8]);
+unsafe impl Sync for Vtbl {}
+
+static DEVICE_VTBL: Vtbl = Vtbl([cb_qi as *const (), cb_ref as *const (), cb_ref as *const (), dev_state as *const (), dev_added as *const (), dev_removed as *const (), dev_default as *const (), dev_property as *const ()]);
+
+fn watch<F: FnOnce() -> Result<(), i32> + Send + 'static>(f: F) -> i32 {
+    let (tx, rx) = std::sync::mpsc::channel::<i32>();
+    std::thread::spawn(move || unsafe {
+        CoInitializeEx(core::ptr::null_mut(), 0);
+        let hr = match f() {
+            Ok(()) => 0,
+            Err(hr) => hr,
+        };
+        let _ = tx.send(hr);
+        if hr >= 0 {
+            loop {
+                std::thread::park();
+            }
+        }
+    });
+    rx.recv().unwrap_or(-2147467259)
+}
+
+pub fn watch_devices() -> i32 {
+    static DONE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *DONE.get_or_init(|| {
+        watch(|| unsafe {
+            let en = enumerator()?;
+            let cb = Box::leak(Box::new(Callback { vtbl: DEVICE_VTBL.0.as_ptr(), iid: IID_IMM_NOTIFICATION_CLIENT }));
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut Callback) -> i32>(en.0, 6)(en.0, cb);
+            if hr < 0 {
+                return Err(hr);
+            }
+            core::mem::forget(en);
+            Ok(())
+        })
+    })
+}

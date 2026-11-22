@@ -235,7 +235,7 @@ pub fn distinct_hz(w: &[Write]) -> Vec<u64> {
 }
 
 unsafe fn device_of(list: *mut c_void) -> *mut c_void {
-    let get: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(list, PC_GET_DEVICE)) };
+    let get: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_GET_DEVICE)) };
     let mut dev: *mut c_void = core::ptr::null_mut();
     if unsafe { get(list, &IID_DEVICE, &mut dev) } < 0 {
         return core::ptr::null_mut();
@@ -462,16 +462,16 @@ pub unsafe fn record_sample(list: *mut c_void, res: *mut c_void, offset: u64, be
             return 0;
         }
         crate::fill::barrier_pub(list, p.scratch, STATE_COPY_DEST, STATE_UAV);
-        let pred: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = core::mem::transmute(vslot(list, PC_SET_PREDICATION));
+        let pred: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_PREDICATION));
         pred(list, core::ptr::null_mut(), 0, 0);
-        let srs: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_SIGNATURE));
+        let srs: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_SIGNATURE));
         srs(list, p.rs as *mut c_void);
-        let spso: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(vslot(list, PC_SET_PSO));
+        let spso: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_PSO));
         spso(list, p.pso as *mut c_void);
-        let su: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_UAV));
+        let su: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_UAV));
         su(list, 1, p.scratch_va);
-        let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_CONSTANTS));
-        let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(vslot(list, PC_DISPATCH));
+        let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_CONSTANTS));
+        let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_DISPATCH));
         for &(hz, out) in &outs {
             let k = constants(begin_slot, now, out, seq, hz, freq);
             sc(list, 0, 8, k.as_ptr(), 0);
@@ -481,7 +481,7 @@ pub unsafe fn record_sample(list: *mut c_void, res: *mut c_void, offset: u64, be
         if st != STATE_COPY_DEST {
             crate::fill::barrier_pub(list, e.res, st, STATE_COPY_DEST);
         }
-        let cp: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = core::mem::transmute(vslot(list, PC_COPY_BUFFER_REGION));
+        let cp: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_COPY_BUFFER_REGION));
         for w in &fits {
             let out = outs.iter().find(|o| o.0 == w.hz).map(|o| o.1).unwrap_or(now);
             cp(list, e.res, base_off + w.dst_off, p.scratch, out as u64 * 8, 8);

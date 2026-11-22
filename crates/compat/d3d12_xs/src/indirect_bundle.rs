@@ -468,7 +468,7 @@ unsafe fn pipe(list: *mut c_void) -> Option<(usize, usize)> {
 }
 
 unsafe fn set_predication(list: *mut c_void, res: usize, off: u64, op: u32) {
-    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = unsafe { core::mem::transmute(vslot(list, PC_SET_PREDICATION)) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_PREDICATION)) };
     unsafe { f(list, res as *mut c_void, off, op) };
 }
 
@@ -480,7 +480,7 @@ unsafe fn restore_title_predication(list: *mut c_void, title: Option<(usize, u64
 }
 
 unsafe fn copy(list: *mut c_void, dst: usize, doff: u64, src: usize, soff: u64, n: u64) {
-    let f: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = unsafe { core::mem::transmute(vslot(list, PC_COPY_BUFFER_REGION)) };
+    let f: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_COPY_BUFFER_REGION)) };
     unsafe { f(list, dst, doff, src, soff, n) };
 }
 
@@ -509,20 +509,20 @@ unsafe fn predicate_pass(list: *mut c_void, c: &Call, slots: u32, n: u64, l: &La
         }
         sources(list, &c.srcs, false);
         let wr = candidate_writes(s.inp_va + w.in_off + l.cand, &c.live);
-        let wbi: unsafe extern "system" fn(*mut c_void, u32, *const [u64; 2], *const u32) = core::mem::transmute(vslot(list, PC_WRITE_BUFFER_IMMEDIATE));
+        let wbi: unsafe extern "system" fn(*mut c_void, u32, *const [u64; 2], *const u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_WRITE_BUFFER_IMMEDIATE));
         wbi(list, wr.len() as u32, wr.as_ptr(), core::ptr::null());
         crate::fill::barrier_pub(list, s.inp, ST_COPY_DEST, ST_UAV);
         crate::fill::barrier_pub(list, s.pred, ST_COMMON, ST_UAV);
-        let srs: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_SIGNATURE));
+        let srs: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_SIGNATURE));
         srs(list, rs as *mut c_void);
-        let spso: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(vslot(list, PC_SET_PSO));
+        let spso: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_PSO));
         spso(list, pso as *mut c_void);
-        let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_CONSTANTS));
+        let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_CONSTANTS));
         sc(list, 0, N_CONSTANTS, k.as_ptr(), 0);
-        let su: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_UAV));
+        let su: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_UAV));
         su(list, 1, s.inp_va);
         su(list, 2, s.pred_va);
-        let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(vslot(list, PC_DISPATCH));
+        let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_DISPATCH));
         d(list, gx, gy, 1);
         crate::fill::barrier_pub(list, s.pred, ST_UAV, ST_PREDICATION);
         crate::fill::barrier_pub(list, s.inp, ST_UAV, ST_COMMON);
@@ -530,7 +530,7 @@ unsafe fn predicate_pass(list: *mut c_void, c: &Call, slots: u32, n: u64, l: &La
 }
 
 unsafe fn candidates(list: *mut c_void, c: &Call, n: u64, w: &Where) {
-    let eb: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { core::mem::transmute(vslot(list, PC_EXECUTE_BUNDLE)) };
+    let eb: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_EXECUTE_BUNDLE)) };
     let rebind: Vec<bool> = c.live.iter().map(|&b| crate::cl2_state::sets_inherited_state(b as *mut c_void)).collect();
     let nl = c.live.len() as u64;
     for i in 0..n {

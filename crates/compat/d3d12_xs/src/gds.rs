@@ -219,7 +219,7 @@ unsafe fn bind(list: *mut c_void, rs: *mut c_void, slot: usize) {
     if barriers_allowed(unsafe { crate::fill::list_type(list) }) {
         unsafe { transition(list, res, STATE_UAV) };
     }
-    let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(vslot(list, slot)) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, slot)) };
     unsafe { f(list, idx, va) };
 }
 
@@ -306,7 +306,7 @@ pub unsafe fn copy(list: *mut c_void, to_gds: bool, dword: u32, count: u32, va: 
     unsafe {
         transition(list, gres, plan.gds_state);
         if let Some((a, b)) = plan.mem_before { crate::fill::barrier_pub(list, e.res, a, b); }
-        let f: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = core::mem::transmute(vslot(list, PC_COPY_BUFFER_REGION));
+        let f: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_COPY_BUFFER_REGION));
         if to_gds {
             f(list, gres, plan.gds_off, e.res, off, plan.bytes);
         } else {
@@ -351,7 +351,7 @@ pub unsafe fn write_ordered_append(list: *mut c_void, counter: u32, gds_dword: u
     let back = STATES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(list as usize)).copied());
     unsafe {
         transition(list, gres, STATE_COPY_DEST);
-        let f: unsafe extern "system" fn(*mut c_void, u32, *const WbiParam, *const u32) = core::mem::transmute(vslot(list, PC_WRITE_BUFFER_IMMEDIATE));
+        let f: unsafe extern "system" fn(*mut c_void, u32, *const WbiParam, *const u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_WRITE_BUFFER_IMMEDIATE));
         f(list, params.len() as u32, params.as_ptr(), modes.as_ptr());
         if let Some(s) = back.filter(|&s| s == STATE_UAV) {
             transition(list, gres, s);

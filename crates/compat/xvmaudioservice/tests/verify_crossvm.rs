@@ -126,6 +126,11 @@ fn crossvm_audio_capture_endpoint_posts_wasapi_packets_to_the_guest_queue() {
 }
 
 #[test]
+fn crossvm_audio_pc_events_become_guest_notification_frames() {
+    run_step("notify");
+}
+
+#[test]
 fn inner() {
     let Ok(step) = std::env::var(STEP) else { return };
     let dir = std::env::temp_dir().join(format!("xvmaudio_crossvm_{}", std::process::id()));
@@ -148,6 +153,7 @@ fn inner() {
         "endpoint" => endpoint(&mix),
         "items" => items(&mix),
         "capture" => capture(),
+        "notify" => notify(),
         _ => objects(&mix),
     }
     println!("STEP OK");
@@ -1195,4 +1201,97 @@ fn capture_period(dev: u32, mix: &[u8]) {
     assert_eq!(median, min as u64, "PC capture packets follow the period requested through 0x0f");
     let mut e = envelope(crossvm::RELEASE_OBJECT, object);
     assert_eq!(send(&mut e), 0);
+}
+
+fn wait_frame(listener: u32, after: usize) -> Option<(i32, Vec<u8>)> {
+    let t = std::time::Instant::now();
+    while t.elapsed().as_secs() < 3 {
+        let l = crossvm::sent_notifications();
+        if let Some(f) = l.iter().skip(after).find(|(_, f)| u32_at(f, 4) == listener) {
+            return Some(f.clone());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    None
+}
+
+fn notify() {
+    let rec = crossvm::device_record(4, "{0.0.0.00000000}.{x}", 0, 1, None).unwrap();
+    assert_eq!(u32_at(&rec, 0) as usize, rec.len());
+    assert_eq!(rec.len(), 0x34 + 2 * 21);
+    assert_eq!((u32_at(&rec, 0x18), u32_at(&rec, 0x1c), u32_at(&rec, 0x20)), (4, 0, 1), "kind 4 OnDefaultDeviceChanged: flow +0x1c, role +0x20 (MMDev 4bfd4)");
+    assert_eq!(wide_at(&rec, 0x34, 32), "{0.0.0.00000000}.{x}");
+    let k = console_sandbox::wasapi::PropertyKey { fmtid: [7; 16], pid: 9 };
+    let rec = crossvm::device_record(5, "a", 0, 0, Some(&k)).unwrap();
+    assert_eq!((&rec[0x1c..0x2c], u32_at(&rec, 0x2c)), (&[7u8; 16][..], 9));
+    assert!(crossvm::device_record(2, &"x".repeat(crossvm::DEVICE_RECORD_MAX_CHARS), 0, 0, None).is_none(), "an id longer than the 0x810 frame allows is not sent");
+
+    let (hr, e) = create(1, 1, 0, 0, &[]);
+    assert_eq!(hr, 0);
+    let enumerator = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::ENUMERATOR_SUBSCRIBE, enumerator);
+    assert_eq!(send(&mut e), 0, "0x23 registers a PC IMMNotificationClient");
+
+    let (hr, e) = create(0x12, 1, 0, 0x4e, &[]);
+    assert_eq!(hr, 0);
+    let vol = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::ENDPOINT_REGISTER, vol);
+    assert_eq!(send(&mut e), 0, "0x4f registers the listener on this endpoint");
+    let ctx = [0x5au8; 16];
+    let before = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::GET_ENDPOINT_VOLUME_SCALAR, vol);
+    assert_eq!(send(&mut e), 0);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(crossvm::sent_notifications().iter().skip(before).all(|(_, f)| u32_at(f, 4) != vol), "a read does not notify");
+
+    let before = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::SET_ENDPOINT_VOLUME_SCALAR, vol);
+    e[0x10..0x14].copy_from_slice(&0.37f32.to_le_bytes());
+    e[0x14..0x24].copy_from_slice(&ctx);
+    assert_eq!(send(&mut e), 0);
+    let (hr, f) = wait_frame(vol, before).expect("SetMasterVolumeLevelScalar notifies every 0x4f listener of the endpoint");
+    let r = &f[crossvm::NOTIFY_RECORD..];
+    let n = u32_at(r, 0x30);
+    println!("endpoint scalar 0.37: frame to listener {vol:#x}, +8 {}, ctx {:02x?}, master {}, muted {}, {n} channels, push {hr:#010x}", u32_at(&f, 8), &r[0x18..0x20], f32_at(r, 0x2c), u32_at(r, 0x28));
+    assert_eq!(f.len(), 0x810);
+    assert_eq!(u32_at(&f, 8), 0, "+8 0 = notification, 1 would disconnect every listener");
+    assert_eq!(&r[0x18..0x28], &ctx[..], "guidEventContext is the GUID the guest passed at args+4 (AudioSrv 71570)");
+    assert!((f32_at(r, 0x2c) - 0.37).abs() < 1e-6, "fMasterVolume at record +0x2c");
+    assert_eq!(u32_at(r, 0x28), 0);
+    assert!(n > 0 && u32_at(r, 0x34) == 0, "channel array at +0x38 with offset 0");
+
+    let before = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::SET_ENDPOINT_CHANNEL_SCALAR, vol);
+    e[0x10..0x14].copy_from_slice(&0u32.to_le_bytes());
+    e[0x14..0x18].copy_from_slice(&0.5f32.to_le_bytes());
+    e[0x18..0x28].copy_from_slice(&[0x33; 16]);
+    assert_eq!(send(&mut e), 0);
+    let (_, f) = wait_frame(vol, before).expect("SetChannelVolumeLevelScalar notifies");
+    let r = &f[crossvm::NOTIFY_RECORD..];
+    assert_eq!(&r[0x18..0x28], &[0x33u8; 16][..], "channel set context GUID at args+8 (AudioSrv 71430)");
+    assert!((f32_at(r, 0x38) - 0.5).abs() < 1e-6, "afChannelVolumes[0]");
+
+    let before = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::SET_ENDPOINT_MUTE, vol);
+    e[0x10] = 1;
+    e[0x11..0x21].copy_from_slice(&[0x44; 16]);
+    assert_eq!(send(&mut e), 0);
+    let (_, f) = wait_frame(vol, before).expect("SetMute notifies");
+    let r = &f[crossvm::NOTIFY_RECORD..];
+    assert_eq!((u32_at(r, 0x28), &r[0x18..0x28]), (1, &[0x44u8; 16][..]), "bMuted and the context GUID at args+1 (AudioSrv 71610)");
+    let before = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::SET_ENDPOINT_MUTE, vol);
+    e[0x10] = 1;
+    assert_eq!(send(&mut e), 1, "S_FALSE: already muted");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(crossvm::sent_notifications().iter().skip(before).all(|(_, f)| u32_at(f, 4) != vol), "an unchanged mute does not notify");
+
+    let mut e = envelope(crossvm::ENDPOINT_UNREGISTER, vol);
+    assert_eq!(send(&mut e), 0);
+    let quiet = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::SET_ENDPOINT_VOLUME_SCALAR, vol);
+    e[0x10..0x14].copy_from_slice(&0.6f32.to_le_bytes());
+    assert_eq!(send(&mut e), 0);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(crossvm::sent_notifications().iter().skip(quiet).all(|(_, f)| u32_at(f, 4) != vol), "after 0x50 the listener gets no frames");
 }

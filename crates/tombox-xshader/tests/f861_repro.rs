@@ -241,6 +241,12 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
     vcall!(l, 46, fn(u32, *const usize, i32, *const usize) -> (), 1, &rtv, 0, &dsv);
     vcall!(l, 30, fn(*mut c_void) -> (), rs);
     vcall!(l, 25, fn(*mut c_void) -> (), pso);
+    if let Ok(s) = std::env::var("TOMBOX_F861_BIAS") {
+        let v: Vec<f32> = s.split(',').map(|t| t.trim().parse::<f32>().unwrap_or(f32::NAN)).collect();
+        let (b, c, sl) = (v.first().copied().unwrap_or(0.0), v.get(1).copied().unwrap_or(0.0), v.get(2).copied().unwrap_or(0.0));
+        vcall!(l, 82, fn(f32, f32, f32) -> (), b, c, sl);
+        println!("RSSetDepthBias({b}, {c}, {sl})");
+    }
     let mut rc = [0u32; 5];
     for (i, v) in rc_vals.iter().take(5).enumerate() {
         rc[i] = *v;
