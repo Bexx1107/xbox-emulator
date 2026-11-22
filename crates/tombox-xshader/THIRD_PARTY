@@ -1,6 +1,0 @@
-Mesa https://gitlab.freedesktop.org/mesa/mesa MIT image_bvh_intersect_ray / image_bvh64_intersect_ray semantics from src/amd/vulkan/radv_rt_common.c and bvh/bvh.h, in src/hlsl.rs BVH_HELPERS and tests/exec_mem/bvh.rs
-LLVM https://github.com/llvm/llvm-project Apache-2.0 WITH LLVM-exception reference only: GFX10 FLAT opcodes from FLATInstructions.td; amdgcn_trig_preop fold from AMDGPUInstCombineIntrinsic.cpp ported to src/hlsl.rs tb_trig_preop64 and tests/exec_vop/mod.rs
-tinygrad https://github.com/tinygrad/tinygrad MIT reference only: RDNA3/RDNA4 ISA pseudocode for v_div_scale_f64, v_div_fixup_f64, v_trig_preop_f64, v_permlane16_b32, v_permlanex16_b32, v_mullit_f32
-TheHumanCompiler https://github.com/ajmiles/TheHumanCompiler MIT hardware-measured v_div_scale_f64 / v_div_fmas_f64 / v_div_fixup_f64 behaviour from src/isa/float64.ts, in src/hlsl.rs tb_div_scale64/tb_div_fmas64/tb_div_fixup64 and tests/exec_vop/mod.rs
-Leonida https://github.com/ItsNotRexed/Leonida GPL-3.0 hardware-checked input/result vectors from runtime/test/shaders/*.asm (facts only, programs rewritten), in tests/exec_vop/leonida.rs
-TomBox (brcly) https://github.com/brcly/TomBox MIT OR Apache-2.0 commit 6b49c147b71b409950d08321d8c8e391930c53a9: pixel-shader interpolation modifiers matched in the feeding stage, in src/hlsl.rs ps_input_interp/translate_linked and tests/linkage.rs
