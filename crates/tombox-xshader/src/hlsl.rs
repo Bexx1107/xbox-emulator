@@ -46,6 +46,26 @@ pub struct Translated {
     pub needs_global: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct InputInterp(pub Vec<(String, String)>);
+
+impl InputInterp {
+    fn for_output(&self, e: &SigElement) -> Option<&str> {
+        let s = semantic(e);
+        let m = self.0.iter().find(|(k, _)| *k == s).map(|(_, m)| m.as_str())?;
+        (m != "TB_CEN_Q" && (e.comp_type == 3 || m == "nointerpolation")).then_some(m)
+    }
+
+    pub fn pc_centroid(mut self) -> Self {
+        for (_, m) in &mut self.0 {
+            if m == "TB_CEN_Q" {
+                *m = "centroid".into();
+            }
+        }
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sym {
     Table(u8),
@@ -138,8 +158,13 @@ float tb_fma(float a, float b, float c) { precise double p = (double)a * (double
 #endif
 bool tb_nan(float x) { return (asuint(x) & 0x7fffffffu) > 0x7f800000u; }
 float tb_qn(float x) { return tb_nan(x) ? asfloat(0x7fc00000u) : x; }
+#if defined(__HLSL_VERSION) && __HLSL_VERSION >= 2021
+#define TB_SEL(c, a, b) select((c), (a), (b))
+#else
+#define TB_SEL(c, a, b) ((c) ? (a) : (b))
+#endif
 float tb_u2f(uint a) { precise float r = (float)(a & 0xffff0000u) + (float)(a & 0xffffu); return r; }
-float tb_log(float x) { return tb_qn((asuint(x) == 0x7f800000u) ? x : log2(x)); }
+float tb_log(float x) { uint b = asuint(x); return tb_qn((b == 0x7f800000u) ? x : TB_SEL(b - 0x00800000u < 0x7f000000u && (b & 0x7fffffu) == 0u, (float)((int)(b >> 23) - 127), log2(x))); }
 float tb_fsub(float a, float b) { precise float r = a - b; return tb_qn(r); }
 float tb_fract(float x) { if ((asuint(x) & 0x7fffffffu) >= 0x7f800000u) return asfloat(0x7fc00000u); precise float f = x - floor(x); return min(f, asfloat(0x3f7fffffu)); }
 #ifdef TB_FAST_F2H
@@ -148,6 +173,10 @@ uint tb_f2h(float x) { uint b = asuint(x); return (b & 0x7fffffffu) > 0x7f800000
 uint tb_f2h(float x) { uint b = asuint(x); uint s = (b >> 16) & 0x8000u; uint a = b & 0x7fffffffu; if (a > 0x7f800000u) return s | 0x7e00u | ((a >> 13) & 0x3ffu); if (a >= 0x477ff000u) return s | 0x7c00u; if (a >= 0x38800000u) { uint r = a - 0x38000000u; return s | ((r + 0xfffu + ((r >> 13) & 1u)) >> 13); } if (a < 0x33000000u) return s; uint e = a >> 23; uint m = (a & 0x7fffffu) | 0x800000u; uint sh = 126u - e; uint q = m >> sh; uint rem = m & ((1u << sh) - 1u); uint hf = 1u << (sh - 1u); if (rem > hf || (rem == hf && (q & 1u) != 0u)) q += 1u; return s | q; }
 #endif
 float tb_rne(float x) { float a = abs(x); if (!(a < 8388608.0)) return x; float r = floor(a); float f = a - r; if (f > 0.5 || (f == 0.5 && (((uint)r) & 1u) != 0u)) r += 1.0; return asfloat(asuint(r) | (asuint(x) & 0x80000000u)); }
+float tb_flr(float x) { return TB_SEL(asuint(x) - 0x80000001u < 0x7fffffu, -1.0, floor(x)); }
+float tb_floor(float x) { uint b = asuint(x); return TB_SEL((b & 0x7fffffffu) > 0x7f800000u, asfloat(b | 0x400000u), tb_flr(x)); }
+float tb_ceil(float x) { uint b = asuint(x); return TB_SEL((b & 0x7fffffffu) > 0x7f800000u, asfloat(b | 0x400000u), TB_SEL(b - 1u < 0x7fffffu, 1.0, ceil(x))); }
+float tb_trunc(float x) { uint b = asuint(x); return TB_SEL((b & 0x7fffffffu) > 0x7f800000u, asfloat(b | 0x400000u), trunc(x)); }
 uint tb_cvt_i(float x) { if (tb_nan(x)) return 0u; if (x >= 2147483648.0) return 0x7fffffffu; if (x <= -2147483648.0) return 0x80000000u; return asuint((int)x); }
 uint tb_cvt_u(float x) { if (tb_nan(x) || x <= 0.0) return 0u; if (x >= 4294967296.0) return 0xffffffffu; return (uint)x; }
 #if defined(__HLSL_VERSION) && __HLSL_VERSION >= 2021
@@ -224,6 +253,11 @@ fn r(o: &Opnd) -> Result<String, String> {
 
 fn f(o: &Opnd) -> Result<String, String> {
     Ok(format!("asfloat({})", r(o)?))
+}
+
+fn sat_int(e: &str, bits: u32) -> String {
+    let h = 1u32 << (bits - 1);
+    format!("(min(asuint(max({e}, -{h})) + {h:#x}u, {:#x}u) ^ {h:#x}u)", (h << 1) - 1)
 }
 
 /// Scalar register number of an operand (SGPRs, plus vcc_lo/vcc_hi = 106/107, which SMEM
@@ -308,6 +342,36 @@ fn semantic(e: &SigElement) -> String {
     format!("{}{}", e.name, e.index)
 }
 
+fn ps_input_modifier(ex: &ShaderExtract, ei: usize, e: &SigElement) -> &'static str {
+    let cons_depth = || {
+        ex.output_sig.iter().any(|o| {
+            let s = semantic(o);
+            s.starts_with("SV_DepthLessEqual") || s.starts_with("SV_DepthGreaterEqual")
+        })
+    };
+    if e.sysval == 1 && cons_depth() {
+        "linear noperspective centroid "
+    } else if e.comp_type != 3 {
+        "nointerpolation "
+    } else if e.name.contains("_centroid") {
+        centroid::qualifier(ex, ei)
+    } else {
+        ""
+    }
+}
+
+pub fn ps_input_interp(ex: &ShaderExtract) -> InputInterp {
+    if ex.stage != Stage::Pixel {
+        return InputInterp::default();
+    }
+    let modifiers = ex.input_sig.iter().enumerate().filter(|(_, e)| e.sysval != 1).filter_map(|(ei, e)| {
+        let m = ps_input_modifier(ex, ei, e).trim_end();
+        let default = if e.comp_type == 3 { "" } else { "nointerpolation" };
+        (m != default).then(|| (semantic(e), m.to_string()))
+    });
+    InputInterp(modifiers.collect())
+}
+
 struct Emitter<'a> {
     ex: &'a ShaderExtract,
     insns: Vec<Insn>,
@@ -355,6 +419,7 @@ struct Emitter<'a> {
     uav_uint: BTreeSet<u32>,
     /// The shader uses wave intrinsics (needs shader model 6: DXC only).
     uses_wave: bool,
+    wave64: bool,
     msel: HashMap<usize, MSel>,
     /// Buffer ops (MUBUF, s_buffer_load) whose descriptor register holds one of several
     /// descriptors: (register key, candidates as (descriptor id, resource)).
@@ -392,6 +457,7 @@ struct Emitter<'a> {
     uses_bvh: bool,
     uses_global: bool,
     mode_use: mode::ModeUse,
+    out_interp: InputInterp,
 }
 
 /// SGPR spills through vector lanes.
@@ -504,7 +570,7 @@ const F64_HELPERS: &str = r#"static const uint tb_2opi[51] = { 0xA2F983u, 0x6E4E
 uint tb_hi64(double x) { uint l, h; asuint(x, l, h); return h; }
 uint tb_lo64(double x) { uint l, h; asuint(x, l, h); return l; }
 bool tb_isinf64(double x) { return abs(x) == asdouble(0u, 0x7ff00000u); }
-double tb_ldexp64(double x, int e) { e = clamp(e, -2200, 2200); for (int i = 0; i < 3; i++) { int k = clamp(e, -1022, 1023); x *= asdouble(0u, (uint)(k + 1023) << 20); e -= k; } return x; }
+double tb_ldexp64(double x, int e) { e = clamp(e, -2200, 2200); for (int i = 0; i < 3; i++) { int k = clamp(e, -1022, 1023); precise double y = x * asdouble(0u, (uint)(k + 1023) << 20); x = y; e -= k; } return x; }
 double tb_trunc64(double x) { if ((tb_hi64(x) & 0x7ff00000u) == 0x7ff00000u || abs(x) >= 4503599627370496.0L) return x; double t = (double)(int64_t)x; return t == 0.0L ? asdouble(0u, tb_hi64(x) & 0x80000000u) : t; }
 double tb_floor64(double x) { double t = tb_trunc64(x); return (t > x) ? t - 1.0L : t; }
 double tb_ceil64(double x) { double t = tb_trunc64(x); return (t < x) ? t + 1.0L : t; }
@@ -519,7 +585,7 @@ bool tb_sub64(double x) { return x != 0.0L && abs(x) < asdouble(0u, 0x00100000u)
 double tb_div_fixup64(double q, double d, double n) { uint dh = tb_hi64(d), nh = tb_hi64(n); uint so = (dh ^ nh) & 0x80000000u; if (tb_isnan64(n)) return asdouble(tb_lo64(n), nh | 0x80000u); if (tb_isnan64(d)) return asdouble(tb_lo64(d), dh | 0x80000u); if ((d == 0.0L && n == 0.0L) || (tb_isinf64(d) && tb_isinf64(n))) return asdouble(0u, 0xfff80000u); if (d == 0.0L || tb_isinf64(n)) return asdouble(0u, so | 0x7ff00000u); if (tb_isinf64(d) || n == 0.0L) return asdouble(0u, so); if (tb_exp64(n) - tb_exp64(d) < -1075) return asdouble(0u, so); if (tb_isnan64(q)) return asdouble(0u, so | 0x7ff00000u); return asdouble(tb_lo64(q), (tb_hi64(q) & 0x7fffffffu) | so); }
 double tb_div_scale64(double x, double d, double n, out uint vcc) { vcc = 0u; if (d == 0.0L || n == 0.0L) { vcc = 1u; return asdouble(0u, 0x7ff80000u); } int en = tb_exp64(n), ed = tb_exp64(d); if (en - ed >= 768) { vcc = 1u; return (x == d) ? tb_ldexp64(x, 128) : x; } if (tb_sub64(d)) return tb_ldexp64(x, 128); bool tr = tb_sub64(1.0L / d), tq = tb_sub64(n / d); if (tr && tq) { vcc = 1u; return (x == d) ? tb_ldexp64(x, -128) : x; } if (tr) return tb_ldexp64(x, -128); if (tq) { vcc = 1u; return (x == n) ? tb_ldexp64(x, 128) : x; } if (en <= 53) return tb_ldexp64(x, 128); return x; }
 double tb_div_fmas64(double a, double b, double c, uint vcc) { precise double r = fma(a, b, c); if (tb_isnan64(r) && !tb_isnan64(a) && !tb_isnan64(b) && !tb_isnan64(c)) return asdouble(0u, 0x7ff80000u); if ((vcc & 1u) == 0u) return r; double up = asdouble(0u, 0x47f00000u), dn = asdouble(0u, 0x37f00000u); if (tb_exp64(c) > 1023) { if (!tb_sub64(r)) return r * up; bool sa = abs(a) <= abs(b); return fma((sa ? a : b) * up, sa ? b : a, c * up); } precise double q = r * dn; if (r == 0.0L || !(abs(r) < asdouble(0u, 0x08100000u))) return q; precise double df = r - q * up; if (abs(df) != asdouble(0u, 0x04c00000u)) return q; precise double p = a * b; precise double pe = fma(a, b, -p); precise double s1 = p + c; precise double bb = s1 - p; precise double s1e = (p - (s1 - bb)) + (c - bb); precise double e = (s1 - r) + (s1e + pe); if (e == 0.0L || ((e > 0.0L) != (df > 0.0L))) return q; return q + ((df > 0.0L) ? asdouble(1u, 0u) : -asdouble(1u, 0u)); }
-double tb_trig_preop64(double x, uint seg) { int e = (int)((tb_hi64(x) >> 20) & 0x7ffu); int sh = (int)(seg & 31u) * 53; if (e > 1077) sh += e - 1077; if (sh >= 1120) return 0.0L; uint rh = 0u, rl = 0u; for (int i = 0; i < 53; i++) { int p = sh + i; uint b = (p < 1201) ? ((tb_2opi[p / 24] >> (23 - p % 24)) & 1u) : 0u; rh = (rh << 1) | (rl >> 31); rl = (rl << 1) | b; } double r = (double)rh * 4294967296.0L + (double)rl; int sc = -53 - sh; if (e >= 1968) sc += 128; return tb_ldexp64(r, sc); }
+double tb_trig_preop64(double x, uint seg) { int e = (int)((tb_hi64(x) >> 20) & 0x7ffu); int sh = (int)(seg & 31u) * 53; if (e > 1077) sh += e - 1077; if (sh >= 1120) return 0.0L; uint w = (uint)sh / 24u, o = (uint)sh % 24u; uint64_t th = (((uint64_t)tb_2opi[w]) << 40) | (((uint64_t)tb_2opi[w + 1u]) << 16) | (uint64_t)(tb_2opi[w + 2u] >> 8); uint64_t tl = (((uint64_t)(tb_2opi[w + 2u] & 0xffu)) << 56) | (((uint64_t)tb_2opi[w + 3u]) << 32); uint64_t m = ((o == 0u) ? th : ((th << o) | (tl >> (64u - o)))) >> 11; int sc = -53 - sh; if (e >= 1968) sc += 128; uint mh = (uint)(m >> 32), ml = (uint)m; if ((mh | ml) == 0u) return 0.0L; int msb = (mh != 0u) ? 32 + (int)firstbithigh(mh) : (int)firstbithigh(ml); int ex = msb + sc; uint64_t b; if (ex >= -1022) { b = (((uint64_t)(uint)(ex + 1023)) << 52) | ((m << (uint)(52 - msb)) & ((((uint64_t)0xfffffu) << 32) | (uint64_t)0xffffffffu)); } else { int s = -1074 - sc; if (s <= 0) { b = m << (uint)(-s); } else if (s >= 64) { b = 0; } else { b = m >> (uint)s; uint64_t rem = m & ((((uint64_t)1) << (uint)s) - 1); uint64_t hf = ((uint64_t)1) << (uint)(s - 1); if (rem > hf || (rem == hf && (b & 1) != 0)) b += 1; } } return asdouble((uint)b, (uint)(b >> 32)); }
 bool tb_cmp_class64(uint lo, uint hi, uint mask) { uint e = (hi >> 20) & 0x7ffu; bool mz = ((hi & 0xfffffu) | lo) == 0u; bool neg = (hi >> 31) != 0u; uint c; if (e == 0x7ffu) { c = !mz ? (((hi & 0x80000u) != 0u) ? 1u : 0u) : (neg ? 2u : 9u); } else if (e == 0u) { c = mz ? (neg ? 5u : 6u) : (neg ? 4u : 7u); } else { c = neg ? 3u : 8u; } return ((mask >> c) & 1u) != 0u; }
 "#;
 
@@ -912,13 +978,21 @@ fn dst16(m: &str) -> bool {
 }
 
 pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
-    match translate_with(ex, None, BTreeSet::new()) {
-        Err(e) if disassemble(&ex.isa).iter().take(16).any(|i| i.mnemonic == "s_swappc_b64") => translate_with(ex, Some(8), BTreeSet::new()).map_err(|e2| if e2.contains("not a buffer descriptor") || e2.contains("not a root table") { e } else { e2 }),
+    translate_linked(ex, None)
+}
+
+pub fn translate_linked(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>) -> Result<Translated, String> {
+    let out_interp = match ex.stage {
+        Stage::Vertex | Stage::Geometry | Stage::Mesh => feeds_ps.cloned().unwrap_or_default(),
+        _ => InputInterp::default(),
+    };
+    match translate_with(ex, &out_interp, None, BTreeSet::new()) {
+        Err(e) if disassemble(&ex.isa).iter().take(16).any(|i| i.mnemonic == "s_swappc_b64") => translate_with(ex, &out_interp, Some(8), BTreeSet::new()).map_err(|e2| if e2.contains("not a buffer descriptor") || e2.contains("not a root table") { e } else { e2 }),
         r => r,
     }
 }
 
-fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_force: BTreeSet<u32>) -> Result<Translated, String> {
+fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_override: Option<usize>, uav_force: BTreeSet<u32>) -> Result<Translated, String> {
     let (profile, is_ps) = match ex.stage {
         Stage::Vertex => ("vs_5_0", false),
         Stage::Pixel => ("ps_5_0", true),
@@ -929,6 +1003,7 @@ fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_for
         other => return Err(format!("stage {other:?} not supported yet")),
     };
     let mut insns = disassemble(&ex.isa);
+    let wave64 = mesh::wave_size(&insns) == 64;
     lower_wave_scans(&mut insns)?;
     lower_wave_reductions(&mut insns)?;
     lower_lane_spills(&mut insns)?;
@@ -968,6 +1043,7 @@ fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_for
         multi_sets: Vec::new(),
         uav_uint: BTreeSet::new(),
         uses_wave: false,
+        wave64,
         msel: HashMap::new(),
         bsel: HashMap::new(),
         dsel_loads: HashMap::new(),
@@ -1003,6 +1079,7 @@ fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_for
         uses_bvh: false,
         uses_global: false,
         mode_use: mode::ModeUse::default(),
+        out_interp: out_interp.clone(),
     };
     em.vreg_array = em.insns.iter().any(|i| i.mnemonic.starts_with("v_movrel"));
     em.mode_use = mode::analyze(&em.insns);
@@ -1024,7 +1101,7 @@ fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_for
     if !clash.is_empty() {
         let mut force = em.uav_force.clone();
         force.extend(clash);
-        return translate_with(ex, user_base_override, force);
+        return translate_with(ex, out_interp, user_base_override, force);
     }
     if is_ps {
         em.find_export_epilogs();
@@ -1721,6 +1798,12 @@ impl<'a> Emitter<'a> {
                 self.cb_size.insert(slot, 4096 * 4);
                 return Ok(Res::CbDyn(slot));
             }
+            None if self.ex.root_sig.is_none() => {
+                return Err(format!(
+                    "mubuf at {:#x}: missing root signature for descriptor table in s{table}",
+                    ins.offset
+                ));
+            }
             other => return Err(format!("mubuf at {:#x}: buffer in table of kind {other:?}", ins.offset)),
         };
         if ins.mnemonic.contains("_atomic_") {
@@ -2001,6 +2084,14 @@ impl<'a> Emitter<'a> {
                     // 0x20 in MainOnePassPointLightPS).
                     let bsym = sym.get(&b).copied().or_else(|| (!written.contains(&b)).then_some(Sym::Table(b as u8)));
                     let cands = self.desc_candidates(bsym.as_ref(), 32).ok_or_else(|| {
+                        if let Some(Sym::Table(root)) = bsym {
+                            if self.ex.root_sig.is_none() {
+                                return format!(
+                                    "s_buffer_load at {:#x}: missing root signature for base s{b} (root s{root})",
+                                    ins.offset
+                                );
+                            }
+                        }
                         format!("s_buffer_load at {:#x}: base s{b} is not a buffer descriptor ({:?})", ins.offset, sym.get(&b))
                     })?;
                     // A dynamic SOFFSET register indexes the buffer at run time: size the
@@ -3296,7 +3387,8 @@ impl<'a> Emitter<'a> {
                             let src = match id {
                                 2 => {
                                     self.uses_wave = true;
-                                    "(scc | (tb_hw2 & 0x18u) | (WaveActiveAnyTrue((exec_lo & 1u) != 0u) ? 0u : 0x200u) | (WaveActiveAnyTrue((vcc_lo & 1u) != 0u) ? 0u : 0x400u) | 0x10000u)".to_string()
+                                    let (ez, vz) = (self.guest_any("(exec_lo & 1u) != 0u"), self.guest_any("(vcc_lo & 1u) != 0u"));
+                                    format!("(scc | (tb_hw2 & 0x18u) | ({ez} ? 0u : 0x200u) | ({vz} ? 0u : 0x400u) | 0x10000u)")
                                 }
                                 29 => {
                                     self.line("tb_hw29 = (tb_hw29 + 4u) & 0xfffffu;");
@@ -3687,7 +3779,6 @@ impl<'a> Emitter<'a> {
                 let word = format!("tb_lds[(({addr} + {off:#x}u) >> 2) & 8191u]");
                 let body = match m.replace("_rtn", "").as_str() {
                     "ds_add_u32" => format!("InterlockedAdd({word}, {x0}, t{t});"),
-                    "ds_sub_u32" => format!("InterlockedAdd({word}, 0u - ({x0}), t{t});"),
                     "ds_min_u32" => format!("InterlockedMin({word}, {x0}, t{t});"),
                     "ds_max_u32" => format!("InterlockedMax({word}, {x0}, t{t});"),
                     "ds_and_b32" => format!("InterlockedAnd({word}, {x0}, t{t});"),
@@ -3698,6 +3789,7 @@ impl<'a> Emitter<'a> {
                     op => {
                         let c = format!("t{t}c");
                         let new = match op {
+                            "ds_sub_u32" => format!("{c} - ({x0})"),
                             "ds_rsub_u32" => format!("({x0}) - {c}"),
                             "ds_min_i32" => format!("asuint(min(asint({c}), asint({x0})))"),
                             "ds_max_i32" => format!("asuint(max(asint({c}), asint({x0})))"),
@@ -3814,6 +3906,24 @@ impl<'a> Emitter<'a> {
         Self::cmp_expr_mod(&format!("v_cmp_{base}"), &s[0], &s[1], mods, opsel)
     }
 
+    fn guest_lane(&self, lane: &str) -> String {
+        if self.wave64 {
+            format!("(({lane}) & 31u)")
+        } else {
+            format!("((WaveGetLaneIndex() & ~31u) | (({lane}) & 31u))")
+        }
+    }
+
+    fn guest_any(&mut self, cond: &str) -> String {
+        if self.wave64 {
+            return format!("WaveActiveAnyTrue({cond})");
+        }
+        let t = self.tmp;
+        self.tmp += 1;
+        self.line(&format!("uint4 t{t}b = WaveActiveBallot({cond}); uint t{t}h = WaveGetLaneIndex() >> 5;"));
+        format!("((t{t}h == 0u ? t{t}b.x : t{t}h == 1u ? t{t}b.y : t{t}h == 2u ? t{t}b.z : t{t}b.w) != 0u)")
+    }
+
     fn emit_dpp(&mut self, ins: &Insn) -> Result<(), String> {
         let code = match ins.src.first() {
             Some(Opnd::Raw(c)) => *c,
@@ -3843,7 +3953,8 @@ impl<'a> Emitter<'a> {
                 c => return Err(format!("{m}: DPP control {c:#x} is not valid on RDNA2")),
             };
             let (row_mask, bank_mask) = ((ext >> 28) & 15, (ext >> 24) & 15);
-            let write = format!("((({row_mask:#x}u >> ({l} >> 4)) & 1u) != 0u && (({bank_mask:#x}u >> (({l} >> 2) & 3u)) & 1u) != 0u)");
+            let row = if self.wave64 { format!("({l} >> 4)") } else { format!("(({l} >> 4) & 1u)") };
+            let write = format!("((({row_mask:#x}u >> {row}) & 1u) != 0u && (({bank_mask:#x}u >> (({l} >> 2) & 3u)) & 1u) != 0u)");
             (sl, inb, (ext >> 18) & 1 != 0, (ext >> 19) & 1 != 0, write, (ext >> 20) & 15)
         } else {
             (format!("(({l} & ~7u) | (({:#x}u >> (({l} & 7u) * 3u)) & 7u))", ext >> 8), "true".to_string(), code == 234, true, "true".to_string(), 0)
@@ -3897,7 +4008,9 @@ impl<'a> Emitter<'a> {
         }
         if ins.op == OP_WAVE_REDUCE && ins.enc == Enc::Vop3 {
             // See `lower_wave_reductions`. Every invocation computes the same value; lanes
-            // that were inactive contribute the identity.
+            if !self.wave64 {
+                return Err(format!("{m}: whole-wave reduction in a wave32 program"));
+            }
             self.uses_wave = true;
             let (f, kind) = m.strip_prefix("tb_wave_").and_then(wave_reduce_op).ok_or_else(|| format!("bad wave op {m}"))?;
             let cast = ["", "asfloat", "asint"][kind as usize];
@@ -3910,6 +4023,9 @@ impl<'a> Emitter<'a> {
             return self.ws(&d, &e);
         }
         if ins.op == OP_WAVE_SCAN && ins.enc == Enc::Vop3 {
+            if !self.wave64 {
+                return Err(format!("{m}: whole-wave scan in a wave32 program"));
+            }
             self.uses_wave = true;
             let (f, kind) = m.strip_prefix("tb_scan_").and_then(wave_scan_op).ok_or_else(|| format!("bad scan op {m}"))?;
             let x = r(&s[0])?;
@@ -3937,12 +4053,12 @@ impl<'a> Emitter<'a> {
                     Opnd::Vgpr(124) | Opnd::Null => return Ok(()),
                     other => return Err(format!("v_readlane: destination {other:?} unsupported")),
                 };
-                self.line(&format!("uint t{t} = WaveReadLaneAt({}, ({lane}) & 31u);", r(&s[0])?));
+                self.line(&format!("uint t{t} = WaveReadLaneAt({}, {});", r(&s[0])?, self.guest_lane(&lane)));
                 return self.ws(&sd, &format!("t{t}"));
             }
             self.touch(&d);
             let dn = name(&d)?;
-            self.line(&format!("uint t{t} = {}; if (WaveGetLaneIndex() == (({lane}) & 31u)) {dn} = t{t};", r(&s[0])?));
+            self.line(&format!("uint t{t} = {}; if (WaveGetLaneIndex() == {}) {dn} = t{t};", r(&s[0])?, self.guest_lane(&lane)));
             return Ok(());
         }
         if matches!(m.as_str(), "v_permlane16_b32" | "v_permlanex16_b32") {
@@ -4170,6 +4286,19 @@ impl<'a> Emitter<'a> {
             let halves: Vec<String> = if (w0 >> 15) & 1 != 0 { halves.into_iter().map(|h| format!("saturate({h})")).collect() } else { halves };
             return self.wv(&d, &format!("(tb_f2h({}) | (tb_f2h({}) << 16))", halves[0], halves[1]));
         }
+        if matches!(m.as_str(), "v_pk_lshlrev_b16" | "v_pk_lshrrev_b16") {
+            let (w0, w1) = (ins.raw[0], ins.raw.get(1).copied().unwrap_or(0));
+            if (w1 >> 29) & 7 != 0 || (w0 >> 8) & 7 != 0 || (w0 >> 15) & 1 != 0 {
+                return Err(format!("{m}: NEG/NEG_HI/CLAMP on an integer packed op"));
+            }
+            let sel = [(w0 >> 11) & 7, ((w1 >> 27) & 3) | (((w0 >> 14) & 1) << 2)];
+            let mut halves = Vec::new();
+            for h in sel {
+                let x: Vec<String> = (0..2).map(|i| r(&s[i]).map(|x| if (h >> i) & 1 != 0 { format!("(({x}) >> 16)") } else { format!("(({x}) & 0xffffu)") })).collect::<Result<_, _>>()?;
+                halves.push(if m == "v_pk_lshlrev_b16" { format!("(({} << ({} & 15u)) & 0xffffu)", x[1], x[0]) } else { format!("({} >> ({} & 15u))", x[1], x[0]) });
+            }
+            return self.wv(&d, &format!("({} | ({} << 16))", halves[0], halves[1]));
+        }
         if matches!(m.as_str(), "v_min3_f16" | "v_max3_f16" | "v_med3_f16") {
             let (a, b, c) = (h16(&s[0])?, h16(&s[1])?, h16(&s[2])?);
             let e = match m.as_str() {
@@ -4292,7 +4421,7 @@ impl<'a> Emitter<'a> {
                     i.push(format!("(asint(({x}) << 16) >> 16)"));
                 }
             }
-            let sat_i = |e: String| if clamp { format!("asuint(clamp({e}, -32768, 32767))") } else { format!("asuint({e})") };
+            let sat_i = |e: String| if clamp { sat_int(&e, 16) } else { format!("asuint({e})") };
             let e = match m.as_str() {
                 "v_add_nc_u16" => if clamp { format!("min({} + {}, 0xffffu)", u[0], u[1]) } else { format!("({} + {})", u[0], u[1]) },
                 "v_sub_nc_u16" => if clamp { format!("({0} < {1} ? 0u : {0} - {1})", u[0], u[1]) } else { format!("({} - {})", u[0], u[1]) },
@@ -4420,8 +4549,8 @@ impl<'a> Emitter<'a> {
             return self.wv(
                 &d,
                 &format!(
-                    "((asuint(clamp(asint({}), -32768, 32767)) & 0xffffu) | (asuint(clamp(asint({}), -32768, 32767)) << 16))",
-                    r(&s[0])?,
+                    "({} | (asuint(clamp(asint({}), -32768, 32767)) << 16))",
+                    sat_int(&format!("asint({})", r(&s[0])?), 16),
                     r(&s[1])?
                 ),
             );
@@ -4697,10 +4826,10 @@ impl<'a> Emitter<'a> {
             "v_cvt_f32_ubyte3" => Some(format!("(float)(({a} >> 24) & 0xffu)")),
             "v_cvt_f32_f16" => Some(format!("f16tof32({a})")),
             "v_fract_f32" => Some(format!("tb_fract({})", fa()?)),
-            "v_trunc_f32" => Some(format!("trunc({})", fa()?)),
-            "v_ceil_f32" => Some(format!("ceil({})", fa()?)),
+            "v_trunc_f32" => Some(format!("tb_trunc({})", fa()?)),
+            "v_ceil_f32" => Some(format!("tb_ceil({})", fa()?)),
             "v_rndne_f32" => Some(format!("tb_rne({})", fa()?)),
-            "v_floor_f32" => Some(format!("floor({})", fa()?)),
+            "v_floor_f32" => Some(format!("tb_floor({})", fa()?)),
             "v_exp_f32" => Some(format!("exp2({})", fa()?)),
             "v_log_f32" => Some(format!("tb_log({})", fa()?)),
             "v_rcp_f32" | "v_rcp_iflag_f32" => Some(format!("1.0 / {}", fa()?)),
@@ -4805,7 +4934,7 @@ impl<'a> Emitter<'a> {
                 .join(" | "),
             "v_cvt_u32_f32" => format!("tb_cvt_u({})", fa()?),
             "v_cvt_i32_f32" => format!("tb_cvt_i({})", fa()?),
-            "v_cvt_flr_i32_f32" => format!("tb_cvt_i(floor({}))", fa()?),
+            "v_cvt_flr_i32_f32" => format!("tb_cvt_i(tb_flr({}))", fa()?),
             "v_cvt_rpi_i32_f32" => format!("tb_cvt_i(floor({} + 0.5))", fa()?),
             "v_cvt_f16_f32" => format!("tb_f2h({})", fa()?),
             "v_cvt_pkrtz_f16_f32" => format!("(tb_f16rtz({}) | (tb_f16rtz({}) << 16))", fa()?, fb()?),
@@ -6220,23 +6349,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                     continue;
                 }
                 let (ty, _) = sig_type(e);
-                // DXIL validation: with a conservative depth output (SV_DepthLessEqual /
-                // SV_DepthGreaterEqual) the position input must be centroid-interpolated.
-                let cons_depth = ex.output_sig.iter().any(|o| {
-                    let s = semantic(o);
-                    s.starts_with("SV_DepthLessEqual") || s.starts_with("SV_DepthGreaterEqual")
-                });
-                let interp = if !is_ps {
-                    ""
-                } else if e.sysval == 1 && cons_depth {
-                    "linear noperspective centroid "
-                } else if e.comp_type != 3 {
-                    "nointerpolation "
-                } else if e.name.contains("_centroid") {
-                    centroid::qualifier(ex, ei)
-                } else {
-                    ""
-                };
+                let interp = if is_ps { ps_input_modifier(ex, ei, e) } else { "" };
                 let _ = writeln!(h, "    {interp}{ty} i{ei} : {};", semantic(e));
             }
         }
@@ -6253,7 +6366,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                 // in the character where the base pass failed the depth test).
                 let _ = writeln!(h, "    precise {ty} o{ei} : {};", semantic(e));
             } else {
-                let _ = writeln!(h, "    {ty} o{ei} : {};", semantic(e));
+                let interp = if is_ps { None } else { self.out_interp.for_output(e) };
+                let interp = interp.map(|m| format!("{m} ")).unwrap_or_default();
+                let _ = writeln!(h, "    {interp}{ty} o{ei} : {};", semantic(e));
             }
         }
         let no_out = ex.output_sig.is_empty();

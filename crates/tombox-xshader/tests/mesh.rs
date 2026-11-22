@@ -228,6 +228,9 @@ fn mesh_clip_distance_export_maps_to_pos1() {
     let t = translate(&ms(&w, mesh_info(64, 64, 64, 2), outs)).expect("translate");
     assert!(t.hlsl.contains("if (exec_lo & 1u) o.o1.x = asfloat(v1);"), "{}", t.hlsl);
     assert!(t.hlsl.contains("if (exec_lo & 1u) o.o1.y = asfloat(v2);"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("groupshared uint tb_mscnt;"));
+    assert!(!t.hlsl.contains("GroupMemoryBarrierWithGroupSync();"));
+    dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap();
     let mut w2 = w.clone();
     let i = w2.iter().position(|x| *x == exp(13, 0x3, false, [1, 2, 0, 0])[0]).unwrap();
     w2[i] = exp(14, 0x3, false, [1, 2, 0, 0])[0];
@@ -260,6 +263,67 @@ fn mesh_and_amplification_validate_thread_dimensions() {
         assert!(t.hlsl.contains(&format!("tb_k < 4u; tb_k += {threads}u) tb_args[tb_k] = 0u;")));
         dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap();
     }
+}
+
+#[test]
+fn mesh_scalar_buffer_load_uses_root_descriptor_for_aliased_register() {
+    use tombox_xshader::meta::{RootParam, RootParamKind, RootSig};
+
+    let mut words = vec![sop1(3, 0, 16), sop1(3, 28, 0), 0xf420_000e, 0xfa00_0000];
+    words.extend(console_ms(3, 1, 0));
+    let mut shader = ms(&words, mesh_info(128, 128, 128, 2), pos_param_outs());
+    let Err(error) = translate(&shader) else {
+        panic!("a scalar buffer load requires a known root descriptor");
+    };
+    assert!(error.contains("missing root signature for base s28 (root s16)"), "{error}");
+
+    shader.has_root_sig = true;
+    shader.root_sig = Some(RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![RootParam {
+            visibility: 0,
+            kind: RootParamKind::Descriptor { kind: 2, register: 7, space: 2 },
+        }],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    });
+    let translated = translate(&shader).expect("explicit CBV root descriptor");
+    assert!(translated.hlsl.contains("register(b7, space2)"), "{}", translated.hlsl);
+}
+
+#[test]
+fn mesh_typed_buffer_load_uses_root_table_range() {
+    use tombox_xshader::meta::{RootParam, RootParamKind, RootRange, RootSig};
+
+    let mut words = vec![0xf408_0008, 0xfa00_0020, 0xe000_2000, 0x8000_0101];
+    words.extend(console_ms(3, 1, 0));
+    let mut shader = ms(&words, mesh_info(128, 128, 128, 2), pos_param_outs());
+    let Err(error) = translate(&shader) else {
+        panic!("a typed buffer load requires a known descriptor table");
+    };
+    assert!(error.contains("missing root signature for descriptor table in s16"), "{error}");
+
+    shader.has_root_sig = true;
+    shader.root_sig = Some(RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![RootParam {
+            visibility: 0,
+            kind: RootParamKind::Table(vec![RootRange {
+                range_type: 0,
+                num: 1,
+                base_register: 7,
+                space: 2,
+                offset_in_table: 1,
+            }]),
+        }],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    });
+    let translated = translate(&shader).expect("explicit SRV descriptor range");
+    assert!(translated.hlsl.contains("Buffer<"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("register(t7, space2)"), "{}", translated.hlsl);
 }
 
 #[test]
@@ -382,10 +446,40 @@ unsafe fn mesh_gpu() -> (Gpu, &'static str) {
         assert!(mesh_tier(d) != 0, "WARP reports MeshShaderTier 0: rerun with TOMBOX_EXEC_HW=1 to use the hardware adapter");
         return (gpu_on(d), "WARP");
     }
-    let mut g = Gpu::new(false).expect("hardware d3d12 device");
-    g.open = false;
-    assert!(mesh_tier(g.device) != 0, "neither WARP nor the hardware adapter supports mesh shaders");
-    (g, "hardware")
+    let d = hw_mesh_device().expect("no hardware adapter supports mesh shaders");
+    (gpu_on(d), "hardware")
+}
+
+unsafe fn hw_mesh_device() -> Option<*mut c_void> {
+    const IID_FACTORY6: Guid = Guid(0xc1b6694f, 0xff09, 0x44a9, [0xb0, 0x3c, 0x77, 0x90, 0x0a, 0x0a, 0x1d, 0x17]);
+    const IID_ADAPTER1: Guid = Guid(0x29038f61, 0x3839, 0x4626, [0x91, 0xfd, 0x08, 0x68, 0x79, 0x01, 0x1a, 0x05]);
+    const DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE: u32 = 2;
+    const DXGI_ADAPTER_FLAG_SOFTWARE: u32 = 2;
+    let dxgi = LoadLibraryA(b"dxgi.dll\0".as_ptr());
+    let cf: unsafe extern "system" fn(*const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(GetProcAddress(dxgi, b"CreateDXGIFactory1\0".as_ptr()));
+    let mut f: *mut c_void = core::ptr::null_mut();
+    assert!(cf(&IID_FACTORY6, &mut f) >= 0, "CreateDXGIFactory1(IDXGIFactory6)");
+    let d3d = LoadLibraryA(b"d3d12.dll\0".as_ptr());
+    let create: unsafe extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(GetProcAddress(d3d, b"D3D12CreateDevice\0".as_ptr()));
+    for i in 0.. {
+        let mut ad: *mut c_void = core::ptr::null_mut();
+        if vcall!(f, 29, fn(u32, u32, *const Guid, *mut *mut c_void) -> i32, i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, &IID_ADAPTER1, &mut ad) < 0 {
+            return None;
+        }
+        let mut desc = [0u32; 78];
+        vcall!(ad, 10, fn(*mut c_void) -> i32, desc.as_mut_ptr() as *mut c_void);
+        if desc[76] & DXGI_ADAPTER_FLAG_SOFTWARE != 0 {
+            continue;
+        }
+        let mut device: *mut c_void = core::ptr::null_mut();
+        if create(ad, 0xc100, &d3d::IID_DEVICE, &mut device) >= 0 {
+            if mesh_tier(device) != 0 {
+                return Some(device);
+            }
+            vcall!(device, 2, fn() -> u32);
+        }
+    }
+    None
 }
 
 const PS: &str = "uint4 main(float4 p : SV_Position, nointerpolation uint2 t : TEXCOORD0) : SV_Target { return uint4(t.x, t.y, 0x77u, 0x88u); }";
@@ -411,10 +505,13 @@ fn bytecode(b: &[u8]) -> Vec<u8> {
     v
 }
 
+static WARP_RENDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 unsafe fn render(words: &[u32], groups: u32) -> Result<[u32; 4], String> {
     let t = translate(&ms(words, mesh_info(128, 128, 128, 2), pos_param_outs()))?;
     let msb = dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).map_err(|e| format!("{e}\n{}", t.hlsl))?;
     let psb = dxc::compile(PS, "ps_6_5")?;
+    let _warp = std::env::var_os("TOMBOX_EXEC_HW").is_none().then(|| WARP_RENDER.lock().unwrap_or_else(|e| e.into_inner()));
     let (mut gpu, kind) = mesh_gpu();
     eprintln!("mesh render on {kind}");
     let d3d12 = LoadLibraryA(b"d3d12.dll\0".as_ptr());
@@ -527,6 +624,18 @@ fn gpu_mesh_divergent_barrier_without_memory_writes() {
 }
 
 #[test]
+fn gpu_mesh_uniform_entry_counts_preserve_rendered_output() {
+    let mut words = console_ms(67, 1, TRI);
+    let guard = words.iter().position(|&w| w == sop1(4, 10, EXEC)).unwrap();
+    let barrier = words.iter().position(|&w| w == sopp(0x0a, 0)).unwrap();
+    words.drain(guard..=barrier);
+    words.splice(..0, [sop1(3, M0, LIT), (1 << 12) | 67, sopp(0x10, 9)]);
+    let shader = translate(&ms(&words, mesh_info(128, 128, 128, 2), pos_param_outs())).unwrap();
+    assert!(!shader.hlsl.contains("GroupMemoryBarrierWithGroupSync();"));
+    assert_eq!(unsafe { render(&words, 1) }.unwrap(), [64, 1, 0x77, 0x88]);
+}
+
+#[test]
 fn mesh_alloc_and_lds_refusals() {
     let mut w = console_ms(67, 1, TRI);
     let i = w.iter().position(|x| *x == sopp(0x10, 9)).unwrap();
@@ -595,4 +704,23 @@ fn warp_rejects_the_console_force_memory_based_abi_root_flag() {
         eprintln!("WARP CreateRootSignature with flag 0x01000000 -> {hr:#010x}");
         assert!(hr < 0, "PC accepted the console-only root signature flag bit 24");
     }
+}
+
+#[test]
+fn compile_amplification_payload_subword_loads() {
+    let mut words = Vec::new();
+    for (op, offset) in [(8, 15), (10, 14)] {
+        words.extend([0xdc00_0000 | (op << 18) | offset, (0x7d << 16) | (4 << 24)]);
+    }
+    words.push(S_ENDPGM);
+    let mut info = mesh_info(1, 0, 0, 0);
+    info.stage = 14;
+    info.payload_bytes = 16;
+    let mut shader = ms(&words, info, vec![]);
+    shader.stage = Stage::Amplification;
+    let t = translate(&shader).unwrap();
+    for width in [1, 2] {
+        assert!(t.hlsl.lines().any(|line| line.contains("tb_gload(") && line.contains(&format!(", {width}u)"))), "{}", t.hlsl);
+    }
+    dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap();
 }
