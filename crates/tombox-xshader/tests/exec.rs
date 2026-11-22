@@ -875,6 +875,23 @@ fn scalar_sop2() {
 }
 
 #[test]
+fn scalar_bfe32_result_and_scc() {
+    let mut cases = Cases::new();
+    for (offset, width, unsigned, signed) in [
+        (16, 0, 0, 0),
+        (31, 1, 1, u32::MAX),
+        (28, 8, 8, 0xffff_fff8),
+        (16, 32, 0x8123, 0xffff_8123),
+        (0, 32, 0x8123_4567, 0x8123_4567),
+    ] {
+        let control = (width << 16) | offset;
+        s2(&mut cases, "s_bfe_u32", 0x27, 0x8123_4567, control, 1, unsigned, nz(u64::from(unsigned)));
+        s2(&mut cases, "s_bfe_i32", 0x28, 0x8123_4567, control, 1, signed, nz(u64::from(signed)));
+    }
+    cases.run_both("s_bfe32_result_and_scc");
+}
+
+#[test]
 fn scalar_sop1() {
     let mut c = Cases::new();
     let vals32: [u32; 7] = [0, 1, 0x8000_0000, 0xffff_ffff, 0x0001_0000, 0x7fff_fff0, 0x1234_0080];
@@ -2363,4 +2380,62 @@ fn second_forward_branch_into_open_guard_skips() {
     pre.vv(10, 0x1111).raw(&[SCC0]);
     c.add("s_cbranch_scc1", &pre, &[sopp(0x05, 4), vop1(1, 10, ic(7)), SCC0, sopp(0x05, 1), vop1(1, 10, ic(8))], &post, &[8]);
     c.run("branch_guard");
+}
+
+#[test]
+fn legacy_minmax_on_warp_keeps_a_nan_in_either_source() {
+    fn legacy(op: u32, a: u32, b: u32) -> u32 {
+        let mov = |dst: u32, val: u32| [0x7e00_0000 | (dst << 17) | (1 << 9) | 255, val];
+        let mut code = Vec::new();
+        code.extend_from_slice(&mov(1, a));
+        code.extend_from_slice(&mov(2, b));
+        code.push((op << 25) | (2 << 9) | (256 + 1));
+        code.push(S_ENDPGM);
+        let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let lowered = tombox_xshader::gcn::to_rdna2(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        let mut words: Vec<u32> = lowered.isa[..lowered.code_len]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words.pop(), Some(S_ENDPGM));
+        let mut p = Prog::new();
+        p.raw(&words);
+        run(&p.words()).unwrap_or_else(|e| panic!("{e}"))[0]
+    }
+    let nan = 0x7fc0_0000u32;
+    let one = 0x3f80_0000u32;
+    assert_eq!(legacy(0x0d, nan, one), one, "min with NaN in source 0");
+    assert_eq!(legacy(0x0d, one, nan), nan, "min with NaN in source 1");
+    assert_eq!(legacy(0x0e, nan, one), one, "max with NaN in source 0");
+    assert_eq!(legacy(0x0e, one, nan), nan, "max with NaN in source 1");
+    assert_eq!(legacy(0x0e, 0, 0x8000_0000), 0, "max of +0 and -0 keeps source 0");
+    assert_eq!(legacy(0x0e, 0x8000_0000, 0), 0x8000_0000, "max of -0 and +0 keeps source 0");
+}
+
+#[test]
+fn pkaccum_u8_packs_four_bytes_into_one_register() {
+    fn mov_lit(dst: u32, val: u32) -> [u32; 2] {
+        [0x7e00_0000 | (dst << 17) | (1 << 9) | 255, val]
+    }
+    fn mov_imm(dst: u32, imm: u32) -> u32 {
+        0x7e00_0000 | (dst << 17) | (1 << 9) | (128 + imm)
+    }
+    let mut code = vec![mov_imm(1, 0)];
+    for (i, bits) in [0x3f80_0000u32, 0x4000_0000, 0x4040_0000, 0x4080_0000].into_iter().enumerate() {
+        code.extend_from_slice(&mov_lit(0, bits));
+        code.push(mov_imm(2, i as u32));
+        code.push((0x2c << 25) | (1 << 17) | (2 << 9) | 256);
+    }
+    code.push(S_ENDPGM);
+    let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let lowered = tombox_xshader::gcn::to_rdna2(&bytes).unwrap_or_else(|e| panic!("{e}"));
+    let mut words: Vec<u32> = lowered.isa[..lowered.code_len]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(words.pop(), Some(S_ENDPGM));
+    let mut p = Prog::new();
+    p.raw(&words);
+    let got = run(&p.words()).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got[1], 0x0403_0201, "{got:08x?}");
 }
