@@ -94,6 +94,10 @@ unsafe fn vslot(o: *mut c_void, i: usize) -> usize {
     unsafe { *(*(o as *const *const usize)).add(i) }
 }
 
+fn read_b13(va: u64) -> Option<Vec<u8>> {
+    unsafe { crate::bindtrace::read_va(va, DUMP_BYTES) }.or_else(|| read_mem(va, DUMP_BYTES))
+}
+
 pub fn read_mem(addr: u64, n: usize) -> Option<Vec<u8>> {
     extern "system" {
         fn ReadProcessMemory(p: *mut c_void, base: *const c_void, buf: *mut c_void, n: usize, read: *mut usize) -> i32;
@@ -185,7 +189,7 @@ pub fn draw(list: usize, text: &str, params: &[(usize, u32, u32, u32)], mask: u6
         .map(|&(i, r, sp, vis)| {
             let set = i < 64 && mask & (1u64 << i) != 0;
             let va = vas.get(&(i as u32)).copied().unwrap_or(0);
-            let bytes = if r == 13 && va != 0 { read_mem(va, DUMP_BYTES) } else { None };
+            let bytes = if r == 13 && va != 0 { read_b13(va) } else { None };
             (i, r, sp, vis, set, va, bytes)
         })
         .collect();
@@ -316,13 +320,13 @@ pub unsafe fn note_exec(queue: *mut c_void, title: &[*mut c_void], real: &[*mut 
 }
 
 unsafe extern "system" fn q_signal(queue: *mut c_void, fence: *mut c_void, value: u64) -> i32 {
-    unsafe { note_signal(queue, fence, value, "emu") };
+    unsafe { note_signal(queue, fence, value, "pc slot 14") };
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 = unsafe { core::mem::transmute(REAL_SIGNAL.load(Ordering::Relaxed)) };
     unsafe { f(queue, fence, value) }
 }
 
 unsafe extern "system" fn q_wait(queue: *mut c_void, fence: *mut c_void, value: u64) -> i32 {
-    unsafe { note_wait(queue, fence, value, "emu") };
+    unsafe { note_wait(queue, fence, value, "pc slot 15") };
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 = unsafe { core::mem::transmute(REAL_WAIT.load(Ordering::Relaxed)) };
     unsafe { f(queue, fence, value) }
 }
@@ -358,7 +362,7 @@ pub fn dump_on_removal() {
     let mut draws = draws;
     draws.sort_by_key(|d| d.seq);
     for d in &draws {
-        let now: Vec<Option<Vec<u8>>> = d.roots.iter().map(|r| if r.1 == 13 && r.5 != 0 { read_mem(r.5, DUMP_BYTES) } else { None }).collect();
+        let now: Vec<Option<Vec<u8>>> = d.roots.iter().map(|r| if r.1 == 13 && r.5 != 0 { read_b13(r.5) } else { None }).collect();
         let changed: Vec<String> = d.roots.iter().zip(&now).filter(|(r, n)| r.1 == 13 && r.6.is_some() && r.6 != **n).map(|(r, _)| format!("param {}", r.0)).collect();
         let note = if changed.is_empty() { "b13 bytes unchanged since recording".to_string() } else { format!("b13 bytes CHANGED since recording at {}", changed.join(", ")) };
         record("d3d12_xs", "hang_cap.removal", &format!("kept {}{note}", snap_text(d, true)));

@@ -780,6 +780,7 @@ qthunks!(
 unsafe extern "system" fn signal_x(queue: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> i32 {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 =
         core::mem::transmute(REAL_QVT[14].load(Ordering::Relaxed));
+    crate::hang_cap::note_signal(queue, fence, value, "title SignalX");
     let hr = crate::slowcall::time("queue SignalX", || f(queue, fence, value));
     static N: AtomicUsize = AtomicUsize::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 3 {
@@ -851,13 +852,15 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
         return;
     }
     crate::sys_ts::note_queue(queue, REAL_QVT[16].load(Ordering::Relaxed), REAL_QVT[17].load(Ordering::Relaxed));
+    crate::rtcap::note_submit(queue as usize, &title, &real);
     let split = crate::cl2_state::before_execute(queue, &real);
     crate::title_heap::sync_for_execute(&real);
     crate::title_shadow::before_execute();
     crate::slowcall::time("queue ExecuteCommandLists replay hook", || crate::replay::on_execute(queue, &real));
-    crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, REAL_QVT[14].load(Ordering::Relaxed), REAL_QVT[15].load(Ordering::Relaxed)));
+    crate::hang_cap::note_exec(queue, &title, &real);
+    crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed))));
     crate::ecl_probe::check("ExecuteCommandLists", queue, REAL_QVT[18].load(Ordering::Relaxed), &title, &real, before);
-    crate::title_shadow::after_execute(queue, REAL_QVT[14].load(Ordering::Relaxed), REAL_QVT[15].load(Ordering::Relaxed));
+    crate::title_shadow::after_execute(queue, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed)));
     crate::list_split::after_submit(queue, &real);
     crate::cl2_state::note_executed(queue, &real);
     crate::cl2_state::after_execute(queue, &split);
@@ -946,6 +949,7 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
             }
             install_qthunks();
             install_qlow();
+            crate::hang_cap::install_queue(&QUEUE_VT, &|i| REAL_QVT[i].load(Ordering::Relaxed));
             QUEUE_VT[10].store(q_exec_dispatch as usize, Ordering::Relaxed);
             QUEUE_VT[16].store(q_freq_dispatch as usize, Ordering::Relaxed);
             QUEUE_VT[17].store(q_calib_dispatch as usize, Ordering::Relaxed);

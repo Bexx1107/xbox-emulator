@@ -165,9 +165,9 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
             unsafe { f(this, mask, blob, len, riid, ppv) }
         }
     };
-    if hr >= 0 && inherit_on() && !ppv.is_null() {
+    if hr >= 0 && track_on() && !ppv.is_null() {
         let rs = unsafe { *ppv } as usize;
-        let regs = root_cbv_regs(unsafe { core::slice::from_raw_parts(blob, len) });
+        let regs = root_cbv_params(unsafe { core::slice::from_raw_parts(blob, len) });
         dc_with(|d| { d.rs.insert(rs, regs); });
     }
     hr
@@ -217,7 +217,7 @@ unsafe extern "system" fn set_graphics_root_cbv_x(this: *mut c_void, i: u32, va:
     if crate::rtcap::enabled() {
         crate::bindtrace::set_root_cbv(this as usize, false, i, va);
     }
-    if inherit_on() {
+    if track_on() {
         dc_with(|d| {
             let l = d.lists.entry(this as usize).or_default();
             if (i as usize) < 64 {
@@ -275,15 +275,21 @@ pub fn hook_device(v: &mut [usize]) {
     v[17] = create_cbv as usize;
 }
 
-pub fn clamp_knob() -> Option<(u32, u32)> {
-    static K: OnceLock<Option<(u32, u32)>> = OnceLock::new();
-    *K.get_or_init(|| {
-        let v = std::env::var("TOMBOX_CBRAW_CLAMP").ok()?;
-        let (a, b) = v.split_once(':')?;
-        let lim = b.trim().trim_start_matches("0x");
-        let lim = if lim == "z" { u32::MAX } else { u32::from_str_radix(lim, 16).ok()? };
-        Some((a.trim().parse().ok()?, lim))
-    })
+pub fn clamp_knob() -> Option<(u32, u32, Option<u64>)> {
+    static K: OnceLock<Option<(u32, u32, Option<u64>)>> = OnceLock::new();
+    *K.get_or_init(|| parse_clamp(&std::env::var("TOMBOX_CBRAW_CLAMP").ok()?))
+}
+
+pub fn parse_clamp(v: &str) -> Option<(u32, u32, Option<u64>)> {
+    let mut it = v.split(':');
+    let a = it.next()?;
+    let lim = it.next()?.trim().trim_start_matches("0x");
+    let lim = if lim == "z" { u32::MAX } else { u32::from_str_radix(lim, 16).ok()? };
+    let only = match it.next() {
+        Some(h) => Some(u64::from_str_radix(h.trim(), 16).ok()?),
+        None => None,
+    };
+    Some((a.trim().parse().ok()?, lim, only))
 }
 
 pub fn clamp_reads(h: &str, slot: u32, lim: u32) -> String {
@@ -298,15 +304,19 @@ pub fn clamp_reads(h: &str, slot: u32, lim: u32) -> String {
 }
 
 pub fn root_cbv_regs(blob: &[u8]) -> Vec<(usize, u32, u32)> {
+    root_cbv_params(blob).into_iter().map(|(i, r, sp, _)| (i, r, sp)).collect()
+}
+
+pub fn root_cbv_params(blob: &[u8]) -> Vec<(usize, u32, u32, u32)> {
     let mut out = Vec::new();
     let Some((o, n)) = crate::console_slots_mesh::rts0_range(blob) else { return out };
     let Some(b) = blob.get(o..o + n) else { return out };
     let (Ok(np), Ok(po)) = (rd(b, 4), rd(b, 8)) else { return out };
     for i in 0..np as usize {
         let at = po as usize + i * 12;
-        if let (Ok(PARAM_CBV), Ok(pl)) = (rd(b, at), rd(b, at + 8)) {
+        if let (Ok(PARAM_CBV), Ok(vis), Ok(pl)) = (rd(b, at), rd(b, at + 4), rd(b, at + 8)) {
             if let (Ok(r), Ok(sp)) = (rd(b, pl as usize), rd(b, pl as usize + 4)) {
-                out.push((i, r, sp));
+                out.push((i, r, sp, vis));
             }
         }
     }
@@ -328,7 +338,7 @@ fn log_root_regs(blob: &[u8]) {
 
 #[derive(Default)]
 struct DrawCheck {
-    rs: std::collections::HashMap<usize, Vec<(usize, u32, u32)>>,
+    rs: std::collections::HashMap<usize, Vec<(usize, u32, u32, u32)>>,
     lists: std::collections::HashMap<usize, (usize, u64, std::collections::HashMap<u32, u64>)>,
     last: std::collections::HashMap<usize, std::collections::HashMap<u32, u64>>,
     seen: std::collections::HashSet<(usize, u64)>,
@@ -366,6 +376,10 @@ fn inherit_on() -> bool {
     *E.get_or_init(|| enabled() && (check_on() || std::env::var("TOMBOX_CBRAW_INHERIT").map(|v| v == "1").unwrap_or(false)))
 }
 
+fn track_on() -> bool {
+    inherit_on() || crate::hang_cap::on()
+}
+
 unsafe extern "system" fn reset_checked(this: *mut c_void, alloc: *mut c_void, pso: *mut c_void) -> i32 {
     dc_with(|d| {
         d.lists.remove(&(this as usize));
@@ -382,11 +396,15 @@ pub fn inherit_plan(regs: &[(usize, u32, u32)], mask: u64, last: &std::collectio
         .collect()
 }
 
-fn check_draw(list: usize) {
+fn check_draw(list: usize, text: &dyn Fn() -> String) {
     let (plan, msg) = dc_with(|d| {
         let (rs, mask, vas) = d.lists.get(&list).cloned().unwrap_or_default();
-        let Some(regs) = d.rs.get(&rs).cloned() else { return (Vec::new(), None) };
-        let plan = d.last.get(&list).map(|last| inherit_plan(&regs, mask, last)).unwrap_or_default();
+        let Some(params) = d.rs.get(&rs).cloned() else { return (Vec::new(), None) };
+        if crate::hang_cap::on() {
+            crate::hang_cap::draw(list, &format!("rs {rs:#x} {}", text()), &params, mask, &vas);
+        }
+        let regs: Vec<(usize, u32, u32)> = params.iter().map(|&(i, r, sp, _)| (i, r, sp)).collect();
+        let plan = if inherit_on() { d.last.get(&list).map(|last| inherit_plan(&regs, mask, last)).unwrap_or_default() } else { Vec::new() };
         if let Some(l) = d.lists.get_mut(&list) {
             for (i, va) in &plan {
                 l.1 |= 1u64 << i;
@@ -403,7 +421,6 @@ fn check_draw(list: usize) {
         if unset.is_empty() {
             return (plan, None);
         }
-        let _ = vas;
         let key = (rs, mask);
         if d.seen.len() >= 64 || !d.seen.insert(key) {
             return (plan, None);
@@ -426,19 +443,19 @@ fn check_draw(list: usize) {
 }
 
 unsafe extern "system" fn draw_indexed_checked(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
-    check_draw(this as usize);
+    check_draw(this as usize, &|| format!("DrawIndexedInstanced(idx={a} inst={b} startIdx={c} baseVtx={d} startInst={e})"));
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32) = unsafe { core::mem::transmute(PREV_DRAW_IDX.load(Ordering::Relaxed)) };
     unsafe { f(this, a, b, c, d, e) }
 }
 
 unsafe extern "system" fn draw_checked(this: *mut c_void, a: u32, b: u32, c: u32, d: u32) {
-    check_draw(this as usize);
+    check_draw(this as usize, &|| format!("DrawInstanced(vtx={a} inst={b} startVtx={c} startInst={d})"));
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = unsafe { core::mem::transmute(PREV_DRAW.load(Ordering::Relaxed)) };
     unsafe { f(this, a, b, c, d) }
 }
 
 pub fn install_draw_check(xbox_vt: &[AtomicUsize]) {
-    if !inherit_on() || xbox_vt.len() <= XBOX_SLOT_SET_GRAPHICS_RS || REAL_ROOT_SRV[1].load(Ordering::Relaxed) == 0 {
+    if !track_on() || xbox_vt.len() <= XBOX_SLOT_SET_GRAPHICS_RS || REAL_ROOT_SRV[1].load(Ordering::Relaxed) == 0 {
         return;
     }
     PREV_RESET.store(xbox_vt[XBOX_SLOT_RESET].load(Ordering::Relaxed), Ordering::Relaxed);
@@ -449,13 +466,22 @@ pub fn install_draw_check(xbox_vt: &[AtomicUsize]) {
     xbox_vt[XBOX_SLOT_SET_GRAPHICS_RS].store(set_graphics_rs_checked as usize, Ordering::Relaxed);
     xbox_vt[XBOX_SLOT_DRAW_INDEXED].store(draw_indexed_checked as usize, Ordering::Relaxed);
     xbox_vt[XBOX_SLOT_DRAW].store(draw_checked as usize, Ordering::Relaxed);
-    record("d3d12_xs", "cbv_raw", "root CBV inheritance across root signature changes installed");
+    crate::hang_cap::install_cmdlist(xbox_vt);
+    record("d3d12_xs", "cbv_raw", if inherit_on() { "root CBV inheritance across root signature changes installed" } else { "root CBV tracking installed for the hang capture (no inheritance)" });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gpu_va::Entry;
+
+    #[test]
+    fn clamp_knob_takes_an_optional_shader_scope() {
+        assert_eq!(parse_clamp("13:z"), Some((13, u32::MAX, None)));
+        assert_eq!(parse_clamp("13:0x470"), Some((13, 0x470, None)));
+        assert_eq!(parse_clamp("13:z:f861c56a34758d84"), Some((13, u32::MAX, Some(0xf861c56a34758d84))));
+        assert_eq!(parse_clamp("13:z:nothex"), None);
+    }
 
     fn rts0(version: u32, ranges: &[[u32; 4]], root_cbv: bool) -> Vec<u8> {
         let rs = if version == 1 { 20 } else { 24 };

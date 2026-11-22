@@ -58,6 +58,7 @@ struct Target {
 }
 static TARGETS: Mutex<Vec<Target>> = Mutex::new(Vec::new());
 static SRV_SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static GEOM: Mutex<Vec<(u64, u64, i64, u64, u64, String)>> = Mutex::new(Vec::new());
 /// Last known state per resource (from creation, then the title's transition barriers).
 static STATES: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 
@@ -300,6 +301,23 @@ pub unsafe fn maybe_capture(queue: *mut c_void, presented: *mut c_void) {
     let _ = writeln!(report, "{} render-target/depth textures known", targets.len());
     let presented_order = targets.iter().find(|t| t.0 == presented as usize).map(|t| format!("#{:03}", t.2)).unwrap_or_else(|| format!("{presented:p}"));
     let _ = writeln!(report, "presented this frame: {presented_order}");
+    let geom: Vec<(u64, u64, i64, u64, u64, String)> = core::mem::take(&mut *GEOM.lock().unwrap());
+    for (ib_va, isz, start, vb, stride, tag) in geom {
+        let ib_at = ib_va + start as u64 * isz;
+        let idx = gpu_read(device, queue, alloc, list, fence, &mut fence_value, ib_at, (6 * isz) as usize);
+        let _ = writeln!(report, "geom {tag}: ib@{ib_at:#x} -> {:x?}", idx.as_ref().map(|v| v.chunks_exact(isz as usize).map(|c| if isz == 2 { u16::from_le_bytes([c[0], c[1]]) as u32 } else { u32::from_le_bytes(c.try_into().unwrap()) }).collect::<Vec<u32>>()));
+        let ids: Vec<u32> = idx.map(|v| v.chunks_exact(isz as usize).map(|c| if isz == 2 { u16::from_le_bytes([c[0], c[1]]) as u32 } else { u32::from_le_bytes(c.try_into().unwrap()) }).collect()).unwrap_or_default();
+        for i in ids.iter().take(4) {
+            let at = vb + *i as u64 * stride;
+            let v = gpu_read(device, queue, alloc, list, fence, &mut fence_value, at, stride as usize);
+            let txt = v.map(|b| {
+                let h: Vec<String> = b.chunks_exact(2).map(|c| format!("{:.3}", half(u16::from_le_bytes([c[0], c[1]])))).collect();
+                let x: Vec<String> = b.chunks_exact(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
+                format!("halves[{}] hex[{}]", h.join(" "), x.join(" "))
+            }).unwrap_or_else(|| "readback failed".into());
+            let _ = writeln!(report, "   v[{i}] @{at:#x}: {txt}");
+        }
+    }
     let mut done = 0;
     for (res, d, order) in targets {
         let u32at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
@@ -670,6 +688,64 @@ pub fn trace_draw(list: usize, compute: bool, text: &str) {
     }
 }
 
+unsafe fn gpu_read(device: *mut c_void, queue: *mut c_void, alloc: *mut c_void, list: *mut c_void, fence: *mut c_void, fence_value: &mut u64, va: u64, n: usize) -> Option<Vec<u8>> {
+    let (base, res, size, _) = crate::bindtrace::buffer_at(va)?;
+    let off = va - base;
+    if off + n as u64 > size {
+        return None;
+    }
+    let heap: [u32; 5] = [3, 0, 0, 1, 1];
+    let mut bd = [0u8; 0x38];
+    bd[0..4].copy_from_slice(&1u32.to_le_bytes());
+    bd[0x10..0x18].copy_from_slice(&(n as u64).to_le_bytes());
+    bd[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
+    bd[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+    bd[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+    bd[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+    bd[0x2c..0x30].copy_from_slice(&1u32.to_le_bytes());
+    let mut buf: *mut c_void = core::ptr::null_mut();
+    let hr = vcall!(device, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+        heap.as_ptr(), 0, bd.as_ptr(), 0x400, core::ptr::null(), &IID_RESOURCE, &mut buf);
+    if hr < 0 || buf.is_null() {
+        return None;
+    }
+    let _keep = Released(buf);
+    vcall!(alloc, 8, fn() -> i32);
+    vcall!(list, 10, fn(*mut c_void, *mut c_void) -> i32, alloc, core::ptr::null_mut());
+    vcall!(list, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), buf, 0, res as *mut c_void, off, n as u64);
+    vcall!(list, 9, fn() -> i32);
+    let lists = [list];
+    vcall!(queue, 10, fn(u32, *const *mut c_void) -> (), 1, lists.as_ptr());
+    *fence_value += 1;
+    vcall!(queue, 14, fn(*mut c_void, u64) -> i32, fence, *fence_value);
+    let mut spins = 0;
+    while vcall!(fence, 8, fn() -> u64) < *fence_value && spins < 3000 {
+        Sleep(1);
+        spins += 1;
+    }
+    let mut data: *mut u8 = core::ptr::null_mut();
+    if vcall!(buf, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut data) < 0 || data.is_null() {
+        return None;
+    }
+    let v = core::slice::from_raw_parts(data, n).to_vec();
+    vcall!(buf, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+    Some(v)
+}
+
+pub fn note_submit(queue: usize, title: &[*mut c_void], real: &[*mut c_void]) {
+    if !enabled() {
+        return;
+    }
+    let active = with_trace(|t| !t.trace_hashes.is_empty() && t.trace_budget > 0 && t.trace_budget < 48);
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if !active || N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 40 {
+        return;
+    }
+    let t: Vec<String> = title.iter().map(|l| format!("{l:p}")).collect();
+    let r: Vec<String> = real.iter().map(|l| format!("{l:p}->{:#x}", list_key(*l as usize))).collect();
+    record("d3d12_xs", "rtcap.submit", &format!("queue={queue:#x} title=[{}] real=[{}]", t.join(" "), r.join(" ")));
+}
+
 fn read_self(addr: u64, n: usize) -> Option<Vec<u8>> {
     extern "system" {
         fn ReadProcessMemory(p: *mut c_void, base: *const c_void, buf: *mut c_void, n: usize, read: *mut usize) -> i32;
@@ -681,11 +757,17 @@ fn read_self(addr: u64, n: usize) -> Option<Vec<u8>> {
     if ok != 0 && got == n {
         return Some(v);
     }
-    let (e, off) = crate::gpu_va::lookup(addr).or_else(|| crate::gpu_va::lookup_gpu(addr))?;
-    if !e.buffer || off + n as u64 > e.len {
+    let (res, off, len) = match crate::gpu_va::lookup(addr).or_else(|| crate::gpu_va::lookup_gpu(addr)).filter(|(e, _)| e.buffer) {
+        Some((e, off)) => (e.res, off, e.len),
+        None => {
+            let (base, res, size, _) = crate::bindtrace::buffer_at(addr)?;
+            (res, addr - base, size)
+        }
+    };
+    if off + n as u64 > len {
         return None;
     }
-    let r = e.res as *mut c_void;
+    let r = res as *mut c_void;
     let mut p: *mut u8 = core::ptr::null_mut();
     let hr = unsafe { vcall!(r, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut p) };
     if hr < 0 || p.is_null() {
@@ -714,7 +796,14 @@ fn dump_vertices(list: usize, text: &str) -> String {
     let ib = [list, list_key(list)].iter().find_map(|&k| crate::console_slots::bound_ib(k));
     let Some(ib) = ib else { return "  vertices: no index buffer view recorded\n".into() };
     let isz = if ib.format == 57 { 2u64 } else { 4 };
-    let mut out = format!("  ib va={:#x} size={} fmt={}\n", ib.va, ib.size, ib.format);
+    {
+        let mut g = GEOM.lock().unwrap();
+        let tag: String = text.chars().take(40).collect();
+        if g.len() < 6 && !g.iter().any(|e| e.3 == vb) {
+            g.push((ib.va, isz, start + 0, vb + (base.max(0) as u64) * stride, stride, tag));
+        }
+    }
+    let mut out = format!("  ib va={:#x} size={} fmt={} | ib buffer {:x?} | vb buffer {:x?}\n", ib.va, ib.size, ib.format, crate::bindtrace::buffer_at(ib.va), crate::bindtrace::buffer_at(vb));
     let Some(raw) = read_self(ib.va + start as u64 * isz, (6 * isz) as usize) else { return out + "  ib not CPU-readable at that VA\n" };
     for i in 0..6 {
         let idx = if isz == 2 { u16::from_le_bytes(raw[i * 2..i * 2 + 2].try_into().unwrap()) as i64 } else { u32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap()) as i64 };

@@ -188,7 +188,7 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
             dump_failure(hash, blob, None, &e);
             format!("bind: {e}")
         })?;
-        if let Some((slot, lim)) = crate::cbv_raw::clamp_knob() {
+        if let Some((slot, lim, _)) = crate::cbv_raw::clamp_knob().filter(|k| k.2.map_or(true, |h| h == hash)) {
             t.hlsl = crate::cbv_raw::clamp_reads(&t.hlsl, slot, lim);
         }
     }

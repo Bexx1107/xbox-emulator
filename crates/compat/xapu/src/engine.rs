@@ -122,11 +122,11 @@ pub fn prepare_start(cfg: &Config, cmd: &[u8; CMD_SIZE]) -> Result<Start, i32> {
         return Ok(s);
     }
     if cfg.codec != PT_DECODE_OPUS {
-        if !(MIN_PITCH..=MAX_PITCH).contains(&pitch) {
+        if !pitch.is_finite() {
             s.error = E_INVALIDARG;
             return Ok(s);
         }
-        s.pitch = pitch;
+        s.pitch = pitch.clamp(MIN_PITCH, MAX_PITCH);
     }
     if cfg.codec != PT_CONVERT_PCM {
         match OpusDecoder::new(OPUS_RATE, ch as usize) {
@@ -325,10 +325,11 @@ pub fn process(cfg: &Config, st: &mut Stream, cmd: &[u8; CMD_SIZE]) -> Outcome {
         return o;
     }
     let ramp = if ramp.is_finite() { ramp.abs().clamp(MIN_RAMP, MAX_RAMP) } else { MIN_RAMP };
-    if !(MIN_PITCH..=MAX_PITCH).contains(&target) {
+    if !target.is_finite() {
         o.status = E_INVALIDARG;
         return o;
     }
+    let target = target.clamp(MIN_PITCH, MAX_PITCH);
     let input = if cfg.codec == PT_CONVERT_PCM { pcm_input(cfg, st, cmd) } else { decode(st, cmd) };
     let input = match input {
         Ok(p) => p,

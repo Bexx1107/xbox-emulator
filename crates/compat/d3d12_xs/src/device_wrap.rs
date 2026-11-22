@@ -806,6 +806,9 @@ unsafe extern "system" fn create_gfx_pso_sync(
     if std::env::var_os("TOMBOX_DBG_CULL_NONE").is_some() {
         desc[0x1c8..0x1cc].copy_from_slice(&1u32.to_le_bytes());
     }
+    if std::env::var_os("TOMBOX_DBG_NO_BLEND").is_some() {
+        desc[0x80..0x84].copy_from_slice(&0u32.to_le_bytes());
+    }
     if crate::rtcap::enabled() {
         let ptr = u64::from_le_bytes(desc[0x228..0x230].try_into().unwrap()) as *const u8;
         let n = u32::from_le_bytes(desc[0x230..0x234].try_into().unwrap()) as usize;

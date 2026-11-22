@@ -1859,7 +1859,7 @@
 <rect x="875.00" y="880.00" width="125.00" height="60.00" fill="none" stroke="#0d1117" stroke-width="2"/>
 <text x="880.00" y="896.00" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Amplification</text>
 </g>
-<text x="4.00" y="971.00" font-family="sans-serif" font-size="16" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Xbox console libraries: 99.44% (2143/2155)</text>
+<text x="4.00" y="971.00" font-family="sans-serif" font-size="16" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Xbox console libraries: 99.54% (2145/2155)</text>
 <rect x="4" y="982" width="10" height="10" fill="#2ea043"/>
 <text x="18.00" y="991.00" font-family="sans-serif" font-size="11" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">implemented</text>
 <rect x="109" y="982" width="10" height="10" fill="#388bfd"/>
@@ -2638,11 +2638,11 @@
 <rect x="849.41" y="1593.85" width="50.20" height="58.24" fill="none" stroke="#0d1117" stroke-width="2"/>
 <text x="854.41" y="1609.85" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">scdxil</text>
 </g>
-<g><title>chad.dll: 6/7 covered; XDefiant imports 5</title>
+<g><title>chad.dll: 7/7 covered; XDefiant imports 5</title>
 <rect x="900.61" y="1594.85" width="48.20" height="18.75" fill="#8cca97"/>
-<rect x="900.61" y="1613.60" width="16.07" height="18.75" fill="#8cca97"/>
-<rect x="916.67" y="1613.60" width="32.13" height="18.75" fill="#2ea043"/>
-<rect x="900.61" y="1632.35" width="16.07" height="18.75" fill="#e6c685"/>
+<rect x="900.61" y="1613.60" width="32.13" height="18.75" fill="#8cca97"/>
+<rect x="932.74" y="1613.60" width="16.07" height="18.75" fill="#2ea043"/>
+<rect x="900.61" y="1632.35" width="16.07" height="18.75" fill="#2ea043"/>
 <line x1="900.61" y1="1613.60" x2="948.80" y2="1613.60" stroke="#0d1117" stroke-width="0.5"/>
 <line x1="900.61" y1="1632.35" x2="948.80" y2="1632.35" stroke="#0d1117" stroke-width="0.5"/>
 <rect x="899.61" y="1593.85" width="50.20" height="58.24" fill="none" stroke="#0d1117" stroke-width="2"/>
@@ -2664,11 +2664,10 @@
 <rect x="741.85" y="1652.09" width="47.55" height="52.69" fill="none" stroke="#0d1117" stroke-width="2"/>
 <text x="746.85" y="1668.09" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">newbe</text>
 </g>
-<g><title>xapu.dll: 5/6 covered; Minecraft imports 4, XDefiant imports 5</title>
+<g><title>xapu.dll: 6/6 covered; Minecraft imports 4, XDefiant imports 5</title>
 <rect x="742.85" y="1705.79" width="45.55" height="25.35" fill="#8cca97"/>
-<rect x="742.85" y="1731.14" width="15.18" height="25.35" fill="#8cca97"/>
-<rect x="758.04" y="1731.14" width="15.18" height="25.35" fill="#2ea043"/>
-<rect x="773.22" y="1731.14" width="15.18" height="25.35" fill="#e6c685"/>
+<rect x="742.85" y="1731.14" width="30.37" height="25.35" fill="#8cca97"/>
+<rect x="773.22" y="1731.14" width="15.18" height="25.35" fill="#2ea043"/>
 <line x1="742.85" y1="1731.14" x2="788.40" y2="1731.14" stroke="#0d1117" stroke-width="0.5"/>
 <rect x="741.85" y="1704.79" width="47.55" height="52.69" fill="none" stroke="#0d1117" stroke-width="2"/>
 <text x="746.85" y="1720.79" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">xapu</text>

@@ -358,7 +358,7 @@ pub(crate) fn conv_known() -> u32 {
     if let Some(m) = std::env::var("TOMBOX_DCC_CONV_KNOWN").ok().and_then(|x| u32::from_str_radix(&x, 16).ok()) {
         return m;
     }
-    if crate::dcc::xg_build() == 19041 { 0xff } else { 0b1101_1111 }
+    0
 }
 
 pub(crate) fn conv_seen(p: Option<usize>) -> [u8; 64] {

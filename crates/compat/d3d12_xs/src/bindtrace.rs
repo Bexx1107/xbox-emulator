@@ -211,6 +211,24 @@ pub unsafe fn read_upload(base: u64) -> Option<Vec<u8>> {
     Some(core::slice::from_raw_parts(mapped as *const u8, size as usize).to_vec())
 }
 
+pub unsafe fn read_va(va: u64, n: usize) -> Option<Vec<u8>> {
+    let (base, _, size, heap_type) = buffer_at(va)?;
+    if heap_type != 2 {
+        return None;
+    }
+    let mut mapped = with(|s| s.buffers.get(&base).map(|b| b.mapped))?;
+    if mapped == 0 {
+        read_upload(base).map(|_| ())?;
+        mapped = with(|s| s.buffers.get(&base).map(|b| b.mapped))?;
+    }
+    if mapped == 0 {
+        return None;
+    }
+    let off = (va - base) as usize;
+    let n = n.min((size as usize).saturating_sub(off));
+    Some(core::slice::from_raw_parts((mapped + off) as *const u8, n).to_vec())
+}
+
 pub fn set_table(list: usize, compute: bool, index: u32, handle: u64) {
     with(|s| {
         let v = s.tables.entry((list, compute)).or_default();
@@ -452,7 +470,8 @@ pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -
                     }
                 };
                 let aged = if it.age > 1 { format!(" (written {} frames ago)", it.age) } else { String::new() };
-                out.push_str(&format!("    param[{}]+{} {kind} {what} | {view}{aged}\n", it.param, it.slot));
+                let st = crate::rtcap::state_of(res).or_else(|| Some(crate::gpu_va::state(res)).filter(|&x| x != 0)).map(|x| format!(" state={x:#x}")).unwrap_or_default();
+                out.push_str(&format!("    param[{}]+{} {kind} {what} | {view}{aged}{st}\n", it.param, it.slot));
             }
             Desc::Sampler { desc } => {
                 let u = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());

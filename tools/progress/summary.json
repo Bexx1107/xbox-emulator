@@ -47,9 +47,9 @@
  },
  "extra": {
   "console_exports": {
-   "done": 2143,
+   "done": 2145,
    "total": 2155,
-   "pct": 99.44
+   "pct": 99.54
   },
   "shader_compile_lobby_frame": {
    "done": 139,
@@ -77,9 +77,9 @@
    "pct": 100.0
   },
   "title_imports_XDefiant": {
-   "done": 50,
+   "done": 52,
    "total": 52,
-   "pct": 96.15
+   "pct": 100.0
   },
   "title_imports_Terraria": {
    "done": 61,
@@ -92,14 +92,14 @@
    "pct": 100.0
   },
   "title_imports_Minecraft": {
-   "done": 34,
+   "done": 35,
    "total": 35,
-   "pct": 97.14
+   "pct": 100.0
   },
   "console_exports_targeted": {
-   "done": 2143,
+   "done": 2145,
    "total": 2154,
-   "pct": 99.49
+   "pct": 99.58
   },
   "console_exports_not_targeted": {
    "done": null,
@@ -111,14 +111,14 @@
  "all_including_pc": {
   "note": "previous definition, kept for history: every export of every console OS DLL and every title import, PC-provided ones included",
   "console_exports": {
-   "done": 21800,
+   "done": 21802,
    "total": 23743,
    "pct": 91.82
   },
   "xbox_only_exports": {
-   "done": 2067,
+   "done": 2069,
    "total": 2078,
-   "pct": 99.47
+   "pct": 99.57
   },
   "title_import_status": {
    "Fortnite": {
@@ -129,9 +129,8 @@
     "title": 356
    },
    "XDefiant": {
-    "implemented": 60,
+    "implemented": 62,
     "title": 323,
-    "stub": 2,
     "pc": 1192,
     "hooked": 30,
     "forwarded": 5
@@ -154,9 +153,8 @@
     "title": 1363,
     "pc": 2060,
     "forwarded": 6,
-    "implemented": 27,
-    "hooked": 27,
-    "stub": 1
+    "implemented": 28,
+    "hooked": 27
    }
   },
   "title_imports_Fortnite": {
@@ -165,9 +163,9 @@
    "pct": 100.0
   },
   "title_imports_XDefiant": {
-   "done": 1610,
+   "done": 1612,
    "total": 1612,
-   "pct": 99.88
+   "pct": 100.0
   },
   "title_imports_Terraria": {
    "done": 3496,
@@ -180,9 +178,9 @@
    "pct": 100.0
   },
   "title_imports_Minecraft": {
-   "done": 3483,
+   "done": 3484,
    "total": 3484,
-   "pct": 99.97
+   "pct": 100.0
   }
  },
  "title_import_status": {
@@ -192,8 +190,7 @@
    "forwarded": 6
   },
   "XDefiant": {
-   "implemented": 40,
-   "stub": 2,
+   "implemented": 42,
    "hooked": 5,
    "forwarded": 5
   },
@@ -209,9 +206,8 @@
   },
   "Minecraft": {
    "forwarded": 6,
-   "implemented": 27,
-   "hooked": 1,
-   "stub": 1
+   "implemented": 28,
+   "hooked": 1
   }
  },
  "console_os_builds": {

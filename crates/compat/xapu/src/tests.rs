@@ -191,9 +191,13 @@ fn pitch_ramp_reported_and_bounded() {
     assert!(gains[0] > 0.5 && gains[0] < 1.0);
     assert!(gains.windows(2).all(|w| w[1] >= w[0]));
     assert_eq!(*gains.last().unwrap(), 1.0);
-    assert_eq!(XApuEnqueueCommand(h, data_cmd(0, None, 0, &mut out, 0.0, 9.0, 0).as_ptr(), &mut seq), S_OK);
+    assert_eq!(XApuEnqueueCommand(h, data_cmd(0, None, 0, &mut out, 8.0, 9.0, 0).as_ptr(), &mut seq), S_OK);
+    let r = result(h).unwrap();
+    assert_eq!(u32_at(&r, 0x2c), 0);
+    assert!(f32::from_bits(u32_at(&r, 0x40)) <= 8.0);
+    assert_eq!(XApuEnqueueCommand(h, data_cmd(0, None, 0, &mut out, 0.0, f32::NAN, 0).as_ptr(), &mut seq), S_OK);
     assert_eq!(u32_at(&result(h).unwrap(), 0x2c), E_INVALIDARG as u32);
-    let mut bad = start_cmd(0, 1, 0.0);
+    let mut bad = start_cmd(0, 1, f32::NAN);
     bad[4..8].copy_from_slice(&0u32.to_le_bytes());
     assert_eq!(XApuEnqueueCommand(h, cmd(CMD_STOP, 0).as_ptr(), &mut seq), S_OK);
     while result(h).is_some() {}
