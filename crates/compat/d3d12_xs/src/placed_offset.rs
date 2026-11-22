@@ -1555,6 +1555,109 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore]
+    fn msaa_off_a_4mb_step_shares_heap_tiles_with_same_va_placements() {
+        if !gpu_free() {
+            return;
+        }
+        unsafe {
+            let p = crate::host_proc(b"D3D12CreateDevice\0");
+            let mk: extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(p);
+            let mut dev: *mut c_void = core::ptr::null_mut();
+            assert!(mk(core::ptr::null_mut(), 0xc000, &IID_DEVICE, &mut dev) >= 0);
+            let r = VirtualAlloc(core::ptr::null_mut(), 0x100_0000, 0x2000, 0x01) as u64;
+            assert!(r != 0);
+            let md = tex_desc(4);
+            let mut info = [0u64; 2];
+            vc!(dev, 25, fn(*mut u64, u32, u32, *const u8) -> *mut u64, info.as_mut_ptr(), 0, 1, md.as_ptr());
+            let mut big: *mut c_void = core::ptr::null_mut();
+            let mb = crate::alias::create_placed_x(dev, r + 0x80_0000, &tex_desc(1), 0x40_0000, 0, core::ptr::null(), &mut big).expect("texture that opens the shared heap");
+            let (mut a, mut b): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
+            let ma = crate::alias::create_placed_x(dev, r + 0x51_0000, &md, info[0], 4, core::ptr::null(), &mut a).expect("MSAA 0x110000 bytes past a 4 MB step");
+            let mb2 = crate::alias::create_placed_x(dev, r + 0x51_0000, &md, info[0], 4, core::ptr::null(), &mut b).expect("second MSAA at the same title VA");
+            assert_eq!((ma.heap, ma.offset), (mb2.heap, mb2.offset));
+            assert_eq!(ma.heap, mb.heap, "the MSAA lands in the heap the title's other placements use");
+            assert_eq!(ma.offset + 0x80_0000, mb.offset + 0x51_0000);
+            assert!(info[1] < crate::msaa_place::MSAA_ALIGN || crate::msaa_place::needs_tiles(4, ma.offset, info[1], crate::msaa_place::capable(ma.heap)));
+            let qd = [0u32; 4];
+            let (mut q, mut al, mut l, mut fe, mut dh): (*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut());
+            assert!(vc!(dev, 8, fn(*const u32, *const Guid, *mut *mut c_void) -> i32, qd.as_ptr(), &IID_QUEUE, &mut q) >= 0);
+            assert!(vc!(dev, 9, fn(u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut al) >= 0);
+            assert!(vc!(dev, 12, fn(u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32, 0, 0, al, core::ptr::null_mut(), &IID_GFX_LIST, &mut l) >= 0);
+            assert!(vc!(dev, 36, fn(u64, u32, *const Guid, *mut *mut c_void) -> i32, 0, 0, &IID_FENCE, &mut fe) >= 0);
+            const IID_DESC_HEAP: Guid = Guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+            let hd = [2u32, 1, 0, 0];
+            assert!(vc!(dev, 14, fn(*const u32, *const Guid, *mut *mut c_void) -> i32, hd.as_ptr(), &IID_DESC_HEAP, &mut dh) >= 0);
+            let mut cpu = 0usize;
+            vc!(dh, 9, fn(*mut usize) -> *mut usize, &mut cpu);
+            vc!(dev, 20, fn(*mut c_void, *const c_void, usize) -> (), a, core::ptr::null(), cpu);
+            let heap: [u32; 5] = [1, 0, 0, 1, 1];
+            let single = tex_desc(1);
+            let mut one: *mut c_void = core::ptr::null_mut();
+            assert!(vc!(dev, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32, heap.as_ptr(), 0, single.as_ptr(), 0x1000, core::ptr::null(), &IID_RESOURCE, &mut one) >= 0);
+            let rbh: [u32; 5] = [3, 0, 0, 1, 1];
+            let rbd = buf_desc(256 * 256 * 4);
+            let mut rb: *mut c_void = core::ptr::null_mut();
+            assert!(vc!(dev, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32, rbh.as_ptr(), 0, rbd.as_ptr(), 0x400, core::ptr::null(), &IID_RESOURCE, &mut rb) >= 0);
+            vc!(l, 9, fn() -> i32);
+            vc!(al, 8, fn() -> i32);
+            vc!(l, 10, fn(*mut c_void, *mut c_void) -> i32, al, core::ptr::null_mut());
+            let colour = [0.25f32, 0.5, 0.75, 1.0];
+            vc!(l, 48, fn(usize, *const f32, u32, *const c_void) -> (), cpu, colour.as_ptr(), 0, core::ptr::null());
+            let mut ab = [0u8; 32];
+            ab[0..4].copy_from_slice(&1u32.to_le_bytes());
+            ab[8..16].copy_from_slice(&(a as u64).to_le_bytes());
+            ab[16..24].copy_from_slice(&(b as u64).to_le_bytes());
+            let bt = |res: *mut c_void, before: u32, after: u32| {
+                let mut x = [0u8; 32];
+                x[8..16].copy_from_slice(&(res as u64).to_le_bytes());
+                x[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+                x[20..24].copy_from_slice(&before.to_le_bytes());
+                x[24..28].copy_from_slice(&after.to_le_bytes());
+                x
+            };
+            let set = [ab, bt(b, 4, 0x2000)];
+            vc!(l, 26, fn(u32, *const u8) -> (), 2, set.as_ptr() as *const u8);
+            vc!(l, 19, fn(*mut c_void, u32, *mut c_void, u32, u32) -> (), one, 0, b, 0, 28);
+            let t = [bt(one, 0x1000, 0x800)];
+            vc!(l, 26, fn(u32, *const u8) -> (), 1, t.as_ptr() as *const u8);
+            let mut dst = [0u8; LOCATION];
+            dst[0..8].copy_from_slice(&(rb as u64).to_le_bytes());
+            dst[8..12].copy_from_slice(&1u32.to_le_bytes());
+            dst[0x18..0x1c].copy_from_slice(&28u32.to_le_bytes());
+            dst[0x1c..0x20].copy_from_slice(&256u32.to_le_bytes());
+            dst[0x20..0x24].copy_from_slice(&256u32.to_le_bytes());
+            dst[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            dst[0x28..0x2c].copy_from_slice(&1024u32.to_le_bytes());
+            let mut src = [0u8; LOCATION];
+            src[0..8].copy_from_slice(&(one as u64).to_le_bytes());
+            vc!(l, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (), dst.as_ptr(), 0, 0, 0, src.as_ptr(), core::ptr::null());
+            assert!(vc!(l, 9, fn() -> i32) >= 0);
+            let ls = [l];
+            vc!(q, 10, fn(u32, *const *mut c_void) -> (), 1, ls.as_ptr());
+            vc!(q, 14, fn(*mut c_void, u64) -> i32, fe, 1);
+            let mut n = 0;
+            while vc!(fe, 8, fn() -> u64) < 1 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                n += 1;
+                assert!(n < 5000);
+            }
+            let mut m: *mut u8 = core::ptr::null_mut();
+            assert!(vc!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut m) >= 0);
+            let px = core::slice::from_raw_parts(m, 256 * 256 * 4);
+            let want = [64u8, 128, 191, 255];
+            let close = |p: &[u8]| p.iter().zip(want).all(|(x, y)| (*x as i32 - y as i32).abs() <= 1);
+            assert!(close(&px[0..4]) && close(&px[px.len() - 4..]), "a clear through one MSAA placement is what the other same-VA placement resolves: {:?}", &px[0..4]);
+            vc!(rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+            for x in [rb, one, dh, a, b, big, l, al, fe, q] {
+                vc!(x, 2, fn() -> u32);
+            }
+            VirtualFree(r as *mut c_void, 0, 0x8000);
+            vc!(dev, 2, fn() -> u32);
+        }
+    }
+
     fn tex_desc(samples: u32) -> [u8; 0x38] {
         let mut d = [0u8; 0x38];
         d[0..4].copy_from_slice(&3u32.to_le_bytes());
@@ -1626,12 +1729,9 @@ mod tests {
             vc!(t3, 2, fn() -> u32);
             let mut t4: *mut c_void = core::ptr::null_mut();
             let same = crate::alias::create_placed_x(dev, r + 0x31_0000, &md, info[0], 4, core::ptr::null(), &mut t4);
-            if info[1] >= crate::msaa_place::MSAA_ALIGN {
-                assert!(same.is_none(), "MSAA that fits its title layout but sits off a 4 MB step of the shared heap falls back to a committed resource");
-            } else {
-                assert!(same.is_some(), "this adapter places MSAA at {:#x}, so any 64 KB step works", info[1]);
-                vc!(t4, 2, fn() -> u32);
-            }
+            let same = same.expect("MSAA off a 4 MB step of the shared heap is still placed in it");
+            assert_eq!((same.kind, same.heap, same.offset), (crate::alias::Kind::Local, m1.heap, 0x31_0000), "it aliases the title's other placements in the shared heap, not a separate committed resource");
+            vc!(t4, 2, fn() -> u32);
             for t in [t1, t2] {
                 vc!(t, 2, fn() -> u32);
             }

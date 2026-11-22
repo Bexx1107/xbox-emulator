@@ -183,6 +183,7 @@ fn console_view_maps_host_lan_addresses_to_the_emulated_nic() {
 
 #[test]
 fn wfp_store_is_empty_and_keeps_dynamic_providers_per_session() {
+    let _g = wfp::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let e = wfp::engine_open(wfp::FWPM_SESSION_FLAG_DYNAMIC).unwrap();
     for kind in [wfp::Kind::ProviderContext, wfp::Kind::SubLayer, wfp::Kind::Callout, wfp::Kind::Filter, wfp::Kind::IpsecSaContext, wfp::Kind::IpsecSa, wfp::Kind::IkeSa, wfp::Kind::AleEndpoint] {
         let h = wfp::create_enum_handle(e, kind).unwrap();
@@ -213,4 +214,42 @@ fn wfp_store_is_empty_and_keeps_dynamic_providers_per_session() {
     assert_eq!(wfp::provider_delete_by_key(e2, &key), wfp::FWP_E_PROVIDER_NOT_FOUND);
     assert_eq!(wfp::engine_close(e2), 0);
     assert_eq!(wfp::create_enum_handle(e2, wfp::Kind::Provider), Err(wfp::ERROR_INVALID_HANDLE));
+}
+
+#[test]
+fn wfp_store_lives_in_the_process_wide_mapping() {
+    let _g = wfp::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    extern "system" {
+        fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> *mut core::ffi::c_void;
+        fn MapViewOfFile(h: *mut core::ffi::c_void, access: u32, high: u32, low: u32, n: usize) -> *mut core::ffi::c_void;
+        fn UnmapViewOfFile(p: *const core::ffi::c_void) -> i32;
+        fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+    }
+    let e = wfp::engine_open(wfp::FWPM_SESSION_FLAG_DYNAMIC).unwrap();
+    let e2 = wfp::engine_open(0).unwrap();
+    assert!(e2 > e && e >= wfp::FIRST_HANDLE);
+    let name: Vec<u16> = "shared-store-probe".encode_utf16().collect();
+    let key = [0x5a; 16];
+    let p = wfp::Provider { key, name: Some(name.clone()), description: None, flags: 0, data: vec![1, 2, 3], service_name: None };
+    assert_eq!(wfp::provider_add(e, p.clone()), 0);
+    let n: Vec<u16> = wfp::shared_mapping_name().encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let h = OpenFileMappingW(0x0004, 0, n.as_ptr());
+        assert!(!h.is_null());
+        let v = MapViewOfFile(h, 0x0004, 0, 0, 0) as *const u8;
+        assert!(!v.is_null());
+        let len = u32::from_le_bytes(core::slice::from_raw_parts(v.add(4), 4).try_into().unwrap()) as usize;
+        let next = u64::from_le_bytes(core::slice::from_raw_parts(v.add(8), 8).try_into().unwrap());
+        assert!(next >= e2);
+        let arena = core::slice::from_raw_parts(v.add(16), len);
+        let wide: Vec<u8> = name.iter().flat_map(|c| c.to_le_bytes()).collect();
+        assert!(arena.windows(16).any(|w| w == key));
+        assert!(arena.windows(wide.len()).any(|w| w == wide.as_slice()));
+        UnmapViewOfFile(v as *const _);
+        CloseHandle(h);
+    }
+    assert_eq!(wfp::provider_get_by_key(e2, &key), Ok(p));
+    assert_eq!(wfp::engine_close(e), 0);
+    assert_eq!(wfp::provider_get_by_key(e2, &key), Err(wfp::FWP_E_PROVIDER_NOT_FOUND));
+    assert_eq!(wfp::engine_close(e2), 0);
 }
