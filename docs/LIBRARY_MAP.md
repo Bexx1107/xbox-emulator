@@ -26,7 +26,7 @@ Upstream's metric set (same definitions as upstream `tools/progress/gen.py`, For
 | Metric | Done | Total | % |
 |---|---|---|---|
 | system_functions | 671 | 671 | 100.0 |
-| d3d12x_methods | 192 | 200 | 96.0 |
+| d3d12x_methods | 199 | 200 | 99.5 |
 | rdna2_instructions | 768 | 794 | 96.73 |
 | shaders_translated | 105506 | 105506 | 100.0 |
 | shader_stages | 0 | 8 | 0.0 |

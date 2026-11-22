@@ -168,6 +168,35 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
     put32(&mut d, 0x264, 20);
     put32(&mut d, 0x268, samples);
     let mut pso: *mut c_void = core::ptr::null_mut();
+    let exact = std::env::var("TOMBOX_F861_EXACT").ok().filter(|_| full.is_some());
+    let mut exact_keep: Vec<Vec<u8>> = Vec::new();
+    let mut stride = 44u32;
+    if let Some(dir) = &exact {
+        let rdf = |n: &str| std::fs::read(format!("{dir}_{n}")).map_err(|e| format!("exact {n}: {e}"));
+        let ed = rdf("desc.bin")?;
+        let evs = rdf("vs.dxil")?;
+        let eps = rdf("ps.dxil")?;
+        let mut lay = rdf("layout.bin")?;
+        let names: [&[u8]; 3] = [b"POSITION\0", b"NORMAL\0", b"TEXCOORD\0"];
+        let fsize = |f: u32| match f { 2 | 3 | 4 => 16, 6 | 7 | 8 => 12, 16 | 17 | 18 => 8, _ => 4 };
+        stride = 0;
+        for (i, e) in lay.chunks_mut(32).enumerate() {
+            e[0..8].copy_from_slice(&(names[i.min(2)].as_ptr() as u64).to_le_bytes());
+            let f = u32::from_le_bytes(e[12..16].try_into().unwrap());
+            let off = u32::from_le_bytes(e[20..24].try_into().unwrap());
+            stride = stride.max(off + fsize(f));
+        }
+        d.copy_from_slice(&ed[..656]);
+        put64(&mut d, 0, rs as u64);
+        put64(&mut d, 8, evs.as_ptr() as u64);
+        put64(&mut d, 16, evs.len() as u64);
+        put64(&mut d, 24, eps.as_ptr() as u64);
+        put64(&mut d, 32, eps.len() as u64);
+        put64(&mut d, 0x228, lay.as_ptr() as u64);
+        d[0x278..0x288].fill(0);
+        println!("exact: desc/vs/ps/layout from {dir}_* (vs {}B ps {}B stride {stride} samples {})", evs.len(), eps.len(), u32::from_le_bytes(d[0x268..0x26c].try_into().unwrap()));
+        exact_keep.extend([evs, eps, lay]);
+    }
     let hr = vcall!(gpu.device, 10, fn(*const u8, *const Guid, *mut *mut c_void) -> i32, d.as_ptr(), &d3d::IID_PSO, &mut pso);
     if hr < 0 {
         return Err(format!("CreateGraphicsPipelineState hr={:#010x}{}", hr as u32, gpu.messages()));
@@ -299,7 +328,7 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
         vcall!(l, 36, fn(u32, u32, *const u32, u32) -> (), 2, 5, rc.as_ptr(), 0);
         vcall!(l, 32, fn(u32, u64) -> (), 3, mg);
         vcall!(l, 32, fn(u32, u64) -> (), 4, if reserved { sg + 64 * sinc as u64 } else { sg });
-        let vs_va = match std::env::var("TOMBOX_F861_VSB13").ok().filter(|_| real_vs.is_some()) {
+        let vs_va = match std::env::var("TOMBOX_F861_VSB13").ok().filter(|_| real_vs.is_some() || exact.is_some()) {
             Some(p) => {
                 let vb13 = std::fs::read(p).map_err(|e| format!("vs b13 {e}"))?;
                 let vub = gpu.buffer(0x10000, 2, d3d::GENERIC_READ, false)?;
@@ -313,7 +342,7 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
             }
             None => va,
         };
-        if real_vs.is_some() {
+        if real_vs.is_some() || exact.is_some() {
             let n = 64u32;
             let idx = gpu.buffer(n as u64 * 16, 2, d3d::GENERIC_READ, false)?;
             let mut rows = vec![0u8; n as usize * 16 * 3];
@@ -343,26 +372,36 @@ unsafe fn run_once(gpu: &mut Gpu, ps: &[u8], cbv: bool, b13: &[u8], samples: u32
             let a = [1.2961135f32, 0.0, -0.8417382];
             let b = [-0.19532247f32, 2.723972, -0.30075872];
             let mut vb = Vec::new();
-            for (sa, sb) in [(-200f32, -200f32), (600., -200.), (-200., 600.)] {
+            let tri = if exact.is_some() { [(-200f32, -200f32), (-200., 600.), (600., -200.)] } else { [(-200f32, -200f32), (600., -200.), (-200., 600.)] };
+            for (sa, sb) in tri {
                 for k in 0..3 {
                     vb.extend_from_slice(&(c[k] + a[k] * sa / 10.0 + b[k] * sb / 10.0).to_le_bytes());
                 }
-                vb.extend_from_slice(&1f32.to_le_bytes());
-                for f in [0f32, 1., 0., 0.5, 0.5, 0.5, 1.] {
-                    vb.extend_from_slice(&f.to_le_bytes());
+                if exact.is_some() {
+                    vb.extend_from_slice(&((0x1ffu32 << 10) | (3 << 30)).to_le_bytes());
+                    vb.extend_from_slice(&0.5f32.to_le_bytes());
+                    vb.extend_from_slice(&0.5f32.to_le_bytes());
+                    while vb.len() % stride as usize != 0 {
+                        vb.push(0);
+                    }
+                } else {
+                    vb.extend_from_slice(&1f32.to_le_bytes());
+                    for f in [0f32, 1., 0., 0.5, 0.5, 0.5, 1.] {
+                        vb.extend_from_slice(&f.to_le_bytes());
+                    }
                 }
             }
             let vbuf = gpu.buffer(vb.len() as u64, 2, d3d::GENERIC_READ, false)?;
             if !Gpu::map_write(vbuf, &vb) {
                 return Err("map vb".into());
             }
-            let view = [Gpu::gpu_va(vbuf), (vb.len() as u64) | (44u64 << 32)];
+            let view = [Gpu::gpu_va(vbuf), (vb.len() as u64) | ((stride as u64) << 32)];
             vcall!(l, 44, fn(u32, u32, *const u64) -> (), 0, 1, view.as_ptr());
             keep.extend([idx, mat, vbuf]);
         }
         vcall!(l, 40, fn(u32, u64) -> (), 5, vs_va);
         vcall!(l, 40, fn(u32, u64) -> (), 6, va);
-        vcall!(l, 32, fn(u32, u64) -> (), 7, if real_vs.is_some() { sg + 128 * sinc as u64 } else { sg });
+        vcall!(l, 32, fn(u32, u64) -> (), 7, if real_vs.is_some() || exact.is_some() { sg + 128 * sinc as u64 } else { sg });
         vcall!(l, 32, fn(u32, u64) -> (), 8, sg);
         let ua = gpu.buffer(0x10000, 1, 8, true)?;
         vcall!(l, 42, fn(u32, u64) -> (), 9, Gpu::gpu_va(ua));
