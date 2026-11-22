@@ -18,6 +18,7 @@ const SAVE_SECS: u64 = 20;
 const CACHED_SALT: u128 = 0x7462_706c_6361_6368_6564_7073_6f00_0001;
 
 const IID_DEVICE1: Guid = Guid { d1: 0x77ac_ce80, d2: 0x638e, d3: 0x4e65, d4: [0x88, 0x95, 0xc1, 0xf2, 0x33, 0x86, 0x86, 0x3e] };
+const IID_PSO: Guid = Guid { d1: 0x765a_30f3, d2: 0xf624, d3: 0x4c6f, d4: [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45] };
 const IID_LIBRARY1: Guid = Guid { d1: 0x80ea_bf42, d2: 0x2568, d3: 0x4e5e, d4: [0xbd, 0x82, 0xc3, 0x7f, 0x86, 0x96, 0x1d, 0xc3] };
 
 const DEV1_CREATE_LIBRARY: usize = 44;
@@ -196,31 +197,41 @@ pub fn stream_key(gfx: u128, extra: &str) -> u128 {
     h.done()
 }
 
-fn roots() -> &'static Mutex<HashMap<usize, u64>> {
-    static R: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
+struct RootInfo {
+    hash: u64,
+    mask: u32,
+    blob: std::sync::Arc<[u8]>,
+    via_real: bool,
+}
+
+fn roots() -> &'static Mutex<HashMap<usize, RootInfo>> {
+    static R: OnceLock<Mutex<HashMap<usize, RootInfo>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn note_root(rs: usize, blob_hash: u64) {
+pub fn note_root(rs: usize, mask: u32, blob: &[u8], via_real: bool) {
     if rs != 0 {
-        roots().lock().unwrap_or_else(|e| e.into_inner()).insert(rs, blob_hash);
+        let hash = fnv64(blob) ^ mask as u64;
+        roots().lock().unwrap_or_else(|e| e.into_inner()).insert(rs, RootInfo { hash, mask, blob: std::sync::Arc::from(blob), via_real });
     }
+}
+
+pub fn root_info(rs: usize) -> Option<(u32, std::sync::Arc<[u8]>, bool)> {
+    roots().lock().unwrap_or_else(|e| e.into_inner()).get(&rs).map(|r| (r.mask, r.blob.clone(), r.via_real))
 }
 
 fn root_hash(rs: u64) -> Option<u64> {
     if rs == 0 {
         return Some(0);
     }
-    roots().lock().unwrap_or_else(|e| e.into_inner()).get(&(rs as usize)).copied()
+    roots().lock().unwrap_or_else(|e| e.into_inner()).get(&(rs as usize)).map(|r| r.hash)
 }
 
 unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, blob: *const u8, len: usize, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const c_void, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(PREV_RS.load(Relaxed)) };
     let hr = unsafe { f(this, mask, blob, len, riid, ppv) };
     if hr >= 0 && !ppv.is_null() && !blob.is_null() && len != 0 {
-        let mut h = fnv64(unsafe { core::slice::from_raw_parts(blob, len) });
-        h ^= mask as u64;
-        note_root(unsafe { *ppv } as usize, h);
+        note_root(unsafe { *ppv } as usize, mask, unsafe { core::slice::from_raw_parts(blob, len) }, false);
     }
     hr
 }
@@ -233,7 +244,7 @@ pub fn hook_device(v: &mut [usize]) {
     v[16] = create_root_signature as *const () as usize;
 }
 
-fn mode_tag() -> &'static str {
+pub(crate) fn mode_tag() -> &'static str {
     crate::shader_xlat::runtime_mode().cbv_raw.key_tag()
 }
 
@@ -370,13 +381,17 @@ fn lib(real: *mut c_void) -> Option<&'static Lib> {
     LIB.get_or_init(|| unsafe { open(real) }).as_ref()
 }
 
-pub fn warm(real: *mut c_void) {
+pub fn warm(real: *mut c_void, wrapper: *mut c_void) {
     if !enabled() || real.is_null() || LIB.get().is_some() {
         return;
     }
-    let r = real as usize;
+    let (r, w) = (real as usize, wrapper as usize);
     let _ = std::thread::Builder::new().name("tombox-pso-lib".into()).spawn(move || {
-        let _ = lib(r as *mut c_void);
+        if let Some(l) = lib(r as *mut c_void) {
+            if let Some(dir) = l.path.parent() {
+                crate::pso_prewarm::start(r as *mut c_void, w as *mut c_void, &l.ident, dir);
+            }
+        }
     });
 }
 
@@ -473,7 +488,7 @@ unsafe fn with_cached(k: u128, desc: &[u8], at: usize, ppv: *mut *mut c_void, cr
     hr
 }
 
-unsafe fn run(key: Option<u128>, real: *mut c_void, desc: &[u8], cached_at: Option<usize>, ppv: *mut *mut c_void, load: &dyn Fn(usize, *const u16) -> i32, create: &dyn Fn(*const u8) -> i32) -> i32 {
+unsafe fn run(key: Option<u128>, kind: Option<u8>, real: *mut c_void, desc: &[u8], cached_at: Option<usize>, riid: *const Guid, ppv: *mut *mut c_void, load: &dyn Fn(usize, *const u16) -> i32, create: &dyn Fn(*const u8) -> i32) -> i32 {
     if !enabled() {
         return create(desc.as_ptr());
     }
@@ -481,11 +496,19 @@ unsafe fn run(key: Option<u128>, real: *mut c_void, desc: &[u8], cached_at: Opti
         UNKEYED.fetch_add(1, Relaxed);
         return create(desc.as_ptr());
     };
+    if kind.is_some() {
+        if let Some(hr) = unsafe { crate::pso_prewarm::claim(k, riid, ppv) } {
+            return hr;
+        }
+    }
     let l = lib(real);
     if let Some(l) = l {
         if unsafe { try_load(l, k, load) } {
             HITS.fetch_add(1, Relaxed);
             note_counts();
+            if let Some(kd) = kind {
+                unsafe { crate::pso_prewarm::note(kd, k, desc) };
+            }
             return 0;
         }
     }
@@ -501,7 +524,41 @@ unsafe fn run(key: Option<u128>, real: *mut c_void, desc: &[u8], cached_at: Opti
             unsafe { store(l, k, *ppv) };
         }
     }
+    if let (Some(kd), true) = (kind, hr >= 0) {
+        unsafe { crate::pso_prewarm::note(kd, k, desc) };
+    }
     hr
+}
+
+pub(crate) unsafe fn prebuild(real: *mut c_void, kind: u8, k: u128, desc: &[u8]) -> (Option<usize>, bool) {
+    let gfx = kind == crate::pso_prewarm::GFX;
+    let mut pso: *mut c_void = core::ptr::null_mut();
+    let l = match LIB.get() {
+        Some(Some(l)) => Some(l),
+        _ => None,
+    };
+    let rejected = l.is_some_and(|l| l.rejected.lock().unwrap_or_else(|e| e.into_inner()).contains(&k));
+    if let (Some(l), false) = (l, rejected) {
+        let w = wide(k);
+        let f: unsafe extern "system" fn(*mut c_void, *const u16, *const u8, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(l.lib as *mut c_void, if gfx { LIB_LOAD_GFX } else { LIB_LOAD_CS })) };
+        let hr = {
+            let _r = l.rw.read().unwrap_or_else(|e| e.into_inner());
+            unsafe { f(l.lib as *mut c_void, w.as_ptr(), desc.as_ptr(), &IID_PSO, &mut pso) }
+        };
+        if hr >= 0 && !pso.is_null() {
+            return (Some(pso as usize), true);
+        }
+        pso = core::ptr::null_mut();
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(real, if gfx { 10 } else { 11 })) };
+    let hr = unsafe { f(real, desc.as_ptr(), &IID_PSO, &mut pso) };
+    if hr < 0 || pso.is_null() {
+        return (None, false);
+    }
+    if let (Some(l), false) = (l, rejected) {
+        unsafe { store(l, k, pso) };
+    }
+    (Some(pso as usize), false)
 }
 
 pub unsafe fn gfx(real: *mut c_void, desc: &[u8], riid: *const Guid, ppv: *mut *mut c_void, create: &dyn Fn(*const u8) -> i32) -> i32 {
@@ -513,7 +570,7 @@ pub unsafe fn gfx(real: *mut c_void, desc: &[u8], riid: *const Guid, ppv: *mut *
         let f: unsafe extern "system" fn(*mut c_void, *const u16, *const u8, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(lib as *mut c_void, LIB_LOAD_GFX)) };
         unsafe { f(lib as *mut c_void, name, desc.as_ptr(), riid, ppv) }
     };
-    unsafe { run(key, real, desc, Some(0x278), ppv, &load, create) }
+    unsafe { run(key, Some(crate::pso_prewarm::GFX), real, desc, Some(0x278), riid, ppv, &load, create) }
 }
 
 pub unsafe fn compute(real: *mut c_void, desc: &[u8], riid: *const Guid, ppv: *mut *mut c_void, create: &dyn Fn(*const u8) -> i32) -> i32 {
@@ -525,7 +582,7 @@ pub unsafe fn compute(real: *mut c_void, desc: &[u8], riid: *const Guid, ppv: *m
         let f: unsafe extern "system" fn(*mut c_void, *const u16, *const u8, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(lib as *mut c_void, LIB_LOAD_CS)) };
         unsafe { f(lib as *mut c_void, name, desc.as_ptr(), riid, ppv) }
     };
-    unsafe { run(key, real, desc, Some(0x20), ppv, &load, create) }
+    unsafe { run(key, Some(crate::pso_prewarm::CS), real, desc, Some(0x20), riid, ppv, &load, create) }
 }
 
 pub unsafe fn stream(real: *mut c_void, desc: &[u8], extra: &str, sd: *const [usize; 2], riid: *const Guid, ppv: *mut *mut c_void, create: &dyn Fn() -> i32) -> i32 {
@@ -537,7 +594,7 @@ pub unsafe fn stream(real: *mut c_void, desc: &[u8], extra: &str, sd: *const [us
         let f: unsafe extern "system" fn(*mut c_void, *const u16, *const [usize; 2], *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(lib as *mut c_void, LIB_LOAD_STREAM)) };
         unsafe { f(lib as *mut c_void, name, sd, riid, ppv) }
     };
-    unsafe { run(key, real, desc, None, ppv, &load, &|_| create()) }
+    unsafe { run(key, None, real, desc, None, riid, ppv, &load, &|_| create()) }
 }
 
 fn save(exiting: bool) -> Result<String, String> {
@@ -615,6 +672,15 @@ pub fn on_present() {
     let last = LAST_SUMMARY.load(Relaxed);
     if summary_due(now, last) && LAST_SUMMARY.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
         record("d3d12_xs", "pso_lib", &format!("totals: {}", summary()));
+        if crate::pso_prewarm::enabled() {
+            record("d3d12_xs", "pso_prewarm", &format!("totals: {}", crate::pso_prewarm::summary()));
+        }
+    }
+    crate::pso_prewarm::on_present();
+    static PW_SAVED: AtomicU64 = AtomicU64::new(0);
+    let ps = PW_SAVED.load(Relaxed);
+    if now.saturating_sub(ps) >= SAVE_SECS && crate::pso_prewarm::dirty() && PW_SAVED.compare_exchange(ps, now, Relaxed, Relaxed).is_ok() {
+        let _ = std::thread::Builder::new().name("tombox-pso-prewarm-save".into()).spawn(|| crate::pso_prewarm::save(false));
     }
     if !matches!(LIB.get(), Some(Some(_))) {
         return;
@@ -629,6 +695,10 @@ pub fn on_present() {
 extern "C" fn exit_save() {
     if STORED.load(Relaxed) != 0 {
         save_logged("process exit");
+    }
+    let _ = crate::pso_prewarm::save(true);
+    if crate::pso_prewarm::enabled() {
+        record("d3d12_xs", "pso_prewarm", &format!("final totals at process exit: {}", crate::pso_prewarm::summary()));
     }
     record("d3d12_xs", "pso_lib", &format!("final totals at process exit: {}", summary()));
 }

@@ -289,3 +289,284 @@ fn log_state_sections_runs_all_five_sections_without_errors() {
         }
     }
 }
+
+fn gname(n: &str) -> [u8; 16] {
+    guids::NAMES.iter().find(|(_, x)| *x == n).map(|(k, _)| *k).unwrap()
+}
+
+fn wv(s: &str) -> Option<Vec<u16>> {
+    Some(s.encode_utf16().collect())
+}
+
+fn gbytes(g: &GUID) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&g.d1.to_le_bytes());
+    b[4..6].copy_from_slice(&g.d2.to_le_bytes());
+    b[6..8].copy_from_slice(&g.d3.to_le_bytes());
+    b[8..].copy_from_slice(&g.d4);
+    b
+}
+
+#[test]
+fn wfp_text_helpers_follow_the_console_formatters() {
+    use super::wfp_format::*;
+    use super::wfp_tables as t;
+    use store::Value;
+    assert_eq!(flags(0, true, &t::FILTER_FLAGS), "0x00000000 (NONE)");
+    assert_eq!(flags(0x21, true, &t::FILTER_FLAGS), "0x00000021 (PERSISTENT DISABLED)");
+    assert_eq!(flags(0x8000_0001, true, &t::CONDITION_FLAGS), "0x80000001 (IS_LOOPBACK unrecognized_0x80000000)");
+    assert_eq!(flags(0xff00_0000_0000_0001, false, &t::INBOUND_TRANSPORT_FLAGS), "0xff00000000000001 (PASSTHRU RESERVED)");
+    assert_eq!(flags(0, true, &t::PROVIDER_FLAGS), "0x00000000 ()");
+    assert_eq!(lookup(0xb, &t::MATCH_TYPE), "??? 11/0x0000000b");
+    assert_eq!(lookup(8, &t::CLASSIFY_OPTION), "FWPM_GENERAL_CONTEXT");
+    assert_eq!(t::IF_TYPE.len(), 199);
+    assert_eq!(ipv4(0xc0a8_0001), "192.168.0.1");
+    let mut v6 = [0u8; 16];
+    v6[0] = 0xfe;
+    v6[1] = 0x80;
+    v6[15] = 1;
+    assert_eq!(ipv6(&v6), "FE80:0000:0000:0000:0000:0000:0000:0001");
+    let remote = gname("FWPM_CONDITION_IP_REMOTE_ADDRESS");
+    let local = gname("FWPM_CONDITION_IP_LOCAL_ADDRESS");
+    let cases: Vec<(Value, Option<[u8; 16]>, &str)> = vec![
+        (Value::Empty, None, "FWP_EMPTY"),
+        (Value::U32(0x0a00_0001), Some(remote), "FWP_UINT32 IPv4 address 10.0.0.1"),
+        (Value::U32(5), None, "FWP_UINT32 uint32 0x00000005/5"),
+        (Value::U8(1), Some(gname("FWPM_CONDITION_IP_LOCAL_ADDRESS_TYPE")), "FWP_UINT8 local address type NlatUnicast"),
+        (Value::U32(0x8000_0001), Some(gname("FWPM_CONDITION_FLAGS")), "FWP_UINT32 condition flags 0x80000001 (IS_LOOPBACK unrecognized_0x80000000)"),
+        (Value::U32(6), Some(gname("FWPM_CONDITION_ARRIVAL_INTERFACE_TYPE")), "FWP_UINT32 arrival interface type IF_TYPE_ETHERNET_CSMACD"),
+        (Value::I8(-1), None, "FWP_INT8 int8 0xffffffff/-1"),
+        (Value::U64(7), None, "FWP_UINT64 uint64 0x0000000000000007/7"),
+        (Value::F32(1.5), None, "FWP_FLOAT float32 1.500000"),
+        (Value::Bytes16(v6), Some(local), "FWP_BYTE_ARRAY16_TYPE IPv6 address FE80:0000:0000:0000:0000:0000:0000:0001"),
+        (Value::Blob(Vec::new()), None, "FWP_BYTE_BLOB_TYPE byteBlob 0x1111111111111111 { size 0, ptr 0x0000000000000000 }"),
+        (Value::Sid(vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]), None, "FWP_SID sid \"S-1-5-18\""),
+        (Value::Sid(vec![1]), None, "FWP_SID sid 0x1111111111111111"),
+        (Value::Unicode(None), None, "FWP_UNICODE_STRING_TYPE unicodeString \"(null)\""),
+        (Value::V4AddrMask(0x0a00_0000, 0xff00_0000), None, "FWP_V4_ADDR_MASK v4AddrMask 0x1111111111111111 {addr 10.0.0.0, mask 255.0.0.0)"),
+        (Value::Range(Box::new(Value::U16(1)), Box::new(Value::U16(2))), None, "FWP_RANGE_TYPE rangeValue 0x1111111111111111 { valueLow FWP_UINT16 uint16 0x0001/1, valueHigh FWP_UINT16 uint16 0x0002/2}"),
+        (Value::Other(0x55), None, "??? type 85 ???"),
+    ];
+    for (v, k, want) in cases {
+        assert_eq!(value_text(&v, k.as_ref(), BUF), want);
+    }
+    assert_eq!(value_text(&Value::Unicode(wv(&"x".repeat(2000))), None, BUF).encode_utf16().count(), BUF - 1);
+    let mut data = b"ABCDEFGHIJKLMNOP".to_vec();
+    data.extend_from_slice(&[0, 0x7f]);
+    let lines = hex_lines(&data);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].0, 0);
+    assert_eq!(lines[0].1, "41 42 43 44 45 46 47 48 49 4A 4B 4C 4D 4E 4F 50 ");
+    assert_eq!(lines[0].2, "ABCDEFGHIJKLMNOP");
+    assert_eq!(lines[1].0, 16);
+    assert_eq!(lines[1].1.len(), 48);
+    assert!(lines[1].1.starts_with("00 7F "));
+    assert_eq!(lines[1].2, "..");
+}
+
+#[test]
+fn wfp_object_formatters_emit_the_console_record_sequences() {
+    use super::wfp_format::*;
+    let _g = lock();
+    let sl = store::SubLayer { key: [0x72; 16], name: wv("s"), description: None, flags: 1, provider_key: None, data: vec![0x41; 17], weight: 0x10 };
+    let ((), v) = run(|| unsafe { format_sublayer(&sl) });
+    assert_eq!(ids(&v, &G_FORMAT), vec![0x39, 0x3a, 0xb, 0xe, 0x3b, 0x3c, 0x3d, 0x17, 0x18, 0xa, 0xa, 0x3e]);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x3b)[0].parts[1]), "0x00000001 (PERSISTENT)");
+    assert_eq!(d64(&find(&v, &G_FORMAT, 0x3c)[0].parts[1]), 0);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x3c)[0].parts[2]), "(nullptr)");
+    let dump = find(&v, &G_FORMAT, 0xa);
+    assert_eq!(wtext(&dump[0].parts[1]), SP4);
+    assert_eq!(wtext(&dump[0].parts[2]), SP8);
+    assert_eq!(d32(&dump[1].parts[3]), 16);
+    assert_eq!(atext(&dump[1].parts[5]), "A");
+    assert_eq!(d32(&find(&v, &G_FORMAT, 0x3e)[0].parts[1]), 0x10);
+    let co = store::Callout { key: [0x73; 16], name: wv("c"), description: wv("d"), flags: 0x50000, provider_key: None, data: Vec::new(), layer: gname("FWPM_LAYER_ALE_AUTH_CONNECT_V4"), id: 9 };
+    let ((), v) = run(|| unsafe { format_callout(&co) });
+    assert_eq!(ids(&v, &G_FORMAT), vec![0x3f, 0x40, 0xb, 0xd, 0x41, 0x42, 0x43, 0x17, 0x19, 0x44, 0x45]);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x41)[0].parts[2]), "0x00050000 (PERSISTENT REGISTERED)");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x44)[0].parts[2]), "FWPM_LAYER_ALE_AUTH_CONNECT_V4");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x17)[0].parts[1]), SP8);
+    let mut context = [0u8; 16];
+    context[..8].copy_from_slice(&3u64.to_le_bytes());
+    let fl = store::Filter {
+        key: [1; 16],
+        name: wv("f"),
+        description: None,
+        flags: 0,
+        provider_key: None,
+        data: Vec::new(),
+        layer: gname("FWPM_LAYER_INBOUND_TRANSPORT_V4"),
+        sublayer: [0; 16],
+        weight: store::Value::Empty,
+        conditions: vec![
+            store::Condition { field: gname("FWPM_CONDITION_IP_REMOTE_ADDRESS"), match_type: 0, value: store::Value::U32(0x0a00_0001) },
+            store::Condition { field: [5; 16], match_type: 0xb, value: store::Value::Blob(vec![1, 2]) },
+        ],
+        action_type: 0x5003,
+        action_key: gname("FWPM_CALLOUT_IPSEC_INBOUND_TRANSPORT_V4"),
+        context,
+        reserved: None,
+        id: 42,
+        effective_weight: store::Value::U64(1),
+    };
+    let ((), v) = run(|| unsafe { format_filter("", &fl) });
+    assert_eq!(ids(&v, &G_FORMAT), vec![0x46, 0x47, 0xb, 0xe, 0x48, 0x49, 0x4a, 0x17, 0x19, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x50, 0x51, 0x52, 0x53, 0xa, 0x54, 0x55, 0x56, 0x5a, 0x5e, 0x5f, 0x60]);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x17)[0].parts[1]), SP4);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x4c)[0].parts[2]), "GUID_NULL");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x4d)[0].parts[2]), "FWP_EMPTY");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x53)[0].parts[2]), "FWP_UINT32 IPv4 address 10.0.0.1");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x52)[1].parts[3]), "??? 11/0x0000000b");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0xa)[0].parts[2]), SP21);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x55)[0].parts[3]), "FWP_ACTION_CALLOUT_TERMINATING");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x5a)[0].parts[2]), "0x0000000000000003 (PASSTHRU PERSIST_CONNECTION_SECURITY)");
+    let id = find(&v, &G_FORMAT, 0x5f);
+    assert_eq!((d64(&id[0].parts[2]), d64(&id[0].parts[3])), (42, 42));
+    let pc = store::ProviderContext {
+        key: [0x74; 16],
+        name: wv("x"),
+        description: None,
+        flags: 0,
+        provider_key: None,
+        data: Vec::new(),
+        kind: store::FWPM_CLASSIFY_OPTIONS_CONTEXT,
+        body: store::ContextBody::ClassifyOptions(vec![store::ClassifyOption { kind: 0, value: store::Value::U32(1) }, store::ClassifyOption { kind: 2, value: store::Value::U32(30) }]),
+        id: 5,
+    };
+    let ((), v) = run(|| unsafe { format_provider_context(&pc) });
+    assert_eq!(ids(&v, &G_FORMAT), vec![0x20, 0x21, 0xb, 0xe, 0x22, 0x23, 0x24, 0x17, 0x19, 0x25, 0x31, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x11, 0x12, 0x16, 0x38]);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x13)[0].parts[3]), "FWP_OPTION_VALUE_DENY_MULTICAST_STATE");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x16)[0].parts[2]), "FWP_UINT32 uint32 0x0000001e/30");
+    let keying = store::ProviderContext { kind: 0, body: store::ContextBody::Keying { key_mods: vec![[0; 16]], flags: 2 }, ..pc.clone() };
+    let ((), v) = run(|| unsafe { format_provider_context(&keying) });
+    assert_eq!(&ids(&v, &G_FORMAT)[10..], &[0x26, 0x27, 0x28, 0x29, 0x2a, 0x38]);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x29)[0].parts[2]), "GUID_NULL");
+}
+
+fn sa_details(dir: u32) -> store::SaDetails {
+    let mut local = [0u8; 16];
+    local[..4].copy_from_slice(&0xa9fe_4201u32.to_le_bytes());
+    store::SaDetails {
+        ip_version: 0,
+        direction: dir,
+        traffic: store::Traffic { ip_version: 0, local, remote: [0; 16], traffic_type: 0, filter_or_policy_id: 7, remote_port: 3074, local_port: 3075, protocol: 17, local_if_luid: 0x6000, real_if_profile_id: 0 },
+        bundle: store::SaBundle {
+            flags: 0,
+            lifetime: [3600, 100000, 0],
+            idle_timeout: 300,
+            nd_allow_clear_timeout: 0,
+            ipsec_id: None,
+            nap_context: 0,
+            qm_sa_id: 1,
+            sas: vec![store::Sa { spi: 0x1234, transform: 4, auth: store::AuthTransform { auth_type: 2, auth_config: 2, crypto_module: None }, auth_key: vec![1; 4], cipher: store::CipherTransform { cipher_type: 3, cipher_config: 3, crypto_module: None }, cipher_key: Vec::new() }],
+            key_module: None,
+            ip_version: 0,
+            peer_v4_private: 0,
+            mm_sa_id: 2,
+            pfs_group: 0,
+            sa_lookup_context: [0; 16],
+            qm_filter_id: 3,
+        },
+        udp_encap: None,
+        transport_filter: None,
+    }
+}
+
+#[test]
+fn wfp_ipsec_and_ike_formatters_walk_the_nested_structures() {
+    use super::wfp_format::*;
+    let _g = lock();
+    let ctx = store::SaContext { id: 11, inbound: sa_details(1), outbound: sa_details(0) };
+    let ((), v) = run(|| unsafe { format_sa_context(&ctx) });
+    let s = ids(&v, &G_FORMAT);
+    assert_eq!(&s[..3], &[0x77, 0x78, 0x7a]);
+    assert_eq!(find(&v, &G_FORMAT, 0x7a).len(), 2);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x7a)[0].parts[1]), SP12);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x7b)[0].parts[3]), "FWP_DIRECTION_INBOUND");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x7e)[0].parts[2]), "169.254.66.1");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x61)[0].parts[1]), format!("{}{}", SP12, SP16));
+    let start = s.iter().position(|x| *x == 0x61).unwrap();
+    assert_eq!(&s[start..start + 22], &[0x61, 0x62, 0x6c, 0x6d, 0x6e, 0xb5, 0xb6, 0xb7, 0xb8, 0x6f, 0x17, 0x18, 0xa, 0x70, 0x71, 0xb9, 0xba, 0xbb, 0xbc, 0x72, 0x17, 0x19]);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0xb6)[0].parts[3]), "IPSEC_AUTH_SHA_256");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0xb8)[0].parts[2]), "(nullptr)");
+    assert_eq!(find(&v, &G_FORMAT, 0xb2).len(), 2);
+    assert_eq!(find(&v, &G_FORMAT, 0xb4).len(), 2);
+    assert_eq!(*s.last().unwrap(), 0xb4);
+    let cred = store::Credential { kind: 0, impersonation: 0, body: store::CredentialBody::PresharedKey { key: vec![7], flags: 1 } };
+    let ike = store::IkeSa {
+        id: 3,
+        key_module: 2,
+        ip_version: 0,
+        udp_encap: Some((4500, 4500)),
+        traffic_ip_version: 1,
+        local: [0; 16],
+        remote: [0; 16],
+        auth_ip_filter_id: 0,
+        proposal: store::IkeProposal { cipher: 4, key_len: 256, rounds: 0, integrity: 2, max_lifetime: 28800, dh_group: 3, qm_limit: 0 },
+        cookie_initiator: 1,
+        cookie_responder: 2,
+        credentials: vec![(cred.clone(), store::Credential { kind: 2, impersonation: 1, body: store::CredentialBody::Name(wv("n")) })],
+        policy_key: [0; 16],
+        virtual_if_tunnel_id: 0,
+        correlation_key: Vec::new(),
+    };
+    let ((), v) = run(|| unsafe { format_ike_sa(&ike) });
+    assert_eq!(ids(&v, &G_FORMAT), vec![
+        0x13f, 0x140, 0x141, 0x142, 0x143, 0x144, 0x146, 0x147, 0x14a, 0x14b, 0x14c, 0x14d, 0x14e, 0xea, 0xeb, 0xec, 0x14f, 0xed, 0x150, 0x151, 0x152, 0x153, 0x154, 0x155, 0x156, 0x157, 0x158,
+        0x159, 0x15a, 0xde, 0xdf, 0xe0, 0xe1, 0x17, 0x18, 0xa, 0xe2, 0x15b, 0xde, 0xdf, 0xe8, 0xe9, 0x15c, 0x15d, 0x15e, 0x17, 0x19,
+    ]);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x140)[0].parts[2]), "IKEEXT_KEY_MODULE_IKEV2");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x151)[0].parts[2]), "IKEEXT_DH_GROUP_14/2048");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0xea)[0].parts[1]), SP12);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0xe9)[0].parts[2]), "n");
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x17)[0].parts[1]), format!("{}{}", SP16, SP8));
+    let ale = store::AleEndpoint { id: 1, ip_version: 0, local: [1, 0, 0, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], remote: [0; 16], protocol: 6, local_port: 80, remote_port: 0, token_id: 0, mm_sa: 0, qm_sa: 0, ipsec_status: 0, flags: 0, app_id: Vec::new() };
+    let ((), v) = run(|| unsafe { format_ale(&ale) });
+    assert_eq!(ids(&v, &G_FORMAT), vec![0x16f, 0x170, 0x171, 0x172, 0x175, 0x176, 0x177, 0x178, 0x179, 0x17a, 0x17b, 0x17c, 0x17d, 0x17, 0x19]);
+    assert_eq!(wtext(&find(&v, &G_FORMAT, 0x171)[0].parts[1]), "127.0.0.1");
+}
+
+#[test]
+fn wfp_section_lists_store_objects_under_their_layer_cases() {
+    let _g = lock();
+    let e = store::engine_open(store::FWPM_SESSION_FLAG_DYNAMIC).unwrap();
+    let transport = gname("FWPM_LAYER_INBOUND_TRANSPORT_V4");
+    let sl = store::SubLayer { key: [0x52; 16], name: wv("emu sublayer"), description: None, flags: 0, provider_key: None, data: Vec::new(), weight: 1 };
+    assert_eq!(store::sublayer_add(e, sl), 0);
+    let flt = store::Filter {
+        key: [0x53; 16],
+        name: wv("emu filter"),
+        description: None,
+        flags: 0,
+        provider_key: None,
+        data: Vec::new(),
+        layer: transport,
+        sublayer: [0x52; 16],
+        weight: store::Value::Empty,
+        conditions: Vec::new(),
+        action_type: 0x1002,
+        action_key: [0; 16],
+        context: [0; 16],
+        reserved: None,
+        id: 0,
+        effective_weight: store::Value::Empty,
+    };
+    let fid = store::filter_add(e, flt).unwrap();
+    let (hr, v) = run(|| unsafe { section::log_wfp() });
+    assert_eq!(store::engine_close(e), 0);
+    assert_eq!(hr, 0);
+    assert!(v.iter().all(|r| r.gate != Gate::Error));
+    let case = section::FILTER_LAYERS.iter().position(|(_, g)| g.map(|g| gbytes(&g)) == Some(transport)).unwrap();
+    let counts: Vec<u32> = find(&v, &WFP_GUID, 0x7e).iter().map(|r| d32(&r.parts[1])).collect();
+    assert_eq!(counts.len(), 17);
+    for (i, c) in counts.iter().enumerate() {
+        assert_eq!(*c, if i == 0 || i == case { 1 } else { 0 }, "case {}", i);
+    }
+    assert_eq!(find(&v, &WFP_GUID, 0x7b).len(), 2);
+    let ids5f: Vec<u64> = find(&v, &G_FORMAT, 0x5f).iter().map(|r| d64(&r.parts[2])).collect();
+    assert_eq!(ids5f, vec![fid, fid]);
+    let names: Vec<String> = find(&v, &G_FORMAT, 0xb).iter().map(|r| wtext(&r.parts[1])).collect();
+    assert!(names.contains(&"emu sublayer".to_string()));
+    assert_eq!(names.iter().filter(|n| *n == "emu filter").count(), 2);
+    assert_eq!(store::object_count(store::Kind::Filter), 0);
+    assert_eq!(store::object_count(store::Kind::SubLayer), 0);
+}

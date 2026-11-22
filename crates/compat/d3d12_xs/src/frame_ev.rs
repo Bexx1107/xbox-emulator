@@ -20,8 +20,11 @@ pub const LOCK: usize = 12;
 pub const FRAME_WAIT: usize = 13;
 pub const PSO_LIB_HIT: usize = 14;
 pub const PSO_LIB_MISS: usize = 15;
-pub const N: usize = 16;
-pub const NAMES: [&str; N] = ["pso_sync", "pso_inline", "pso_async", "pso_bind_wait", "xlat", "dxc", "committed", "placed", "heap", "upload", "io_read", "io_read_bg", "lock_wait", "frame_wait", "pso_lib_hit", "pso_lib_miss"];
+pub const PREWARM_HIT: usize = 16;
+pub const PREWARM_LATE: usize = 17;
+pub const PREWARM_UNUSED: usize = 18;
+pub const N: usize = 19;
+pub const NAMES: [&str; N] = ["pso_sync", "pso_inline", "pso_async", "pso_bind_wait", "xlat", "dxc", "committed", "placed", "heap", "upload", "io_read", "io_read_bg", "lock_wait", "frame_wait", "pso_lib_hit", "pso_lib_miss", "prewarm_hit", "prewarm_late", "prewarm_unused"];
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static CNT: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
@@ -84,7 +87,13 @@ fn worker() -> bool {
 }
 
 pub fn counts_on_title_frame(k: usize) -> bool {
-    k == PSO_LIB_HIT || k == PSO_LIB_MISS
+    matches!(k, PSO_LIB_HIT | PSO_LIB_MISS | PREWARM_HIT | PREWARM_LATE | PREWARM_UNUSED)
+}
+
+pub fn note(k: usize, ticks: i64) {
+    if active() {
+        add(k, ticks, worker());
+    }
 }
 
 fn add(k: usize, ticks: i64, bg: bool) {

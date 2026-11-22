@@ -1587,7 +1587,7 @@ unsafe fn root_from_shaders(real: *mut c_void, desc: &[u8], stages: &[usize]) ->
             let _ = std::fs::write(std::env::temp_dir().join("tombox").join("psodump").join(format!("rts0_{key:016x}.bin")), rts);
         }
         if hr >= 0 && !rs.is_null() {
-            crate::pso_lib::note_root(rs as usize, crate::pso_lib::fnv64(&container));
+            crate::pso_lib::note_root(rs as usize, 0, &container, true);
             m.insert(key, rs as usize);
             return rs as usize;
         }
@@ -2052,9 +2052,9 @@ pub fn wrap_device(real: *mut c_void) -> *mut c_void {
     if crate::rtcap::enabled() && !real.is_null() {
         unsafe { patch_real_device(real) };
     }
-    crate::pso_lib::warm(real);
     let w = Box::new(DeviceWrapper { vtable: vtable(), real, refs: AtomicU32::new(1) });
     let p = Box::into_raw(w) as *mut c_void;
+    crate::pso_lib::warm(real, p);
     WRAPPED.lock().unwrap_or_else(|e| e.into_inner()).push((real as usize, p as usize));
     p
 }

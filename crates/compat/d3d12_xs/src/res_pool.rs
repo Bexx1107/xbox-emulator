@@ -31,12 +31,24 @@ struct Guid(u32, u16, u16, [u8; 8]);
 const IID_HEAP: Guid = Guid(0x6b3b2502, 0x6e51, 0x45b3, [0x90, 0xee, 0x98, 0x84, 0x26, 0x5e, 0x8d, 0xf3]);
 const IID_RESOURCE: Guid = Guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
 
+fn setting(env: Option<String>, cfg: Option<String>) -> (bool, &'static str) {
+    let on = |v: &str| matches!(v.trim(), "1" | "on");
+    let off = |v: &str| matches!(v.trim(), "0" | "off");
+    if let Some(v) = env.as_deref().filter(|v| on(v) || off(v)) {
+        return (on(v), "TOMBOX_RES_POOL");
+    }
+    if let Some(v) = cfg.as_deref().filter(|v| on(v) || off(v)) {
+        return (on(v), "tombox.cfg res_pool");
+    }
+    (false, "default off")
+}
+
 pub fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        let on = std::env::var("TOMBOX_RES_POOL").map(|v| v == "1").unwrap_or(false);
+        let (on, src) = setting(std::env::var("TOMBOX_RES_POOL").ok(), compat_common::cfg("res_pool"));
         if on {
-            record("d3d12_xs", "res_pool", &format!("committed buffers up to {} KiB and non-RT/DS default-heap textures are placed in pooled {} MiB heaps (TOMBOX_RES_POOL=1)", MAX_POOLED >> 10, HEAP_BYTES >> 20));
+            record("d3d12_xs", "res_pool", &format!("committed buffers up to {} KiB and non-RT/DS default-heap textures are placed in pooled {} MiB heaps ({src})", MAX_POOLED >> 10, HEAP_BYTES >> 20));
         }
         on
     })
@@ -499,7 +511,9 @@ pub unsafe fn try_create(real: *mut c_void, heap: *const u32, heap_flags: u32, d
         let mut hp: *mut c_void = core::ptr::null_mut();
         let ch: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(real as usize, DEVICE_CREATE_HEAP)) };
         INSIDE.with(|c| c.set(true));
+        let ev = crate::frame_ev::begin(crate::frame_ev::HEAP);
         let hr = unsafe { ch(real, hd.as_ptr(), &IID_HEAP, &mut hp) };
+        drop(ev);
         INSIDE.with(|c| c.set(false));
         if hr < 0 || hp.is_null() {
             bump(S_FAIL);
@@ -515,7 +529,9 @@ pub unsafe fn try_create(real: *mut c_void, heap: *const u32, heap_flags: u32, d
     let (hp, off, dirty) = slot?;
     let cp: unsafe extern "system" fn(*mut c_void, usize, u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(real as usize, DEVICE_CREATE_PLACED)) };
     INSIDE.with(|c| c.set(true));
+    let ev = crate::frame_ev::begin(crate::frame_ev::PLACED);
     let hr = unsafe { cp(real, hp, off, d.as_ptr(), init_state, clear, &IID_RESOURCE, ppv) };
+    drop(ev);
     INSIDE.with(|c| c.set(false));
     let res = unsafe { *ppv };
     if hr < 0 || res.is_null() {
@@ -564,6 +580,19 @@ pub unsafe fn try_create(real: *mut c_void, heap: *const u32, heap_flags: u32, d
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setting_env_over_cfg() {
+        let s = |e: Option<&str>, c: Option<&str>| setting(e.map(String::from), c.map(String::from)).0;
+        assert!(!s(None, None));
+        assert!(s(None, Some("on")));
+        assert!(s(None, Some("1")));
+        assert!(!s(None, Some("off")));
+        assert!(!s(Some("0"), Some("on")));
+        assert!(s(Some("1"), Some("off")));
+        assert!(s(Some(""), Some("on")));
+        assert!(!s(None, Some("maybe")));
+    }
+
     use super::*;
 
     fn buf(width: u64) -> [u8; 0x40] {

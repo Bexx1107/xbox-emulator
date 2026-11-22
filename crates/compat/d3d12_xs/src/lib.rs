@@ -47,6 +47,7 @@ mod frame_csv;
 mod frame_ev;
 mod xlat_index;
 mod pso_lib;
+mod pso_prewarm;
 mod overlay_font;
 mod overlay_sensors;
 #[cfg(test)]

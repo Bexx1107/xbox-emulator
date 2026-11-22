@@ -49,18 +49,29 @@ pub fn requested() -> bool {
 static DEVICE: AtomicUsize = AtomicUsize::new(0);
 static DRED: AtomicUsize = AtomicUsize::new(0);
 static REPORTED: AtomicBool = AtomicBool::new(false);
+static REMOVED: AtomicBool = AtomicBool::new(false);
 
 pub fn is_removal(hr: i32) -> bool {
     matches!(hr as u32, 0x887A_0005 | 0x887A_0006 | 0x887A_0007 | 0x887A_0020)
 }
 
+pub fn removed() -> bool {
+    REMOVED.load(Ordering::Acquire)
+}
+
+pub fn mark_removed() {
+    REMOVED.store(true, Ordering::Release);
+}
+
 pub fn on_failure(hr: i32, site: &str) {
     if is_removal(hr) {
+        mark_removed();
         report_once(site, Some(hr));
     }
 }
 
 pub fn report_once(site: &str, hr: Option<i32>) -> bool {
+    mark_removed();
     let dev = DEVICE.load(Ordering::Acquire) as *mut c_void;
     if dev.is_null() || REPORTED.swap(true, Ordering::AcqRel) {
         return false;

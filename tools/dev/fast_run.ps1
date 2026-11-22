@@ -112,7 +112,7 @@ if (-not $Scene -or $Scene -eq 'main') { $Scene = $Spec.Main }
 if (-not $Spec.Scenes.Contains($Scene)) { throw "scene '$Scene' is not defined for $Title (scenes: $($Spec.Scenes.Keys -join ', '))" }
 $Sc = $Spec.Scenes[$Scene]
 if ($Seconds -le 0) { $Seconds = $Sc.Timeout }
-if ($AfterScene -lt 0) { $AfterScene = $Sc.After }
+if ($AfterScene -lt 0) { $AfterScene = $Sc.After; if ($Fps) { $AfterScene = [Math]::Max($AfterScene, 60) } }
 if ($PadScript -eq 'default') { $PadScript = $Sc.Pad }
 if ($GameArgs -eq 'default') { $GameArgs = '' }
 $SceneRx = if ($Sc.Rx) { [regex]$Sc.Rx } else { $null }
