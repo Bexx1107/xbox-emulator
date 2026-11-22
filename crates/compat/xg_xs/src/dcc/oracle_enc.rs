@@ -87,6 +87,10 @@ fn inputs(r: &mut Rng, bpe: usize) -> Vec<[u8; 256]> {
 fn oracle_dcc_enc_stages() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_enc_stages: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let hl = holes(&o);
     let st = states();
     let covered: usize = st.iter().map(|x| x.1).sum();
@@ -431,6 +435,10 @@ fn oracle_dcc_enc_undefined_classes() {
 fn oracle_dcc_enc_relayout_holes() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_enc_relayout_holes: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let lay: Lay = unsafe { core::mem::transmute(o.h + 0x4ac90) };
     let st = states();
     let (mut cases, mut bad, mut holed) = (0u64, 0u64, 0u64);
@@ -475,6 +483,10 @@ fn oracle_dcc_enc_relayout_holes() {
 fn oracle_dcc_enc_convert_holes() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_enc_convert_holes: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let conv: super::oracle_dec::Conv = unsafe { core::mem::transmute(o.h + 0x4adc0) };
     let (mut cases, mut bad, mut holed, mut vbad) = (0u64, 0u64, 0u64, 0u64);
     for &((f, sw, dim, p0, p1), _) in &states() {

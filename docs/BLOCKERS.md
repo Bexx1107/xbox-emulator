@@ -745,6 +745,13 @@ elease`, the log shows one install and every interface is emulated.
       - drelay1 initial = drelay0's final relay temp (0x4ad37).
       Seeding exactly those makes native accept, but the output is still wrong in more bytes (constant run cf 0e 81 c0 16 2f ...). Id 723 shows the same. These need a full model of the driver-frame locals; on 22621/19041 the same ids are proven process-dependent.
     - The convert quads other than q5 are host CRT/ntdll stack residue from the console's own sprintf. They are stable on this PC under every state, and console ucrtbase/ntdll exist in the dumps, but the values are not derived from those console DLLs. Veto point: if host-CRT residue must not be modelled, set dcc::enc::conv_known to 0 (q2 E-relative excepted). Then 23 accepted 22000 ids and the 9 ids 81 175 325 674 741 1051 1074 1103 1322 return to unproven rejections.
+    - 22621: relay-3 entry now models the colour locals (bytes 56..63 = 8, 52..55 = 0, 24..51 carried from the previous relay; writer con+0x2b4c8). 19 ids that had been console-stable rejections (81 175 325 674 741 1051 1074 1103 1322 1457 1731 1796 1959 2280 2314 2416 2640 2793 2810) are now accepted and equal the console. Accepted-invariance: 1474 accepted, 0 differ. The partition (run before this fix) found no other stable S_OK class among the 1255 rejections.
+    - 19041: the first 112 of 1241 native rejections in the partition already include 52 console-stable S_OK, stopped there. In that sample:
+      - 21 decoder;
+      - 18 need relay-1 entry bytes;
+      - 15 need relay-3 entry bytes;
+      - 3 need relay-3 entry plus convert q6/q7.
+      The 19041 relay entry locals (channel and colour) and the decoder frame locals are not modelled. This is the largest remaining gap.
     - Pre-existing: exports_table::export_table_matches_source fails while these rows say stub, because the exports are real fns. It passes once the rows become implemented.
 
 ## RDNA2 s_sendmsghalt / s_trap (tombox-xshader, all titles) - 2026-11-21, scalar
@@ -1028,3 +1035,24 @@ Headless runs straight into each title's test scene, on the staged release of 11
 - 🟥 **Minecraft (1 of 6 boots): AV in the compat xmem.dll.**
   - Crash at xmem.dll+0x3278e1 at +54.9 s, after `graphics context was gained` and before the first-run dialog draws.
   - Release 07:40. Run: fast_20261122_081738_minecraft_c3_mcmenu.
+
+### Update 2026-11-22 09:15 (scenes sub-chat)
+- Fortnite lobby: FIXED in the working tree (d3d12_xs device_wrap.rs register_pso). The derived-PSO E_INVALIDARG came from dangling title pointers in the PsoRecord snapshot that slot 55 builds derived PSOs from: the root signature was not AddRef'd, and CachedPSO and semantic-name pointers were kept raw. Every one-field bisection variant of a failing derived desc still failed, which points at one of these desc-wide fields. Lobby reached 3/3 headless (dev-fast).
+- Fortnite lobby fps: 12.1 fps (ft 82.8 ms) on dev-fast vs 23.5 fps on the 11-21 release. Re-measure on the lead's next release build.
+- Minecraft menu: still black after the first-run dialog. Only ~5 graphics PSOs are ever created, so the title never starts drawing the menu. The screen-reader dialog is not triggered by the NarratorRunning mutex check (OpenMutexA finds nothing on this host), and its button label is not drawn. Nothing points at the xmem heap accounting yet; it has no off-switch, so it is not A/B-tested.
+- XDefiant menu: in the 08:41 run (another agent) the compute PSO OOM and the AV are gone, but the menu is black at 0.7 fps.
+
+### Update 2026-11-22 09:45 (scenes sub-chat)
+- Fortnite lobby on release (09:14 build): reached 2/2 at +45.0 / +42.0 s. It runs at 12.1 fps, GPU-bound (present_wait 78.8 ms/f). The 11-21 batch run at the same start screen was 11.0 fps (present_copy 89.6 ms/f), so this is not a regression against that run; where the 23.5 fps figure came from is unknown.
+- Minecraft menu: the menu IS rendered (debug line FPS 60.1, logo, Play/Marketplace) but appears on only a few presented frames; most presents are black. The panorama background and button labels are missing even when it shows. PresentX gets 1 plane and the same source resource every frame, and that resource is "not a registered RT". The menu is probably rendered into another resource that aliases the same memory, reaching the presented one only now and then. Next step: TOMBOX_RTCAP draw attribution and the alias/placed-resource paths.
+- Minecraft: the xmem heap accounting is ruled out. New switch TOMBOX_XMEM_HEAPACCT=0; with accounting off and on, both runs show the same intermittent menu.
+- Minecraft: the "second process" (hook_thread, PID line) was DiscordHook64.dll, the host's Discord overlay injected at +93 s. It is host contamination of test runs; one 4.26 s host present followed.
+- d3d12_xs slot_audit::done_slots_have_real_handlers: FIXED on the test side. Slots 31-35/69/83/85/88/89 hold deliberate console E_NOTIMPL handlers (device_console_fix::notimpl_x, console_slots::dev_notimpl, console_slots_dev2::scarlett_notimpl). The linker folded them with dev_stub's identical body, so SymFromAddr named them dev_stub. dev_stub now counts hits (DEV_STUB_HITS) and can no longer be folded; d3d12_xs lib 475/0.
+- Minecraft menu, RTCAP 09:44 (TOMBOX_RTCAP=1, capture ~15 s after the A press):
+  - Where it draws: the menu goes into MSAA target 1920x1049 fmt 28 (res #007, MSAA depth #008). Every frame the title resolves it (ResolveSubresource, Xbox cmdlist slot 19) into one of 3 rotating 1904x1041 present buffers. The sizes differ, so resolve_x.rs issues PC ResolveSubresourceRegion [0,0,1904,1041] instead (slot 64 on the real PC list, which is correct).
+  - What reads back: all 3 present buffers and the non-MSAA 1920x1049 target #005 are black, yet a menu frame does reach the screen now and then.
+  - Suspect 1: the size mismatch itself. The title created its present buffers at 1904x1041 and its render targets at the 1920x1049 window client size, so it saw a window resize between the two (window clamp / fit_window_to_aspect). On a console the output size never changes.
+  - Suspect 2: resolve states. Present buffers record COMMON (state 0x0), the source records RESOLVE_SOURCE.
+  - Next: dump the MSAA source (rtcap skips multisampled targets), and run once with the window size held fixed so both sizes match.
+  - Note: TOMBOX_PRESENT_PROBE=30 always samples the same one of the 3 present buffers (30 is a multiple of 3); use a period that is not a multiple of 3.
+  - Suspect 3: Minecraft Maps all 3 present buffers (map_x: committed RT textures given console CPU memory, served through the placed-texture uploader). The uploader logs them as "NOT mirrored (render target)", so CPU zeros should not overwrite the resolve, but this path is not ruled out.

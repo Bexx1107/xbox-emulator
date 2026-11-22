@@ -13,6 +13,8 @@ pub mod monitor;
 pub mod xmemi;
 pub mod titlememory;
 pub mod processdelta;
+pub mod offline;
+pub mod conndiag;
 
 #[cfg(test)]
 mod tests;
