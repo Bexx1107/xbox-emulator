@@ -451,6 +451,7 @@ struct Emitter<'a> {
     bl_const: HashMap<u32, u32>,
     uses_f64: bool,
     uses_d16: bool,
+    uses_trans16: bool,
     uav_mips: BTreeSet<u32>,
     tex_mips: BTreeSet<u32>,
     sm6_minor: u32,
@@ -1086,6 +1087,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         bl_const: HashMap::new(),
         uses_f64: false,
         uses_d16: false,
+        uses_trans16: false,
         uav_mips: BTreeSet::new(),
         tex_mips: BTreeSet::new(),
         sm6_minor: 0,
@@ -4287,6 +4289,29 @@ impl<'a> Emitter<'a> {
             };
             return self.wv(&d, &hres(e));
         }
+        if let Some(op) = crate::trans16::op_index(m.as_str()).filter(|_| !f16_native()) {
+            self.uses_trans16 = true;
+            let o = &s[0];
+            let hi_sel = ins.enc == Enc::Vop3 && (ins.raw[0] >> 11) & 1 != 0;
+            let mut x = match o {
+                Opnd::ConstF32(_) => format!("tb_f2h({})", f(o)?),
+                _ if hi_sel => format!("((({}) >> 16) & 0xffffu)", r(o)?),
+                _ => format!("(({}) & 0xffffu)", r(o)?),
+            };
+            if ins.enc == Enc::Vop3 {
+                if ins.aux.mask & 1 != 0 {
+                    x = format!("({x} & 0x7fffu)");
+                }
+                if (ins.aux.mask >> 3) & 1 != 0 {
+                    x = format!("({x} ^ 0x8000u)");
+                }
+            }
+            let e = format!("tb_t16({op}u, {x})");
+            if ins.enc == Enc::Vop3 && (ins.aux.imm2 != 0 || ins.aux.imm != 0) {
+                return self.wv(&d, &hres(format!("f16tof32({e})")));
+            }
+            return self.wv(&d, &e);
+        }
         if matches!(m.as_str(), "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_fract_f16") {
             let a = h16(&s[0])?;
             let e = match m.as_str() {
@@ -6098,14 +6123,27 @@ impl<'a> Emitter<'a> {
                 })
                 .collect();
             if target == 13 && !misc.is_empty() {
+                let packed_view = self.durango.is_none() && osig.iter().any(|e| e.sysval == 5);
+                if packed_view && compr {
+                    return Err("position export 13 packs SV_ViewportArrayIndex into the layer dword, and a compressed export has no integer dword".into());
+                }
                 for (ei, c) in misc {
-                    if self.durango.is_none() && osig.iter().any(|e| e.sysval == 5) {
-                        return Err("position export 13 (misc vector) writes SV_ViewportArrayIndex, which RDNA2 packs into layer bits 19:16; not lowered".into());
+                    if packed_view && !matches!(osig[ei].comp_type, 1 | 2) {
+                        return Err(format!("position export 13 packs {} as an integer field of the layer dword", osig[ei].name));
                     }
-                    if (en >> if c == "z" { 2 } else { 3 }) & 1 == 0 {
-                        return Err(format!("position export 13 (misc vector) leaves the {c} lane of {} disabled", osig[ei].name));
+                    let lane = if packed_view { 2 } else if c == "z" { 2 } else { 3 };
+                    if (en >> lane) & 1 == 0 {
+                        let which = if lane == 2 { "z" } else { "w" };
+                        return Err(format!("position export 13 (misc vector) leaves the {which} lane of {} disabled", osig[ei].name));
                     }
-                    assigns.push((ei, c.to_string()));
+                    let sw = if !packed_view {
+                        c.to_string()
+                    } else if osig[ei].sysval == 5 {
+                        "view".into()
+                    } else {
+                        "layer".into()
+                    };
+                    assigns.push((ei, sw));
                 }
             } else if target != 12 {
                 let mut regs: Vec<u32> = osig.iter().filter(|e| matches!(e.sysval, 2 | 3)).map(|e| e.register).collect();
@@ -6147,6 +6185,15 @@ impl<'a> Emitter<'a> {
         let mut lines = vec![];
         for (ei, sw) in assigns {
             let (ty, _) = sig_type(&osig[ei]);
+            if matches!(sw.as_str(), "layer" | "view") {
+                let z = match &raw {
+                    Some(rc) => rc[2].clone(),
+                    None => return Err("position export 13 packs SV_ViewportArrayIndex into the layer dword, which this export does not carry unpacked".into()),
+                };
+                let expr = if sw == "layer" { format!("({z}) & 0x7ffu") } else { format!("(({z}) >> 16) & 0xfu") };
+                lines.push(format!("if (exec_lo & 1u) o.o{ei} = ({ty})({expr});"));
+                continue;
+            }
             // Integer elements carry the register bits themselves; converting them through
             // float (or half) would destroy them.
             let val = match (osig[ei].comp_type, &raw) {
@@ -6198,6 +6245,9 @@ impl<'a> Emitter<'a> {
         }
         if self.uses_d16 {
             h.push_str(mtbuf::D16_HELPERS);
+        }
+        if self.uses_trans16 {
+            h.push_str(&crate::trans16::hlsl());
         }
         if self.uses_global {
             h.push_str(&global::helpers());
@@ -6551,6 +6601,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         h.push_str(if no_out || self.is_gs { "}\n" } else { "    return o;\n}\n" });
         Ok(h)
     }
+}
+
+fn f16_native() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("TOMBOX_XS_F16_NATIVE").map(|v| v.trim() == "1").unwrap_or(false))
 }
 
 pub fn loop_guard(default: u32) -> u32 {
