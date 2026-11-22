@@ -220,7 +220,12 @@ const H_WINHTTPQUERYAVAIL: usize = 19;
 const H_WINHTTPREADDATA: usize = 20;
 const H_WINHTTPQUERYHEADERS: usize = 21;
 const H_WINHTTPWSUPGRADE: usize = 22;
-static ORIG: [AtomicUsize; 23] = [const { AtomicUsize::new(0) }; 23];
+const H_BIND: usize = 23;
+const H_LISTEN: usize = 24;
+const H_ACCEPT: usize = 25;
+const H_WSAACCEPT: usize = 26;
+const H_CLOSESOCKET: usize = 27;
+static ORIG: [AtomicUsize; 28] = [const { AtomicUsize::new(0) }; 28];
 static GAME_CB: Mutex<Vec<(usize, usize, u32)>> = Mutex::new(Vec::new());
 static PARENT: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
@@ -560,6 +565,92 @@ unsafe fn note_socket(s: usize, r: i32, remote: *const u8, len: i32) {
         crate::netview::sockets::report_socket(s, remote, len);
     }
     SetLastError(e);
+}
+
+unsafe fn note_event(s: usize, event: crate::netview::sockets::Event, remote: *const u8, len: i32) {
+    let e = GetLastError();
+    crate::netview::sockets::report_event(s, event, remote, len);
+    SetLastError(e);
+}
+
+unsafe extern "system" fn h_bind(s: usize, name: *const u8, len: i32) -> i32 {
+    let r = orig!(H_BIND, fn(usize, *const u8, i32) -> i32)(s, name, len);
+    if r == 0 {
+        note_event(s, crate::netview::sockets::Event::Bound, core::ptr::null(), 0);
+    }
+    r
+}
+
+unsafe extern "system" fn h_listen(s: usize, backlog: i32) -> i32 {
+    let r = orig!(H_LISTEN, fn(usize, i32) -> i32)(s, backlog);
+    if r == 0 {
+        note_event(s, crate::netview::sockets::Event::Listening, core::ptr::null(), 0);
+    }
+    r
+}
+
+unsafe fn accepted_len(len: *const i32) -> i32 {
+    if len.is_null() { 0 } else { *len }
+}
+
+unsafe extern "system" fn h_accept(s: usize, addr: *mut u8, len: *mut i32) -> usize {
+    let r = orig!(H_ACCEPT, fn(usize, *mut u8, *mut i32) -> usize)(s, addr, len);
+    if r != usize::MAX {
+        note_event(r, crate::netview::sockets::Event::Accepted, addr, accepted_len(len));
+    }
+    r
+}
+
+unsafe extern "system" fn h_wsaaccept(s: usize, addr: *mut u8, len: *mut i32, cond: *const c_void, data: usize) -> usize {
+    let r = orig!(H_WSAACCEPT, fn(usize, *mut u8, *mut i32, *const c_void, usize) -> usize)(s, addr, len, cond, data);
+    if r != usize::MAX {
+        note_event(r, crate::netview::sockets::Event::Accepted, addr, accepted_len(len));
+    }
+    r
+}
+
+unsafe extern "system" fn h_closesocket(s: usize) -> i32 {
+    crate::netview::sockets::forget(s as u64);
+    orig!(H_CLOSESOCKET, fn(usize) -> i32)(s)
+}
+
+const SOCKET_TABLE_HOOKS: usize = 5;
+
+fn install_socket_table_hooks() -> (usize, Vec<String>) {
+    let ws = b"ws2_32.dll\0";
+    let table: [(&[u8], usize, usize); SOCKET_TABLE_HOOKS] = [
+        (b"bind\0", H_BIND, h_bind as *const () as usize),
+        (b"listen\0", H_LISTEN, h_listen as *const () as usize),
+        (b"accept\0", H_ACCEPT, h_accept as *const () as usize),
+        (b"WSAAccept\0", H_WSAACCEPT, h_wsaaccept as *const () as usize),
+        (b"closesocket\0", H_CLOSESOCKET, h_closesocket as *const () as usize),
+    ];
+    let (mut hooked, mut missing) = (0, Vec::new());
+    for (f, idx, hook) in table {
+        let name = String::from_utf8_lossy(&f[..f.len() - 1]).into_owned();
+        if ORIG[idx].load(Ordering::SeqCst) != 0 {
+            hooked += 1;
+            continue;
+        }
+        let p = unsafe { resolve_export(ws, f) };
+        if p.is_null() {
+            missing.push(name);
+            continue;
+        }
+        match unsafe { make_trampoline(p) } {
+            Some(t) => {
+                ORIG[idx].store(t, Ordering::SeqCst);
+                if unsafe { write_jump(p, hook) } { hooked += 1 } else { missing.push(name) }
+            }
+            None => missing.push(name),
+        }
+    }
+    (hooked, missing)
+}
+
+fn socket_table_note() -> String {
+    let (hooked, missing) = install_socket_table_hooks();
+    format!("; socket table: {hooked}/{SOCKET_TABLE_HOOKS} hooked{}", if missing.is_empty() { String::new() } else { format!(" (not patched: {})", missing.join(", ")) })
 }
 
 unsafe extern "system" fn h_wsaconnect(s: usize, name: *const u8, len: i32, a: *mut c_void, b: *mut c_void, c: *mut c_void, d: *mut c_void) -> i32 {
@@ -960,8 +1051,9 @@ fn install_deny() {
             missing.push(String::from_utf8_lossy(&f[..f.len() - 1]).into_owned());
         }
     }
+    let sockets = socket_table_note();
     crate::record_raw("net_guard", "installed", &format!(
-        "{ok}/14 network entry points blocked in-process{}",
+        "{ok}/14 network entry points blocked in-process{}{sockets}",
         if missing.is_empty() { String::new() } else { format!(" (not patched: {})", missing.join(", ")) }));
     ext::install(false);
 }
@@ -1014,8 +1106,9 @@ fn install_redirect(host: &str) {
             }
         }
     }
+    let sockets = socket_table_note();
     crate::record_raw("net_guard", "installed", &format!(
-        "REDIRECT mode: every host -> '{host}'{}; {hooked}/23 entry points hooked{}{}",
+        "REDIRECT mode: every host -> '{host}'{}; {hooked}/23 entry points hooked{}{}{sockets}",
         match LOCAL_PORT.load(Ordering::Relaxed) { 0 => String::new(), p => format!(" (local backend: WinHTTP -> port {p}, plain HTTP)") },
         if denied.is_empty() { String::new() } else { format!("; fail-closed (no trampoline): {}", denied.join(", ")) },
         if missing.is_empty() { String::new() } else { format!("; NOT PATCHED: {}", missing.join(", ")) }));
@@ -1145,5 +1238,117 @@ mod callback_owner_tests {
         assert!(SEEN.lock().unwrap().contains(&(ws, 0x0008_0000, 0x42)));
         unsafe { cb_wrap(ws as *mut c_void, 0x40, 0x0000_0800, core::ptr::null_mut(), 0) };
         assert!(find_cb(ws).is_none());
+    }
+}
+
+#[cfg(test)]
+mod socket_table_tests {
+    use super::*;
+    use crate::netview::sockets::{self, MIB_TCP_STATE_ESTAB, MIB_TCP_STATE_LISTEN, MIB_TCP_STATE_RESERVED, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID};
+    use crate::netview::AF_INET;
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn socket(af: i32, ty: i32, proto: i32) -> usize;
+    }
+
+    fn arm() -> std::sync::MutexGuard<'static, ()> {
+        let g = sockets::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = std::net::UdpSocket::bind("127.0.0.1:0");
+        for (idx, name) in [(H_BIND, &b"bind\0"[..]), (H_LISTEN, b"listen\0"), (H_ACCEPT, b"accept\0"), (H_WSAACCEPT, b"WSAAccept\0"), (H_CLOSESOCKET, b"closesocket\0")] {
+            let p = unsafe { resolve_export(b"ws2_32.dll\0", name) };
+            assert!(!p.is_null());
+            ORIG[idx].store(p as usize, Ordering::SeqCst);
+        }
+        g
+    }
+
+    fn loopback_any() -> [u8; 16] {
+        let mut a = [0u8; 16];
+        a[0] = 2;
+        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        a
+    }
+
+    fn mine(s: usize) -> Option<sockets::Endpoint> {
+        let pid = std::process::id();
+        sockets::snapshot().into_iter().find(|e| e.socket == s as u64 && e.pid == pid)
+    }
+
+    fn rows(t: &[u8], size: usize) -> Vec<&[u8]> {
+        let n = u32::from_le_bytes([t[0], t[1], t[2], t[3]]) as usize;
+        (0..n).map(|i| &t[4 + i * size..4 + (i + 1) * size]).collect()
+    }
+
+    fn tcp_ports() -> Vec<(u16, u32)> {
+        let t = sockets::tcp_table(AF_INET, TCP_TABLE_OWNER_PID_ALL, true).unwrap();
+        rows(&t, sockets::TCP_ROW_OWNER_PID_SIZE).iter().filter(|r| u32::from_le_bytes([r[0x14], r[0x15], r[0x16], r[0x17]]) == std::process::id()).map(|r| (u16::from_be_bytes([r[8], r[9]]), u32::from_le_bytes([r[0], r[1], r[2], r[3]]))).collect()
+    }
+
+    #[test]
+    fn bound_listening_accepted_and_closed_tcp_sockets_track_the_table() {
+        let _g = arm();
+        unsafe {
+            let s = socket(2, 1, 6);
+            assert_ne!(s, usize::MAX);
+            let a = loopback_any();
+            assert_eq!(h_bind(s, a.as_ptr(), 16), 0);
+            let bound = mine(s).expect("bound socket recorded");
+            assert_eq!(bound.state, MIB_TCP_STATE_RESERVED);
+            let port = bound.local.port();
+            assert_ne!(port, 0);
+            assert!(!tcp_ports().iter().any(|(p, _)| *p == port));
+            assert_eq!(h_listen(s, 4), 0);
+            assert_eq!(mine(s).unwrap().state, MIB_TCP_STATE_LISTEN);
+            assert!(tcp_ports().contains(&(port, MIB_TCP_STATE_LISTEN)));
+            let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut peer = [0u8; 16];
+            let mut plen = 16i32;
+            let c = h_accept(s, peer.as_mut_ptr(), &mut plen);
+            assert_ne!(c, usize::MAX);
+            let acc = mine(c).expect("accepted socket recorded");
+            assert_eq!(acc.state, MIB_TCP_STATE_ESTAB);
+            assert_eq!(acc.local.port(), port);
+            assert_eq!(acc.remote.unwrap().port(), client.local_addr().unwrap().port());
+            assert!(tcp_ports().contains(&(port, MIB_TCP_STATE_ESTAB)));
+            assert_eq!(h_closesocket(c), 0);
+            assert!(mine(c).is_none());
+            assert_eq!(h_closesocket(s), 0);
+            assert!(mine(s).is_none());
+            assert!(!tcp_ports().iter().any(|(p, _)| *p == port));
+        }
+    }
+
+    #[test]
+    fn bound_udp_sockets_show_in_the_udp_table_until_closed() {
+        let _g = arm();
+        unsafe {
+            let s = socket(2, 2, 17);
+            assert_ne!(s, usize::MAX);
+            let a = loopback_any();
+            assert_eq!(h_bind(s, a.as_ptr(), 16), 0);
+            let port = mine(s).expect("bound udp recorded").local.port();
+            let t = sockets::udp_table(AF_INET, UDP_TABLE_OWNER_PID, true).unwrap();
+            assert!(rows(&t, sockets::UDP_ROW_OWNER_PID_SIZE).iter().any(|r| u16::from_be_bytes([r[4], r[5]]) == port));
+            assert_eq!(h_closesocket(s), 0);
+            assert!(mine(s).is_none());
+        }
+    }
+
+    #[test]
+    fn emulator_owned_listeners_are_reported() {
+        let _g = arm();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(sockets::report_std(&l));
+        let port = l.local_addr().unwrap().port();
+        assert!(tcp_ports().contains(&(port, MIB_TCP_STATE_LISTEN)));
+        let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(sockets::report_std(&u));
+        let up = u.local_addr().unwrap().port();
+        let t = sockets::udp_table(AF_INET, UDP_TABLE_OWNER_PID, true).unwrap();
+        assert!(rows(&t, sockets::UDP_ROW_OWNER_PID_SIZE).iter().any(|r| u16::from_be_bytes([r[4], r[5]]) == up));
+        let raw = std::os::windows::io::AsRawSocket::as_raw_socket(&l);
+        drop(l);
+        assert!(!sockets::endpoints().iter().any(|e| e.socket == raw && e.pid == std::process::id()));
     }
 }

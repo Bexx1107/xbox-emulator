@@ -130,6 +130,7 @@ fn teredo_reports_offline_state_and_no_port() {
 
 #[test]
 fn socket_registry_reports_live_title_sockets_in_owner_module_tables() {
+    let _g = super::sockets::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
     let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -171,6 +172,7 @@ fn socket_registry_reports_live_title_sockets_in_owner_module_tables() {
 
 #[test]
 fn console_view_maps_host_lan_addresses_to_the_emulated_nic() {
+    let _g = super::sockets::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let a: std::net::SocketAddr = "192.168.1.20:5000".parse().unwrap();
     assert_eq!(console_local(a), std::net::SocketAddr::new(IpAddr::V4(NIC_IPV4), 5000));
     let l: std::net::SocketAddr = "127.0.0.1:7".parse().unwrap();

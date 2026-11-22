@@ -16,6 +16,7 @@ extern "system" {
 
 pub const MIB_TCP_STATE_LISTEN: u32 = 2;
 pub const MIB_TCP_STATE_ESTAB: u32 = 5;
+pub const MIB_TCP_STATE_RESERVED: u32 = 100;
 
 pub const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
 pub const TCP_TABLE_OWNER_PID_CONNECTIONS: u32 = 4;
@@ -39,6 +40,7 @@ const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
 const SOL_SOCKET: i32 = 0xffff;
 const SO_TYPE: i32 = 0x1008;
+const SO_ACCEPTCONN: i32 = 0x0002;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Proto {
@@ -58,6 +60,9 @@ pub struct Endpoint {
 }
 
 const CAPACITY: usize = 256;
+
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -228,6 +233,17 @@ unsafe fn socket_type(s: usize) -> Option<i32> {
     Some(t)
 }
 
+unsafe fn accepting(s: usize) -> bool {
+    let f = ws_fn(b"getsockopt\0");
+    if f == 0 {
+        return false;
+    }
+    let f: GetSockOpt = core::mem::transmute(f);
+    let mut v = 0i32;
+    let mut n = 4i32;
+    f(s, SOL_SOCKET, SO_ACCEPTCONN, &mut v as *mut i32 as *mut u8, &mut n) == 0 && v != 0
+}
+
 pub unsafe fn parse_sockaddr(p: *const u8, len: i32) -> Option<SocketAddr> {
     if p.is_null() || len < 16 {
         return None;
@@ -260,7 +276,30 @@ unsafe fn local_name(s: usize) -> Option<SocketAddr> {
     parse_sockaddr(b.as_ptr(), n)
 }
 
-pub unsafe fn report_socket(s: usize, remote: *const u8, remote_len: i32) -> bool {
+unsafe fn peer_name(s: usize) -> Option<SocketAddr> {
+    let f = ws_fn(b"getpeername\0");
+    if f == 0 {
+        return None;
+    }
+    let f: GetSockName = core::mem::transmute(f);
+    let mut b = [0u8; 128];
+    let mut n = b.len() as i32;
+    if f(s, b.as_mut_ptr(), &mut n) != 0 {
+        return None;
+    }
+    parse_sockaddr(b.as_ptr(), n)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    Bound,
+    Listening,
+    Connected,
+    Accepted,
+    Sent,
+}
+
+pub unsafe fn report_event(s: usize, event: Event, remote: *const u8, remote_len: i32) -> bool {
     let proto = match socket_type(s) {
         Some(SOCK_STREAM) => Proto::Tcp,
         Some(SOCK_DGRAM) => Proto::Udp,
@@ -269,15 +308,51 @@ pub unsafe fn report_socket(s: usize, remote: *const u8, remote_len: i32) -> boo
     let Some(local) = local_name(s) else {
         return false;
     };
-    let remote = if proto == Proto::Tcp { parse_sockaddr(remote, remote_len) } else { None };
-    let state = match (proto, remote) {
-        (Proto::Tcp, Some(_)) => MIB_TCP_STATE_ESTAB,
-        (Proto::Tcp, None) => MIB_TCP_STATE_LISTEN,
-        _ => 0,
-    };
     let pid = GetCurrentProcessId();
-    let created = snapshot().iter().find(|e| e.socket == s as u64 && e.pid == pid && e.proto == proto).map(|e| e.created).unwrap_or_else(now_filetime);
+    let prior = snapshot().into_iter().find(|e| e.socket == s as u64 && e.pid == pid && e.proto == proto);
+    let (remote, state) = match proto {
+        Proto::Udp => (None, 0),
+        Proto::Tcp => match event {
+            Event::Listening => (None, MIB_TCP_STATE_LISTEN),
+            Event::Bound => match prior {
+                Some(p) => (p.remote, p.state),
+                None => (None, if accepting(s) { MIB_TCP_STATE_LISTEN } else { MIB_TCP_STATE_RESERVED }),
+            },
+            Event::Accepted => match peer_name(s).or_else(|| parse_sockaddr(remote, remote_len)) {
+                Some(r) => (Some(r), MIB_TCP_STATE_ESTAB),
+                None => return false,
+            },
+            Event::Connected | Event::Sent => match parse_sockaddr(remote, remote_len).or_else(|| peer_name(s)) {
+                Some(r) => (Some(r), MIB_TCP_STATE_ESTAB),
+                None if accepting(s) => (None, MIB_TCP_STATE_LISTEN),
+                None => match prior {
+                    Some(p) => (p.remote, p.state),
+                    None => (None, MIB_TCP_STATE_RESERVED),
+                },
+            },
+        },
+    };
+    let created = prior.map(|e| e.created).unwrap_or_else(now_filetime);
     report(Endpoint { socket: s as u64, pid, proto, local: console_local(local), remote, state, created })
+}
+
+pub unsafe fn report_socket(s: usize, remote: *const u8, remote_len: i32) -> bool {
+    report_event(s, Event::Connected, remote, remote_len)
+}
+
+pub fn report_std<S: std::os::windows::io::AsRawSocket>(s: &S) -> bool {
+    report_owned(s.as_raw_socket())
+}
+
+pub fn report_owned(s: u64) -> bool {
+    unsafe {
+        let event = match socket_type(s as usize) {
+            Some(SOCK_STREAM) if accepting(s as usize) => Event::Listening,
+            Some(_) => Event::Connected,
+            None => return false,
+        };
+        report_event(s as usize, event, core::ptr::null(), 0)
+    }
 }
 
 pub fn endpoints() -> Vec<Endpoint> {
@@ -430,7 +505,11 @@ pub fn tcp_table(family: u32, class: u32, order: bool) -> Result<Vec<u8>, u32> {
         TCP_TABLE_OWNER_MODULE_ALL => (true, true, true),
         _ => return Err(ERROR_INVALID_PARAMETER),
     };
-    let rows: Vec<Vec<u8>> = select(Proto::Tcp, family, order, |e| if e.state == MIB_TCP_STATE_LISTEN { listen } else { conn }).iter().map(|e| tcp_row(e, family, module)).collect();
+    let rows: Vec<Vec<u8>> = select(Proto::Tcp, family, order, |e| match e.state {
+        MIB_TCP_STATE_RESERVED => false,
+        MIB_TCP_STATE_LISTEN => listen,
+        _ => conn,
+    }).iter().map(|e| tcp_row(e, family, module)).collect();
     let row = match (family, module) {
         (AF_INET, true) => TCP_ROW_OWNER_MODULE_SIZE,
         (AF_INET, false) => TCP_ROW_OWNER_PID_SIZE,

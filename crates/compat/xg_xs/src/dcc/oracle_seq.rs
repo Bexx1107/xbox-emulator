@@ -1030,7 +1030,7 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
         }
         let (nat, u) = native_masked(nd, ne, &c);
         if nat.hr != 0 {
-            if !c.enc && crate::dcc::dec::last_unmodeled() {
+            if if c.enc { crate::dcc::last_enc_unmodeled() } else { crate::dcc::dec::last_unmodeled() } {
                 unmodeled.push(id);
             }
             continue;
@@ -1064,6 +1064,10 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
                 undef_varied += 1;
             } else {
                 undef_stable += 1;
+                if std::env::var("TOMBOX_DCC_STABLE_WHY").is_ok() {
+                    let drivers: Vec<u32> = (0..4u32).filter(|&bit| native_with(&c, 0x1000_0000, 1 << bit) == 0 && crate::dcc::last_undefined().get(i) == Some(&true)).collect();
+                    println!("stable-undef {id} enc {} fmt {} blk {i} drivers {:?}", c.enc, c.fmt, drivers);
+                }
             }
         }
         if u.iter().any(|&x| x) {
@@ -1074,9 +1078,13 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
     if let Ok(p) = std::env::var("TOMBOX_DCC_UNDEF_OUT") {
         std::fs::write(p, format!("{:?}\n{:?}\n", undef_ids, unmodeled)).unwrap();
     }
-    println!("dcc accepted cases, undefined blocks masked ({}): {acc} of {n} generator cases native S_OK; blocks: {defined} defined (compared byte-exact), {} undefined (read console stack scratch no console code writes first; masked: {undef_varied} changed under the perturbations below, {undef_stable} never did) in {} cases; native E_INVALIDARG for {} decoder cases whose remap holes are console-written frame locals native does not model yet: {:?}; {runs} console runs under stack smears 00/ff/random, heap sprays, a relocated console DLL, two forwarding XMem allocation hooks and two rewrites of the host-written convert scratch quads; {} differ from native on a defined block: {:?}", b.name, undef_varied + undef_stable, undef_ids.len(), unmodeled.len(), &unmodeled[..unmodeled.len().min(40)], bad.len(), &bad[..bad.len().min(40)]);
+    println!("dcc accepted cases, undefined blocks masked ({}): {acc} of {n} generator cases native S_OK; blocks: {defined} defined (compared byte-exact), {} undefined (read console stack scratch no console code writes first; masked: {undef_varied} changed under the perturbations below, {undef_stable} never did) in {} cases; native E_INVALIDARG for {} cases whose unknown inputs are console-written frame or relayout-entry locals native does not model yet: {:?}; {runs} console runs under stack smears 00/ff/random, heap sprays, a relocated console DLL, two forwarding XMem allocation hooks and two rewrites of the host-written convert scratch quads; {} differ from native on a defined block: {:?}", b.name, undef_varied + undef_stable, undef_ids.len(), unmodeled.len(), &unmodeled[..unmodeled.len().min(40)], bad.len(), &bad[..bad.len().min(40)]);
     assert!(bad.is_empty());
-    assert!(unmodeled.iter().all(|id| b.unmodeled.contains(id)), "decoder cases rejected as unmodeled console-written frame locals outside the known list for this build: {:?}", unmodeled.iter().filter(|id| !b.unmodeled.contains(id)).collect::<Vec<_>>());
+    if let Ok(p) = std::env::var("TOMBOX_DCC_UNMODELED_OUT") {
+        std::fs::write(p, format!("{:?}", unmodeled)).unwrap();
+    }
+    assert_eq!(unmodeled.len(), b.unmodeled_n, "unmodeled rejections changed for this build: {:?}", unmodeled);
+    assert!(unmodeled.iter().all(|id| b.unmodeled.is_empty() || b.unmodeled.contains(id)), "cases rejected as unmodeled console-written locals outside the known list for this build: {:?}", unmodeled.iter().filter(|id| !b.unmodeled.contains(id)).collect::<Vec<_>>());
 }
 
 fn seq_id(seed: u64, j: u64) -> u64 {

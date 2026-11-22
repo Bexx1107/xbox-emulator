@@ -143,6 +143,10 @@ fn set_undefined(v: Vec<bool>) {
     LAST_UNDEF.with(|c| *c.borrow_mut() = v);
 }
 
+pub fn last_enc_unmodeled() -> bool {
+    ENC_UNMODELED.with(|c| c.get())
+}
+
 pub fn last_undefined() -> Vec<bool> {
     LAST_UNDEF.with(|c| c.borrow().clone())
 }
@@ -192,6 +196,7 @@ thread_local! {
     pub(crate) static VARY: core::cell::Cell<u32> = const { core::cell::Cell::new(!0) };
     static STUB_E: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     static LAST_UNDEF: core::cell::RefCell<Vec<bool>> = const { core::cell::RefCell::new(Vec::new()) };
+    static ENC_UNMODELED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -270,17 +275,13 @@ fn unknowns(k: u64) -> [u8; 64] {
 
 pub(crate) const SAMPLES: u64 = 7;
 
-fn enc_block(d: &mut Dcc) -> Result<(u32, bool, bool), i32> {
-    let pre = Dcc { m: d.m.clone(), b: d.b };
-    let p = ENTRY.with(|c| c.get()).map(|e| e.wrapping_sub(CONV_FROM_ENTRY));
-    let seen = enc::conv_seen(p);
+fn enc_samples(pre: &Dcc, seen: &[u8; 64], vary: u32) -> Result<Vec<(Dcc, u32)>, i32> {
     let mut runs = Vec::new();
-    let vary = VARY.with(|v| v.get());
     for k in 0..SAMPLES {
         let q = |b: u32, x: u64| if vary >> b & 1 != 0 { x } else { 7 };
         let fills = [unknowns(q(0, 3 * k)), unknowns(q(1, 3 * k + 1)), unknowns(q(2, 3 * k + 2))];
         let mut conv = match (vary >> 3 & 1 != 0, k) {
-            (false, _) | (true, 0) => seen,
+            (false, _) | (true, 0) => *seen,
             (true, k) => {
                 let mut r = unknowns(100 + k);
                 let km = enc::conv_known();
@@ -300,9 +301,23 @@ fn enc_block(d: &mut Dcc) -> Result<(u32, bool, bool), i32> {
                 }
             }
         }
-        runs.push(enc_try(&pre, &fills, &conv)?);
+        runs.push(enc_try(pre, &fills, &conv)?);
     }
-    let defined = runs[1..].iter().all(|r| same(r, &runs[0]));
+    Ok(runs)
+}
+
+fn enc_block(d: &mut Dcc) -> Result<(u32, bool, bool), i32> {
+    let pre = Dcc { m: d.m.clone(), b: d.b };
+    let p = ENTRY.with(|c| c.get()).map(|e| e.wrapping_sub(CONV_FROM_ENTRY));
+    let seen = enc::conv_seen(p);
+    let vary = VARY.with(|v| v.get());
+    let mut runs = enc_samples(&pre, &seen, vary)?;
+    let agree = |r: &Vec<(Dcc, u32)>| r[1..].iter().all(|x| same(x, &r[0]));
+    let defined = agree(&runs);
+    if !defined && vary & 8 != 0 && agree(&enc_samples(&pre, &seen, vary & !0xff_0007)?) {
+        ENC_UNMODELED.with(|c| c.set(true));
+        return Err(E_INVALIDARG);
+    }
     let carried = runs[1..].iter().all(|r| r.0.m == runs[0].0.m && r.0.b == runs[0].0.b);
     let (t, s) = runs.swap_remove(0);
     *d = t;
@@ -327,6 +342,7 @@ pub fn encode(count: u32, src: &[u8], dst: &mut [u8], meta: &mut [u8], mut sizes
         return e;
     }
     let (mut undef, mut taint) = (Vec::with_capacity(count as usize), false);
+    ENC_UNMODELED.with(|c| c.set(false));
     for i in 0..count as usize {
         d.b[0].copy_from_slice(&src[i * 256..i * 256 + 256]);
         let size = match enc_block(&mut d) {
@@ -361,6 +377,7 @@ pub unsafe fn encode_export(count: u32, src: *const u8, dst: *mut u8, meta: *mut
         return e;
     }
     let (mut undef, mut taint) = (Vec::with_capacity(count as usize), false);
+    ENC_UNMODELED.with(|c| c.set(false));
     for i in 0..count as usize {
         core::ptr::copy_nonoverlapping(src.add(i * 256), d.b[0].as_mut_ptr(), 256);
         let size = match enc_block(&mut d) {
@@ -370,7 +387,8 @@ pub unsafe fn encode_export(count: u32, src: *const u8, dst: *mut u8, meta: *mut
                 s
             }
             Err(e) => {
-                compat_common::record(crate::M, "XGEncodeDCC", &format!("block {} format {} swizzle {} dim {} params {:#x},{:#x}: the console faults in this block's colour stage (integer divide or /GS) for some or all contents of its uninitialised stack scratch; native rejects", i, fmt, sw, dim, p0, p1));
+                let why = if last_enc_unmodeled() { "its output depends on relayout entry locals (channel/colour locals, caller-frame bytes) whose console writers native does not model yet" } else { "the console faults in its colour stage (integer divide or /GS) for some or all contents of its uninitialised stack scratch" };
+                compat_common::record(crate::M, "XGEncodeDCC", &format!("block {} format {} swizzle {} dim {} params {:#x},{:#x}: {}; native rejects", i, fmt, sw, dim, p0, p1, why));
                 return e;
             }
         };

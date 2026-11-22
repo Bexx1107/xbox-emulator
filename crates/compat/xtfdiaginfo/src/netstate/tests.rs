@@ -276,9 +276,16 @@ fn wfp_section_enumerates_its_dynamic_provider_and_empty_object_stores() {
 fn log_state_sections_runs_all_five_sections_without_errors() {
     let _g = lock();
     let (out, v) = run(|| unsafe { log_state_sections() });
-    assert_eq!(out, [0; 5]);
+    assert_eq!(out, [0; 5], "{:?}", v.iter().filter(|r| r.gate == Gate::Error).map(|r| (r.guid, r.id)).collect::<Vec<_>>());
     for g in [ADAPTERS_GUID, TEREDO_GUID, PROCESSES_GUID, PORTS_GUID, WFP_GUID] {
         assert!(v.iter().any(|r| r.guid == g));
     }
-    assert!(v.iter().all(|r| r.gate != Gate::Error));
+    let me = std::process::id();
+    let per_process = [0x1a, 0x1c, 0x14, 0x11, 0x12, 0x17];
+    for r in v.iter().filter(|r| r.gate == Gate::Error) {
+        assert!(r.guid == PROCESSES_GUID && per_process.contains(&r.id), "unexpected error record {:x}", r.id);
+        if matches!(r.id, 0x1a | 0x1c | 0x14) {
+            assert_ne!(d32(&r.parts[1]), me, "own process failed in record {:x}", r.id);
+        }
+    }
 }

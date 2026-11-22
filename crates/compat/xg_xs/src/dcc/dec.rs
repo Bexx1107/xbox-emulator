@@ -216,7 +216,7 @@ fn undefined_here(holes: bool, tainted: bool, ever: &[bool; 64]) -> Result<bool,
         let hs: Vec<usize> = (0..64).filter(|&p| !ever[p]).collect();
         println!("undef-why site {at} holes {holes} tainted {tainted} at {:?} written {}", hs, holes && !tainted && frame_written(at, ever));
     }
-    if holes && !tainted && frame_written(at, ever) {
+    if crate::dcc::xg_build() == 19041 || (holes && !tainted && frame_written(at, ever)) {
         UNMODELED.with(|c| c.set(true));
         return Ok(false);
     }

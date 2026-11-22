@@ -1696,11 +1696,14 @@ pub(crate) unsafe fn submit_part(list: *mut c_void, queue: *mut c_void) {
     let l = [list];
     unsafe { crate::title_heap::sync_for_execute(&l) };
     crate::title_shadow::before_execute();
+    let sig = if crate::gpu_wait::signal_fn() != 0 { crate::gpu_wait::signal_fn() } else { unsafe { vslot(queue, 14) } };
+    unsafe { crate::placed_offset::before_submit(queue, &l, exec as usize, sig) };
     if crate::gpu_wait::has_queue_fns() {
         unsafe { crate::gpu_wait::submit(queue, &l, exec, crate::gpu_wait::signal_fn(), crate::gpu_wait::wait_fn()) };
     } else {
         unsafe { exec(queue, 1, l.as_ptr()) };
     }
+    unsafe { crate::placed_offset::after_submit(queue, &l, exec as usize, sig) };
     unsafe { crate::title_shadow::after_execute(queue, crate::gpu_wait::signal_fn(), crate::gpu_wait::wait_fn()) };
     unsafe { crate::list_split::after_submit(queue, &l) };
     unsafe { note_executed(queue, &l) };
