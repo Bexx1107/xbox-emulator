@@ -432,6 +432,7 @@ struct Emitter<'a> {
     live: Vec<String>,
     /// Pixel shader needs its position within the 2x2 quad (ds_swizzle).
     uses_quad: bool,
+    vs_lds_out: bool,
     regs: BTreeSet<String>,
     body: String,
     tmp: usize,
@@ -1061,6 +1062,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         dsel_moves: HashMap::new(),
         live: Vec::new(),
         uses_quad: false,
+        vs_lds_out: false,
         regs: BTreeSet::new(),
         body: String::new(),
         tmp: 0,
@@ -2052,7 +2054,7 @@ impl<'a> Emitter<'a> {
                         written.insert(d);
                     }
                 }
-                Enc::Sop1 if ins.mnemonic == "s_swappc_b64" && self.durango.is_some() => {}
+                Enc::Sop1 if ins.mnemonic == "s_swappc_b64" && (self.durango.is_some() || crate::gcn::is_durango(&self.ex.fssm)) => {}
                 Enc::Sop1 if ins.mnemonic == "s_getpc_b64" => {
                     if let Some(d) = ins.dst.first().and_then(sg) {
                         sym.insert(d, Sym::Code);
@@ -3689,6 +3691,7 @@ impl<'a> Emitter<'a> {
                 // registers back to back, 4 dwords each (observed in a55400ccab602283: dwords
                 // 0..3 = TEXCOORD6.xyzw, 4..6 = TEXCOORD8.xyz, matching the output signature).
                 // The address register is this vertex's record base and is not needed.
+                self.vs_lds_out = true;
                 let off = ins.aux.imm as u32;
                 let vg = |o: &Opnd, k: u8| match o {
                     Opnd::Vgpr(n) => Ok(Opnd::Vgpr(n + k)),
@@ -6500,9 +6503,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let _ = writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;");
         }
         if !is_ps && !self.is_gs {
+            let is_durango = self.durango.is_some() || crate::gcn::is_durango(&self.ex.fssm);
             let mut group = 0usize;
             for reg in distinct_regs(ex.input_sig.iter().filter(|e| e.sysval == 0)) {
-                let read = ex.input_sig.iter().any(|e| e.sysval == 0 && e.register == reg && e.rw_mask != 0);
+                let read = ex.input_sig.iter().any(|e| e.sysval == 0 && e.register == reg && (e.rw_mask != 0 || (is_durango && e.mask != 0)));
                 if ex.stage == Stage::Vertex && !read {
                     continue;
                 }
@@ -6520,6 +6524,20 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                         None => (if c == 3 { "0x3f800000u" } else { "0u" }).to_string(),
                     };
                     let _ = writeln!(init, "    {v} = {val};");
+                }
+            }
+            if ex.stage == Stage::Vertex && !self.vs_lds_out && self.durango.is_none() {
+                for (ei, e) in ex.input_sig.iter().enumerate() {
+                    let v = match e.sysval {
+                        6 => "v0",
+                        8 => "v3",
+                        _ => continue,
+                    };
+                    if !self.live.iter().any(|l| l == v) {
+                        continue;
+                    }
+                    self.regs.insert(v.to_string());
+                    let _ = writeln!(init, "    {v} = (uint)(i.i{ei});");
                 }
             }
         }
