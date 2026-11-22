@@ -600,8 +600,22 @@ fn save_async() {
 }
 
 static LAST_SAVED_STORED: AtomicU64 = AtomicU64::new(0);
+static LAST_SUMMARY: AtomicU64 = AtomicU64::new(0);
+pub const SUMMARY_SECS: u64 = 10;
+
+pub fn summary_due(now: u64, last: u64) -> bool {
+    last == 0 || now.saturating_sub(last) >= SUMMARY_SECS
+}
 
 pub fn on_present() {
+    if !enabled() || LIB.get().is_none() {
+        return;
+    }
+    let now = now_s();
+    let last = LAST_SUMMARY.load(Relaxed);
+    if summary_due(now, last) && LAST_SUMMARY.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
+        record("d3d12_xs", "pso_lib", &format!("totals: {}", summary()));
+    }
     if !matches!(LIB.get(), Some(Some(_))) {
         return;
     }
@@ -616,6 +630,7 @@ extern "C" fn exit_save() {
     if STORED.load(Relaxed) != 0 {
         save_logged("process exit");
     }
+    record("d3d12_xs", "pso_lib", &format!("final totals at process exit: {}", summary()));
 }
 
 fn register_exit_save() {
@@ -766,6 +781,15 @@ void main() { o.Store(0, 5u); }
                 release(o);
             }
         }
+    }
+
+    #[test]
+    fn totals_are_logged_every_ten_seconds_even_without_new_entries() {
+        assert!(summary_due(100, 0));
+        assert!(!summary_due(105, 100));
+        assert!(summary_due(110, 100));
+        assert!(summary_due(500, 100));
+        assert!(summary().contains("hits") && summary().contains("stored"));
     }
 
     #[test]

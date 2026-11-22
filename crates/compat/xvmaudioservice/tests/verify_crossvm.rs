@@ -1294,4 +1294,75 @@ fn notify() {
     assert_eq!(send(&mut e), 0);
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert!(crossvm::sent_notifications().iter().skip(quiet).all(|(_, f)| u32_at(f, 4) != vol), "after 0x50 the listener gets no frames");
+
+    let (hr, e) = create(0x14, 1, 0, 0x67, &[]);
+    assert_eq!(hr, 0);
+    let sess = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::SESSION_REGISTER_NOTIFICATION, sess);
+    assert_eq!(send(&mut e), 0, "0x1e registers a PC IAudioSessionEvents on the title session");
+    let mut e = envelope(crossvm::SESSION_GET_INSTANCE_IDENTIFIER, sess);
+    assert_eq!(send(&mut e), 0);
+    let sid = wide_at(&e, 0x10, crossvm::SESSION_STRING_CHARS);
+
+    let before = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::SET_SIMPLE_VOLUME, sess);
+    e[0x10..0x14].copy_from_slice(&0.4f32.to_le_bytes());
+    e[0x14..0x24].copy_from_slice(&[0x61; 16]);
+    assert_eq!(send(&mut e), 0);
+    let (_, f) = wait_frame(sess, before).expect("ISimpleAudioVolume::SetMasterVolume notifies the 0x1e listener");
+    let r = session_valid(&f, &sid);
+    assert_eq!(u32_at(r, 4), 1, "kind 1 OnSimpleVolumeChanged");
+    assert_eq!(r.len(), 0x48 + u32_at(r, 0x18) as usize, "kind 1 size is exactly 0x48 + session id bytes (AudioSes 7cb9)");
+    assert_eq!(&r[0x1c..0x2c], &[0x61u8; 16][..], "context GUID from 0x16 args+4");
+    assert_eq!((f32_at(r, 0x30), r[0x34]), (0.4, 0));
+    println!("session simple volume: frame to {sess:#x}, record {} bytes, sid {sid}", r.len());
+
+    let before = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::SESSION_SET_CHANNEL_VOLUME, sess);
+    e[0x14..0x18].copy_from_slice(&0.5f32.to_le_bytes());
+    e[0x18..0x28].copy_from_slice(&[0x62; 16]);
+    assert_eq!(send(&mut e), 0);
+    let (_, f) = wait_frame(sess, before).expect("IChannelAudioVolume::SetChannelVolume notifies");
+    let r = session_valid(&f, &sid);
+    let off = u32_at(r, 0x30) as usize;
+    let n = u32_at(r, 0x38) as usize;
+    assert_eq!(u32_at(r, 4), 2);
+    assert_eq!((off & 3, off >= 0x48 + u32_at(r, 0x18) as usize, r.len()), (0, true, off + 4 * n), "channel array offset aligned, size = offset + 4n");
+    assert_eq!((u32_at(r, 0x34), f32_at(r, off)), (0, 0.5));
+    assert_eq!(&r[0x1c..0x2c], &[0x62u8; 16][..]);
+    let mut e = envelope(crossvm::SESSION_SET_CHANNEL_VOLUME, sess);
+    e[0x14..0x18].copy_from_slice(&1.0f32.to_le_bytes());
+    assert_eq!(send(&mut e), 0);
+
+    let before = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::SESSION_SET_DISPLAY_NAME, sess);
+    let label: Vec<u8> = "TomBox notify".encode_utf16().chain(Some(0)).flat_map(|c| c.to_le_bytes()).collect();
+    e[0x10..0x10 + label.len()].copy_from_slice(&label);
+    e[0x10 + crossvm::DISPLAY_NAME_CHARS * 2..0x20 + crossvm::DISPLAY_NAME_CHARS * 2].copy_from_slice(&[0x63; 16]);
+    assert_eq!(send(&mut e), 0);
+    let (_, f) = wait_frame(sess, before).expect("the PC OnDisplayNameChanged becomes a kind 0x10 frame");
+    let r = session_valid(&f, &sid);
+    let (len, at) = (u32_at(r, 0x30) as usize, u32_at(r, 0x34) as usize);
+    assert_eq!(u32_at(r, 4), 0x10);
+    assert_eq!(at, 0x48 + u32_at(r, 0x18) as usize, "name offset = 0x48 + session id bytes");
+    assert_eq!((len, r.len()), (label.len(), at + len));
+    assert_eq!(&r[at..at + len], &label[..]);
+    assert_eq!(&r[0x1c..0x2c], &[0x63u8; 16][..], "the PC event carries the guest's context GUID through");
+    println!("session display name: PC event -> frame to {sess:#x}, name at +{at:#x}, {len} bytes");
+    let mut e = envelope(crossvm::RELEASE_OBJECT, sess);
+    assert_eq!(send(&mut e), 0);
+}
+
+fn session_valid<'a>(f: &'a [u8], sid: &str) -> &'a [u8] {
+    assert_eq!(f.len(), 0x810);
+    assert_eq!(u32_at(f, 8), 0);
+    let r = &f[crossvm::NOTIFY_RECORD..];
+    let size = u32_at(r, 0) as usize;
+    let kind = u32_at(r, 4);
+    let sl = u32_at(r, 0x18) as usize;
+    assert!(size >= 0x50 && kind & 0xffe17000 == 0 && kind.count_ones() == 1, "AudioSes 7be0 header checks");
+    assert!(sl != 0 && sl <= size && 0x48 + sl <= size && u16::from_le_bytes([r[0x46 + sl], r[0x47 + sl]]) == 0);
+    assert_eq!(wide_at(r, 0x48, sl / 2), sid, "+0x48 is the session instance identifier the guest compares (wcsicmp)");
+    assert_eq!(2 * (sid.encode_utf16().count() + 1), sl);
+    &r[..size]
 }

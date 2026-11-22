@@ -582,11 +582,31 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
             if !(0.0..=1.0).contains(&v) {
                 return E_INVALIDARG;
             }
-            simple(object, |o| o.gain = v).map(|_| S_OK).unwrap_or(E_INVALIDARG)
+            let ctx = ctx_at(a, 4);
+            match simple(object, |o| {
+                o.gain = v;
+                (o.gain, o.mute)
+            }) {
+                Some((g, m)) => {
+                    session_changed(|sid| session_simple_record(sid, &ctx, g, m));
+                    S_OK
+                }
+                None => E_INVALIDARG,
+            }
         }
         SET_SIMPLE_MUTE => {
             let m: u8 = rd(a, 0);
-            simple(object, |o| o.mute = m != 0).map(|_| S_OK).unwrap_or(E_INVALIDARG)
+            let ctx = ctx_at(a, 1);
+            match simple(object, |o| {
+                o.mute = m != 0;
+                (o.gain, o.mute)
+            }) {
+                Some((g, m)) => {
+                    session_changed(|sid| session_simple_record(sid, &ctx, g, m));
+                    S_OK
+                }
+                None => E_INVALIDARG,
+            }
         }
         GET_SIMPLE_VOLUME => match simple(object, |o| o.gain) {
             Some(g) => {
@@ -929,8 +949,11 @@ unsafe fn session_volume(id: u32, object: u32, a: *mut u8) -> i32 {
     let mut v = s.session_channels.clone().unwrap_or_else(|| vec![1.0; n]);
     let r = channel_op(id - SESSION_CHANNEL_COUNT, &mut v, a);
     if r >= 0 && (id == SESSION_SET_CHANNEL_VOLUME || id == SESSION_SET_ALL_VOLUMES) {
-        s.session_channels = Some(v);
+        s.session_channels = Some(v.clone());
         apply_all(&mut s);
+        drop(s);
+        let (changed, ctx) = if id == SESSION_SET_CHANNEL_VOLUME { (rd::<u32>(a, 0), ctx_at(a, 8)) } else { (u32::MAX, ctx_at(a, SESSION_ALL_VOLUMES_CTX)) };
+        session_changed(|sid| session_channel_record(sid, &ctx, changed, &v));
     }
     r
 }
@@ -947,6 +970,13 @@ fn subscribe(object: u32, id: u32, on: bool) -> i32 {
                 watch = Some(endpoint_key(&device_for(object)));
                 S_OK
             }
+            SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER => match wasapi::watch_session(device_for(object).as_deref(), &session_guid()) {
+                Ok(sid) => {
+                    watch = Some(sid);
+                    S_OK
+                }
+                Err(hr) => hr,
+            },
             _ => S_OK,
         };
         if hr < 0 {
@@ -1041,6 +1071,12 @@ fn pc_event(e: wasapi::PcEvent) {
         for (&k, o) in s.objects.iter().filter(|(_, o)| o.notify) {
             let rec = match (&e, o.notify_id) {
                 (wasapi::PcEvent::Device { kind, id, a, b, key }, ENUMERATOR_SUBSCRIBE) => device_record(*kind, id, *a, *b, key.as_ref()),
+                (wasapi::PcEvent::Session { sid, kind, ctx, text, guid, value }, SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER) if o.watch.as_deref() == Some(sid.as_str()) => match *kind {
+                    0x10 | 0x100 => session_text_record(*kind, sid, ctx, text),
+                    4 => session_record(4, sid, ctx, guid, &[]),
+                    8 | 0x20 => session_value_record(*kind, sid, *value),
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(r) = rec {
@@ -1063,6 +1099,94 @@ fn endpoint_changed(object: u32, ctx: &[u8; 16]) {
         }
     }
     deliver(frames);
+}
+
+pub const SESSION_RECORD_SID: usize = 0x48;
+pub const SESSION_ALL_VOLUMES_CTX: usize = 0xcc;
+pub const SESSION_RECORD_ARGS: usize = 0x30;
+
+pub fn session_record(kind: u32, sid: &str, ctx: &[u8; 16], args: &[u8], tail: &[u8]) -> Option<Vec<u8>> {
+    let w: Vec<u8> = sid.encode_utf16().chain(Some(0)).flat_map(|c| c.to_le_bytes()).collect();
+    let base = SESSION_RECORD_SID + w.len();
+    if args.len() > SESSION_RECORD_SID - SESSION_RECORD_ARGS {
+        return None;
+    }
+    let mut r = vec![0u8; base];
+    r[4..8].copy_from_slice(&kind.to_le_bytes());
+    r[0x18..0x1c].copy_from_slice(&(w.len() as u32).to_le_bytes());
+    r[0x1c..0x2c].copy_from_slice(ctx);
+    r[SESSION_RECORD_ARGS..SESSION_RECORD_ARGS + args.len()].copy_from_slice(args);
+    r[SESSION_RECORD_SID..base].copy_from_slice(&w);
+    r.extend_from_slice(tail);
+    if r.len() < 0x50 {
+        return None;
+    }
+    if NOTIFY_RECORD + r.len() > gchost_frame() {
+        return None;
+    }
+    let n = r.len() as u32;
+    r[0..4].copy_from_slice(&n.to_le_bytes());
+    Some(r)
+}
+
+fn session_sid_len(sid: &str) -> usize {
+    SESSION_RECORD_SID + 2 * (sid.encode_utf16().count() + 1)
+}
+
+pub fn session_text_record(kind: u32, sid: &str, ctx: &[u8; 16], text: &str) -> Option<Vec<u8>> {
+    let t: Vec<u8> = text.encode_utf16().chain(Some(0)).flat_map(|c| c.to_le_bytes()).collect();
+    let mut a = (t.len() as u32).to_le_bytes().to_vec();
+    a.extend_from_slice(&(session_sid_len(sid) as u32).to_le_bytes());
+    session_record(kind, sid, ctx, &a, &t)
+}
+
+pub fn session_value_record(kind: u32, sid: &str, value: u32) -> Option<Vec<u8>> {
+    if kind == 8 && value > 2 || kind == 0x20 && !matches!(value, 0 | 1 | 2 | 4 | 5) {
+        return None;
+    }
+    session_record(kind, sid, &[0; 16], &value.to_le_bytes(), &[])
+}
+
+pub fn session_simple_record(sid: &str, ctx: &[u8; 16], volume: f32, mute: bool) -> Option<Vec<u8>> {
+    let mut a = volume.to_le_bytes().to_vec();
+    a.push(mute as u8);
+    session_record(1, sid, ctx, &a, &[])
+}
+
+pub fn session_channel_record(sid: &str, ctx: &[u8; 16], changed: u32, volumes: &[f32]) -> Option<Vec<u8>> {
+    let base = session_sid_len(sid);
+    let off = (base + 3) & !3;
+    let mut a = (off as u32).to_le_bytes().to_vec();
+    a.extend_from_slice(&changed.to_le_bytes());
+    a.extend_from_slice(&(volumes.len() as u32).to_le_bytes());
+    let mut t = vec![0u8; off - base];
+    for v in volumes {
+        t.extend_from_slice(&v.to_le_bytes());
+    }
+    let r = session_record(2, sid, ctx, &a, &t)?;
+    if r.len() != off + 4 * volumes.len() {
+        return None;
+    }
+    Some(r)
+}
+
+fn session_changed(build: impl Fn(&str) -> Option<Vec<u8>>) {
+    let mut frames = Vec::new();
+    {
+        let s = state();
+        for (&k, o) in s.objects.iter().filter(|(_, o)| o.notify && matches!(o.notify_id, SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER)) {
+            if let Some(r) = o.watch.as_deref().and_then(&build) {
+                frames.push(notify_frame(k, &r));
+            }
+        }
+    }
+    deliver(frames);
+}
+
+unsafe fn ctx_at(a: *const u8, o: usize) -> [u8; 16] {
+    let mut g = [0u8; 16];
+    core::ptr::copy_nonoverlapping(a.add(o), g.as_mut_ptr(), 16);
+    g
 }
 
 fn deliver(frames: Vec<Vec<u8>>) {

@@ -1221,7 +1221,7 @@ pub(crate) unsafe fn pause_queries(list: *mut c_void, occlusion_only: bool) -> V
         }
     }
     if let Some((r, o, op)) = pred {
-        let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = unsafe { core::mem::transmute(vslot(list, PC_SET_PREDICATION)) };
+        let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = unsafe { core::mem::transmute(pc_list_slot(list, PC_SET_PREDICATION)) };
         unsafe { f(list, r as *mut c_void, o, op) };
     }
     qs.iter().map(|q| (q.heap, q.ty, q.index)).collect()

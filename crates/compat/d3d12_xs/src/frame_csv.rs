@@ -57,7 +57,7 @@ unsafe impl Send for Csv {}
 impl Csv {
     fn wrote_row(&mut self, now: i64) {
         self.rows += 1;
-        if self.rows % 240 == 0 || self.rows <= 2 || now - self.last_flush >= qpf() {
+        if self.rows % 240 == 0 || self.rows <= 2 || now - self.last_flush >= qpf() / 4 {
             let _ = self.out.flush();
             self.last_flush = now;
         }

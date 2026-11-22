@@ -73,8 +73,13 @@ fn worker() -> bool {
     })
 }
 
+pub fn counts_on_title_frame(k: usize) -> bool {
+    k == PSO_LIB_HIT || k == PSO_LIB_MISS
+}
+
 fn add(k: usize, ticks: i64, bg: bool) {
     let t = ticks.max(0) as u64;
+    let bg = bg && !counts_on_title_frame(k);
     if bg {
         BG[k].fetch_add(1, Relaxed);
         BG_TICKS[k].fetch_add(t, Relaxed);
@@ -298,6 +303,24 @@ fn install_title_hooks() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_library_events_from_pso_workers_land_in_the_frame_columns() {
+        let before = take();
+        add(PSO_LIB_HIT, 10, true);
+        add(PSO_LIB_MISS, 20, true);
+        add(PSO_SYNC, 30, true);
+        let s = take();
+        assert!(s.n[PSO_LIB_HIT] >= 1 && s.n[PSO_LIB_MISS] >= 1);
+        assert!(s.ticks[PSO_LIB_HIT] >= 10 && s.ticks[PSO_LIB_MISS] >= 20);
+        assert_eq!(s.bg_n[PSO_LIB_HIT] + s.bg_n[PSO_LIB_MISS], 0);
+        assert!(s.bg_n[PSO_SYNC] >= 1);
+        let r = row(&s, None);
+        let cols: Vec<&str> = r.split(',').collect();
+        assert_ne!(cols[1 + 2 * PSO_LIB_HIT], "0");
+        assert_ne!(cols[1 + 2 * PSO_LIB_MISS], "0");
+        let _ = before;
+    }
 
     #[test]
     fn scopes_record_exclusive_time_and_reset_per_take() {

@@ -1256,10 +1256,12 @@ unsafe fn run_capture(o: Open, ring: Ring, q: CaptureQueue, s: Arc<Shared>, tx: 
 }
 
 const IID_IUNKNOWN: Guid = Guid { data1: 0, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+const IID_IAUDIO_SESSION_EVENTS: Guid = Guid { data1: 0x24918ACC, data2: 0x64B3, data3: 0x37C1, data4: [0x8C, 0xA9, 0x74, 0xA6, 0x6E, 0x99, 0x57, 0xA8] };
 const IID_IMM_NOTIFICATION_CLIENT: Guid = Guid { data1: 0x7991EEC9, data2: 0x7E89, data3: 0x4D85, data4: [0x83, 0x90, 0x6C, 0x70, 0x3C, 0xEC, 0x60, 0xC0] };
 
 pub enum PcEvent {
     Device { kind: u32, id: String, a: u32, b: u32, key: Option<PropertyKey> },
+    Session { sid: String, kind: u32, ctx: [u8; 16], text: String, guid: [u8; 16], value: u32 },
 }
 
 static EVENT_SINK: std::sync::OnceLock<fn(PcEvent)> = std::sync::OnceLock::new();
@@ -1293,6 +1295,7 @@ fn same_guid(a: &Guid, b: &Guid) -> bool {
 struct Callback {
     vtbl: *const *const (),
     iid: Guid,
+    sid: String,
 }
 
 unsafe extern "system" fn cb_qi(this: *mut Callback, riid: *const Guid, out: *mut *mut c_void) -> i32 {
@@ -1335,10 +1338,52 @@ unsafe extern "system" fn dev_property(_this: *mut Callback, id: *const u16, key
     0
 }
 
-struct Vtbl([*const (); 8]);
+unsafe fn guid16(p: *const Guid) -> [u8; 16] {
+    let mut g = [0u8; 16];
+    if !p.is_null() {
+        core::ptr::copy_nonoverlapping(p as *const u8, g.as_mut_ptr(), 16);
+    }
+    g
+}
+
+unsafe fn session_emit(this: *mut Callback, kind: u32, ctx: *const Guid, text: String, guid: [u8; 16], value: u32) -> i32 {
+    emit(PcEvent::Session { sid: (*this).sid.clone(), kind, ctx: guid16(ctx), text, guid, value });
+    0
+}
+
+unsafe extern "system" fn sess_name(this: *mut Callback, name: *const u16, ctx: *const Guid) -> i32 {
+    session_emit(this, 0x10, ctx, wide_str(name), [0; 16], 0)
+}
+
+unsafe extern "system" fn sess_icon(this: *mut Callback, path: *const u16, ctx: *const Guid) -> i32 {
+    session_emit(this, 0x100, ctx, wide_str(path), [0; 16], 0)
+}
+
+unsafe extern "system" fn sess_simple(_this: *mut Callback, _v: f32, _m: i32, _ctx: *const Guid) -> i32 {
+    0
+}
+
+unsafe extern "system" fn sess_channel(_this: *mut Callback, _n: u32, _v: *const f32, _c: u32, _ctx: *const Guid) -> i32 {
+    0
+}
+
+unsafe extern "system" fn sess_grouping(this: *mut Callback, g: *const Guid, ctx: *const Guid) -> i32 {
+    session_emit(this, 4, ctx, String::new(), guid16(g), 0)
+}
+
+unsafe extern "system" fn sess_state(this: *mut Callback, st: u32) -> i32 {
+    session_emit(this, 8, core::ptr::null(), String::new(), [0; 16], st)
+}
+
+unsafe extern "system" fn sess_disconnected(this: *mut Callback, reason: u32) -> i32 {
+    session_emit(this, 0x20, core::ptr::null(), String::new(), [0; 16], reason)
+}
+
+struct Vtbl([*const (); 10]);
 unsafe impl Sync for Vtbl {}
 
-static DEVICE_VTBL: Vtbl = Vtbl([cb_qi as *const (), cb_ref as *const (), cb_ref as *const (), dev_state as *const (), dev_added as *const (), dev_removed as *const (), dev_default as *const (), dev_property as *const ()]);
+static DEVICE_VTBL: Vtbl = Vtbl([cb_qi as *const (), cb_ref as *const (), cb_ref as *const (), dev_state as *const (), dev_added as *const (), dev_removed as *const (), dev_default as *const (), dev_property as *const (), core::ptr::null(), core::ptr::null()]);
+static SESSION_VTBL: Vtbl = Vtbl([cb_qi as *const (), cb_ref as *const (), cb_ref as *const (), sess_name as *const (), sess_icon as *const (), sess_simple as *const (), sess_channel as *const (), sess_grouping as *const (), sess_state as *const (), sess_disconnected as *const ()]);
 
 fn watch<F: FnOnce() -> Result<(), i32> + Send + 'static>(f: F) -> i32 {
     let (tx, rx) = std::sync::mpsc::channel::<i32>();
@@ -1363,7 +1408,7 @@ pub fn watch_devices() -> i32 {
     *DONE.get_or_init(|| {
         watch(|| unsafe {
             let en = enumerator()?;
-            let cb = Box::leak(Box::new(Callback { vtbl: DEVICE_VTBL.0.as_ptr(), iid: IID_IMM_NOTIFICATION_CLIENT }));
+            let cb = Box::leak(Box::new(Callback { vtbl: DEVICE_VTBL.0.as_ptr(), iid: IID_IMM_NOTIFICATION_CLIENT, sid: String::new() }));
             let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut Callback) -> i32>(en.0, 6)(en.0, cb);
             if hr < 0 {
                 return Err(hr);
@@ -1372,4 +1417,31 @@ pub fn watch_devices() -> i32 {
             Ok(())
         })
     })
+}
+
+pub fn watch_session(id: Option<&str>, session: &Guid) -> Result<String, i32> {
+    static DONE: std::sync::OnceLock<Mutex<std::collections::HashMap<(String, [u8; 16]), Result<String, i32>>>> = std::sync::OnceLock::new();
+    let map = DONE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let key = (id.unwrap_or_default().to_string(), unsafe { guid16(session) });
+    if let Some(r) = map.lock().unwrap().get(&key) {
+        return r.clone();
+    }
+    let r = session_string(id, session, 13).and_then(|sid| {
+        let dev = id.map(|s| s.to_string());
+        let g = Guid { data1: session.data1, data2: session.data2, data3: session.data3, data4: session.data4 };
+        let reg_sid = sid.clone();
+        let hr = watch(move || unsafe {
+            let c = session_control(dev.as_deref(), &g)?;
+            let cb = Box::leak(Box::new(Callback { vtbl: SESSION_VTBL.0.as_ptr(), iid: IID_IAUDIO_SESSION_EVENTS, sid: reg_sid }));
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut Callback) -> i32>(c.0, 10)(c.0, cb);
+            if hr < 0 {
+                return Err(hr);
+            }
+            core::mem::forget(c);
+            Ok(())
+        });
+        if hr < 0 { Err(hr) } else { Ok(sid) }
+    });
+    map.lock().unwrap().insert(key, r.clone());
+    r
 }
