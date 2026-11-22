@@ -203,9 +203,32 @@ fn perturbed_call(dec: usize, enc: usize, c: &Case, p: usize) -> Out {
     call_via(dec, enc, c, 0x3c)
 }
 
-pub(super) const PATTERNS: usize = 10;
+pub(super) const PATTERNS: usize = 11;
 pub(super) const HOOKED: usize = 6;
-pub(super) const POKED: usize = 8;
+pub(super) const HELD: usize = 8;
+pub(super) const THREAD: usize = 10;
+
+fn with_held_xmem<R>(n: usize, f: impl FnOnce() -> R) -> R {
+    let w: Vec<u16> = "xmem.dll".encode_utf16().chain(Some(0)).collect();
+    let h = unsafe { GetModuleHandleW(w.as_ptr()) };
+    let g = |nm: &str| unsafe { GetProcAddress(h, format!("{nm}\0").as_ptr()) as usize };
+    let a: XAlloc = unsafe { core::mem::transmute(g("XMemAllocDefault")) };
+    let fr: XFree = unsafe { core::mem::transmute(g("XMemFreeDefault")) };
+    let sizes = [0x4usize, 0x10, 0x100, 0x14d0, 0x10, 0x100, 0x4];
+    let held: Vec<*mut u8> = (0..n).map(|i| unsafe { a(sizes[i % sizes.len()], 0x480009e) }).collect();
+    for (i, &p) in held.iter().enumerate() {
+        unsafe { core::ptr::write_bytes(p, pfill(n + 90, i), sizes[i % sizes.len()]) };
+    }
+    let r = f();
+    for &p in &held {
+        unsafe { fr(p, 0x480009e) };
+    }
+    r
+}
+
+fn on_fresh_thread(dec: usize, enc: usize, id: u64) -> Out {
+    std::thread::spawn(move || perturbed_call(dec, enc, &case(id), 0)).join().unwrap()
+}
 
 pub(super) fn host_residue_sites(b: &super::oracle_cases::Build, c: &Case) -> Vec<(usize, usize, usize)> {
     if c.enc { vec![(b.convs, 0x88, 0xff)] } else { vec![] }
@@ -371,7 +394,7 @@ fn heap_child(spec: &str) {
     for p in from..PATTERNS {
         writeln!(so, "@@P {p}").unwrap();
         so.flush().unwrap();
-        let r = if p == RELOC { perturbed_call(rd, re, &c, 0) } else if p >= POKED { poked_call(&o, &c, p) } else if p >= HOOKED { with_xmem_hook(p, || perturbed_call(cd, ce, &c, 0)) } else { perturbed_call(cd, ce, &c, p.saturating_sub(1)) };
+        let r = if p == RELOC { perturbed_call(rd, re, &c, 0) } else if p == THREAD { on_fresh_thread(cd, ce, id) } else if p >= HELD { with_held_xmem(if p == HELD { 7 } else { 23 }, || perturbed_call(cd, ce, &c, 0)) } else if p >= HOOKED { with_xmem_hook(p, || perturbed_call(cd, ce, &c, 0)) } else { perturbed_call(cd, ce, &c, p.saturating_sub(1)) };
         writeln!(so, "@@H {p} {:08x} {:016x}", r.hr as u32, out_hash(&c, &r)).unwrap();
         so.flush().unwrap();
     }
@@ -434,10 +457,10 @@ pub(super) fn proven(v: &[Res]) -> Option<&'static str> {
     if v.len() > RELOC && differ(&v[0], &v[RELOC]) {
         return Some("console output changes when the same console DLL is loaded at another base (it writes its own code addresses)");
     }
-    if v.len() > POKED && v[POKED..].iter().any(|r| differ(&v[0], r)) {
-        return Some("console output changes with the stack bytes the host CRT (ucrtbase/ntdll) leaves in the console's scratch during its own sprintf call; they are not console state");
+    if v.len() > HELD && v[HELD..THREAD.min(v.len())].iter().any(|r| differ(&v[0], r)) {
+        return Some("console output changes when the title holds other XMem blocks across the call (XMemAllocDefault, the console attribute 0x480009e); it embeds addresses or contents of the title allocator's heap");
     }
-    if v.len() > HOOKED && v[HOOKED..POKED.min(v.len())].iter().any(|r| differ(&v[0], r)) {
+    if v.len() > HOOKED && v[HOOKED..HELD.min(v.len())].iter().any(|r| differ(&v[0], r)) {
         return Some("console output changes when the title installs a forwarding XMem allocation hook (XMEM_SET_ALLOCATION_HOOKS); it depends on the title's allocator path");
     }
     None
@@ -987,6 +1010,17 @@ fn oracle_dcc_accepted_cases_invariant() {
             };
             runs += 1;
             if !same_out(&c, &nat, &r) {
+                if v == 0 && std::env::var("TOMBOX_DCC_INV_DUMP").is_ok() {
+                    for blk in 0..c.n {
+                        let (a, b2) = (&nat.dst[blk * 256..blk * 256 + 256], &r.dst[blk * 256..blk * 256 + 256]);
+                        let dj: Vec<usize> = (0..256).filter(|&j| a[j] != b2[j]).collect();
+                        if !dj.is_empty() {
+                            println!("invdump {id} fmt {} meta {:02x?} blk{blk} differ {:?}
+  native  {:02x?}
+  console {:02x?}", c.fmt, c.meta, &dj[..dj.len().min(24)], &a[dj[0] & !63..(dj[0] & !63) + 64], &b2[dj[0] & !63..(dj[0] & !63) + 64]);
+                        }
+                    }
+                }
                 bad.push(format!("{id}@{v}"));
             }
         }

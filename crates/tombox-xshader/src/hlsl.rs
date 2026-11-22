@@ -2408,8 +2408,6 @@ impl<'a> Emitter<'a> {
         self.touch(dst);
         let d = name(dst)?;
         match d.as_str() {
-            "exec_lo" => self.line(&format!("exec_lo = ({expr}) & 1u;")),
-            "exec_hi" => self.line("exec_hi = 0u;"),
             _ => self.line(&format!("{d} = {expr};")),
         }
         Ok(())
@@ -3235,6 +3233,9 @@ impl<'a> Emitter<'a> {
                         let t = self.tmp;
                         self.tmp += 1;
                         self.line(&format!("uint t{t} = {a}; t{t} |= (t{t} >> 1) & 0x77777777u; t{t} |= (t{t} >> 2) & 0x33333333u; t{t} &= 0x11111111u; t{t} *= 0xfu;"));
+                        if name(&d)? == "exec_lo" {
+                            self.line(&format!("t{t} &= 1u;"));
+                        }
                         self.ws(&d, &format!("t{t}"))?;
                         self.line(&format!("scc = (t{t} != 0u) ? 1u : 0u;"));
                         Ok(())
@@ -3246,6 +3247,9 @@ impl<'a> Emitter<'a> {
                         self.tmp += 1;
                         for (k, x) in [("l", &a), ("h", &ah)] {
                             self.line(&format!("uint t{t}{k} = {x}; t{t}{k} |= (t{t}{k} >> 1) & 0x77777777u; t{t}{k} |= (t{t}{k} >> 2) & 0x33333333u; t{t}{k} &= 0x11111111u; t{t}{k} *= 0xfu;"));
+                        }
+                        if name(&d)? == "exec_lo" {
+                            self.line(&format!("t{t}l &= 1u; t{t}h = 0u;"));
                         }
                         self.ws(&d, &format!("t{t}l"))?;
                         let dh = hi(&d);

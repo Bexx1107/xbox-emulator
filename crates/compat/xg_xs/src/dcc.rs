@@ -125,7 +125,6 @@ pub fn decode(count: u32, src: &[u8], meta: &[u8], dst: &mut [u8], fmt: u32, sw:
     if let Err(e) = d.init(fmt, sw, dim, p0, p1) {
         return e;
     }
-    dec::begin();
     for i in 0..count as usize {
         d.b[1].copy_from_slice(&src[i * 256..i * 256 + 256]);
         d.w32(0x58, meta[i] as u32);
