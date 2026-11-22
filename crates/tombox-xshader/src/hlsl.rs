@@ -6410,7 +6410,7 @@ impl<'a> Emitter<'a> {
                 regs.dedup();
                 let first = if misc.is_empty() { 13 } else { 14 };
                 let Some(&reg) = regs.get(target.checked_sub(first).unwrap_or(u32::MAX) as usize) else {
-                    return Err(format!("position export {target} has no SV_ClipDistance/SV_CullDistance output register"));
+                    return Ok(());
                 };
                 for (ei, e) in osig.iter().enumerate() {
                     if matches!(e.sysval, 2 | 3) && e.register == reg {
