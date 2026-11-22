@@ -237,6 +237,31 @@ fn barrier(res: usize, before: u32, after: u32) -> [u64; 4] {
 
 /// Called at PresentX. Captures when the trigger file exists.
 pub unsafe fn maybe_capture(queue: *mut c_void, presented: *mut c_void) {
+    if std::env::var_os("TOMBOX_DBG_GPU_IDLE").is_some() {
+        static FENCE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        static VAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let mut f = FENCE.load(core::sync::atomic::Ordering::Acquire) as *mut c_void;
+        if f.is_null() {
+            let mut dev: *mut c_void = core::ptr::null_mut();
+            if vcall!(queue, 7, fn(*const Guid, *mut *mut c_void) -> i32, &IID_DEVICE, &mut dev) >= 0 && !dev.is_null() {
+                let mut nf: *mut c_void = core::ptr::null_mut();
+                if vcall!(dev, 36, fn(u64, u32, *const Guid, *mut *mut c_void) -> i32, 0, 0, &IID_FENCE, &mut nf) >= 0 {
+                    FENCE.store(nf as usize, core::sync::atomic::Ordering::Release);
+                    f = nf;
+                }
+                vcall!(dev, 2, fn() -> u32);
+            }
+        }
+        if !f.is_null() {
+            let v = VAL.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;
+            vcall!(queue, 14, fn(*mut c_void, u64) -> i32, f, v);
+            let mut spins = 0;
+            while vcall!(f, 8, fn() -> u64) < v && spins < 2000 {
+                Sleep(1);
+                spins += 1;
+            }
+        }
+    }
     if !enabled() {
         return;
     }

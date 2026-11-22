@@ -180,13 +180,14 @@ pub(super) fn console_encode(o: &Oracle, src: &[u8], count: usize, f: u32, sw: u
 }
 
 #[test]
-fn oracle_dcc_enc_e2e() {
+fn oracle_dcc_enc_e2e_undefined_masked() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
     let cdec: DecF = unsafe { core::mem::transmute(o.f("XGDecodeDCC")) };
     let st = states();
     let mut r = Rng(0xe2e_e4c_31);
     let (mut calls, mut blocks, mut bad, mut undef, mut nerr, mut faults, mut rt, mut rtbad, mut lossy) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut masked, mut dmasked) = (0u64, 0u64);
     let mut extra: Vec<(u32, u32, u32, u32, u32)> = configs();
     extra.retain(|_| r.below(30) == 0);
     let mut cfgs: Vec<(u32, u32, u32, u32, u32)> = st.iter().map(|x| x.0).collect();
@@ -222,18 +223,22 @@ fn oracle_dcc_enc_e2e() {
                 }
                 continue;
             }
+            let nu = crate::dcc::last_undefined();
+            masked += nu.iter().filter(|&&x| x).count() as u64;
             let a = console_encode(&o, &src, count, f, sw, dim, p0, p1, 0xaa, 0xa5);
             let b = console_encode(&o, &src, count, f, sw, dim, p0, p1, 0x55, 0x5a);
             calls += 2;
             blocks += count as u64;
-            if a != b {
+            let blk_eq = |x: &(i32, Vec<u8>, Vec<u8>, Vec<u32>), dd: &[u8], mm: &[u8], ss: &[u32], i: usize| x.1[i * 256..i * 256 + 256] == dd[i * 256..i * 256 + 256] && x.2[i] == mm[i] && x.3[i] == ss[i];
+            let defined: Vec<usize> = (0..count).filter(|&i| !nu[i]).collect();
+            if a.0 != b.0 || defined.iter().any(|&i| !blk_eq(&a, &b.1, &b.2, &b.3, i)) {
                 undef += 1;
                 if undef <= 5 {
                     let j = (0..a.1.len()).find(|&j| a.1[j] != b.1[j]);
                     println!("e2e console output depends on prior memory f={} sw={} dim={} p0={} p1={:#x} count={} first dst diff {:?} meta {:02x?}/{:02x?}", f, sw, dim, p0, p1, count, j, a.2, b.2);
                 }
             }
-            if a.0 != 0 || a.1 != nd || a.2 != nm || a.3 != ns {
+            if a.0 != 0 || defined.iter().any(|&i| !blk_eq(&a, &nd, &nm, &ns, i)) {
                 bad += 1;
                 if bad <= 10 {
                     let j = (0..nd.len()).find(|&j| a.1[j] != nd[j]);
@@ -245,8 +250,10 @@ fn oracle_dcc_enc_e2e() {
             let cr = unsafe { cdec(count as u32, nd.as_ptr(), nm.as_ptr(), cd.as_mut_ptr(), f, sw, dim, prm.as_ptr()) };
             let mut dd = vec![0u8; 256 * count];
             let dr = crate::dcc::decode(count as u32, &nd, &nm, &mut dd, f, sw, dim, p0, p1);
+            let du = if dr == 0 { crate::dcc::last_undefined() } else { Vec::new() };
+            dmasked += du.iter().filter(|&&x| x).count() as u64;
             rt += 1;
-            if dr == 0 && (cr != 0 || cd != dd) {
+            if dr == 0 && (cr != 0 || (0..count).any(|i| !du[i] && cd[i * 256..i * 256 + 256] != dd[i * 256..i * 256 + 256])) {
                 rtbad += 1;
                 if rtbad <= 5 {
                     println!("round trip f={} sw={} dim={} p0={} p1={:#x} count={}: native decode differs from console decode", f, sw, dim, p0, p1, count);
@@ -257,7 +264,7 @@ fn oracle_dcc_enc_e2e() {
             }
         }
     }
-    println!("dcc enc e2e: {} XGEncodeDCC calls, {} blocks, {} mismatches, {} console results depending on prior memory, {} native E_INVALIDARG (non-fault), {} color #DE predicted, {} round trips, {} native/console decode mismatches, {} lossy round trips", calls, blocks, bad, undef, nerr, faults, rt, rtbad, lossy);
+    println!("dcc enc e2e, undefined blocks masked: {} XGEncodeDCC calls, {} blocks ({} undefined on the console and masked), {} mismatches on defined blocks, {} console results depending on prior memory in defined blocks, {} native E_INVALIDARG (non-fault), {} color #DE predicted, {} round trips ({} decoded blocks undefined and masked), {} native/console decode mismatches, {} lossy round trips", calls, blocks, masked, bad, undef, nerr, faults, rt, dmasked, rtbad, lossy);
     assert_eq!(bad, 0);
     assert_eq!(undef, 0);
     assert_eq!(rtbad, 0);

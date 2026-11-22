@@ -1117,8 +1117,14 @@ pub(crate) unsafe fn real_device(this: *mut c_void) -> *mut c_void {
 
 /// For the diagnostic draw trace: (translated VS pointer, translated PS pointer, state text).
 pub fn pso_desc_text(pso: usize) -> Option<String> {
-    let rec = crate::frame_ev::lock(pso_registry()).get(&pso).cloned()?;
-    Some(desc_text(&rec.desc))
+    let real = crate::pso_async::real_of(pso);
+    let reg = crate::frame_ev::lock(pso_registry());
+    let (rec, via) = match reg.get(&pso) {
+        Some(r) => (r.clone(), String::new()),
+        None => (reg.get(&real)?.clone(), format!("async real {real:#x} ")),
+    };
+    drop(reg);
+    Some(format!("{via}{}", desc_text(&rec.desc)))
 }
 
 pub fn desc_text(d: &[u8]) -> String {

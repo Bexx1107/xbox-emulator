@@ -79,6 +79,10 @@ fn map() -> &'static Mutex<HashMap<usize, Arc<Slot>>> {
     M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub fn real_of(placeholder: usize) -> usize {
+    map().lock().ok().and_then(|m| m.get(&placeholder).map(|s| s.real.load(Ordering::Acquire))).unwrap_or(0)
+}
+
 pub fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {

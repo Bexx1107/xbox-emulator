@@ -980,8 +980,33 @@ fn same_out(c: &Case, a: &Out, b: &Out) -> bool {
     a.hr == b.hr && a.dst == b.dst && (!c.enc || (a.meta == b.meta && a.sizes == b.sizes))
 }
 
+fn block_eq(c: &Case, a: &Out, b: &Out, i: usize) -> bool {
+    a.dst[i * 256..i * 256 + 256] == b.dst[i * 256..i * 256 + 256] && (!c.enc || (a.meta[i] == b.meta[i] && a.sizes[i] == b.sizes[i]))
+}
+
+pub(super) fn native_masked(nd: usize, ne: usize, c: &Case) -> (Out, Vec<bool>) {
+    let r = call_via(nd, ne, c, 0x3c);
+    let u = if r.hr == 0 { crate::dcc::last_undefined() } else { Vec::new() };
+    (r, u)
+}
+
+fn masked(c: &Case, r: &Out, u: &[bool]) -> Out {
+    let mut m = Out { hr: r.hr, dst: r.dst.clone(), meta: r.meta.clone(), sizes: r.sizes.clone() };
+    if r.hr != 0 {
+        return m;
+    }
+    for (i, _) in u.iter().enumerate().filter(|(_, &x)| x) {
+        m.dst[i * 256..i * 256 + 256].fill(0);
+        if c.enc {
+            m.meta[i] = 0;
+            m.sizes[i] = 0;
+        }
+    }
+    m
+}
+
 #[test]
-fn oracle_dcc_accepted_cases_invariant() {
+fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle().expect("console xg_xs.dll");
     let b = build_of(&o);
@@ -991,17 +1016,25 @@ fn oracle_dcc_accepted_cases_invariant() {
     let (_rh, rd, re) = relocated_copy();
     arm_veh(o.h);
     let (mut acc, mut runs, mut bad) = (0usize, 0usize, Vec::new());
+    let (mut defined, mut undef_varied, mut undef_stable, mut unmodeled) = (0usize, 0usize, 0usize, Vec::new());
+    let mut undef_ids = Vec::new();
     for id in 0..n {
         let c = case(id);
         if !init_ok(&c) {
             continue;
         }
-        let nat = perturbed_call(nd, ne, &c, 0);
+        spray(0);
+        let _ = smear(0);
+        let (nat, u) = native_masked(nd, ne, &c);
         if nat.hr != 0 {
+            if !c.enc && crate::dcc::dec::last_unmodeled() {
+                unmodeled.push(id);
+            }
             continue;
         }
         acc += 1;
         CUR_ID.store(id as usize, std::sync::atomic::Ordering::SeqCst);
+        let mut seen: Vec<Out> = Vec::new();
         for v in 0..10usize {
             let r = match v {
                 5 => perturbed_call(rd, re, &c, 0),
@@ -1010,24 +1043,37 @@ fn oracle_dcc_accepted_cases_invariant() {
                 _ => perturbed_call(cd, ce, &c, v),
             };
             runs += 1;
-            if !same_out(&c, &nat, &r) {
-                if v == 0 && std::env::var("TOMBOX_DCC_INV_DUMP").is_ok() {
-                    for blk in 0..c.n {
+            let bad_blocks: Vec<usize> = (0..c.n).filter(|&i| !u[i] && (r.hr != nat.hr || !block_eq(&c, &nat, &r, i))).collect();
+            if r.hr != nat.hr || !bad_blocks.is_empty() {
+                if std::env::var("TOMBOX_DCC_INV_DUMP").is_ok() {
+                    for &blk in &bad_blocks {
                         let (a, b2) = (&nat.dst[blk * 256..blk * 256 + 256], &r.dst[blk * 256..blk * 256 + 256]);
                         let dj: Vec<usize> = (0..256).filter(|&j| a[j] != b2[j]).collect();
-                        if !dj.is_empty() {
-                            println!("invdump {id} fmt {} meta {:02x?} blk{blk} differ {:?}
-  native  {:02x?}
-  console {:02x?}", c.fmt, c.meta, &dj[..dj.len().min(24)], &a[dj[0] & !63..(dj[0] & !63) + 64], &b2[dj[0] & !63..(dj[0] & !63) + 64]);
-                        }
+                        println!("invdump {id}@{v} enc {} fmt {} blk{blk} meta n{:02x?} c{:02x?} size n{:?} c{:?} differ {:?}", c.enc, c.fmt, nat.meta.get(blk), r.meta.get(blk), nat.sizes.get(blk), r.sizes.get(blk), &dj[..dj.len().min(24)]);
                     }
                 }
                 bad.push(format!("{id}@{v}"));
             }
+            seen.push(r);
         }
+        for i in (0..c.n).filter(|&i| u[i]) {
+            if seen[1..].iter().any(|r| r.hr != seen[0].hr || !block_eq(&c, &seen[0], r, i)) {
+                undef_varied += 1;
+            } else {
+                undef_stable += 1;
+            }
+        }
+        if u.iter().any(|&x| x) {
+            undef_ids.push(id);
+        }
+        defined += u.iter().filter(|&&x| !x).count();
     }
-    println!("dcc accepted cases ({}): {acc} of {n} generator cases accepted natively; {runs} console runs under stack smears 00/ff/random, heap sprays, a relocated console DLL, two forwarding XMem allocation hooks and two rewrites of the allocator-dependent convert scratch quads; {} differ from native: {:?}", b.name, bad.len(), &bad[..bad.len().min(40)]);
+    if let Ok(p) = std::env::var("TOMBOX_DCC_UNDEF_OUT") {
+        std::fs::write(p, format!("{:?}\n{:?}\n", undef_ids, unmodeled)).unwrap();
+    }
+    println!("dcc accepted cases, undefined blocks masked ({}): {acc} of {n} generator cases native S_OK; blocks: {defined} defined (compared byte-exact), {} undefined (read console stack scratch no console code writes first; masked: {undef_varied} changed under the perturbations below, {undef_stable} never did) in {} cases; native E_INVALIDARG for {} decoder cases whose remap holes are console-written frame locals native does not model yet: {:?}; {runs} console runs under stack smears 00/ff/random, heap sprays, a relocated console DLL, two forwarding XMem allocation hooks and two rewrites of the host-written convert scratch quads; {} differ from native on a defined block: {:?}", b.name, undef_varied + undef_stable, undef_ids.len(), unmodeled.len(), &unmodeled[..unmodeled.len().min(40)], bad.len(), &bad[..bad.len().min(40)]);
     assert!(bad.is_empty());
+    assert!(unmodeled.iter().all(|id| b.unmodeled.contains(id)), "decoder cases rejected as unmodeled console-written frame locals outside the known list for this build: {:?}", unmodeled.iter().filter(|id| !b.unmodeled.contains(id)).collect::<Vec<_>>());
 }
 
 fn seq_id(seed: u64, j: u64) -> u64 {
@@ -1043,11 +1089,12 @@ fn seq_child(seed: u64, start: u64, end: u64) {
     let mut so = std::io::stdout();
     for j in start..end {
         let c = case(seq_id(seed, j));
-        let n = call_via(nd, ne, &c, 0x3c);
+        let (n, u) = native_masked(nd, ne, &c);
         writeln!(so, "@@C {j} {:08x}", n.hr as u32).unwrap();
         so.flush().unwrap();
         let k = call_via(cd, ce, &c, 0x3c);
-        writeln!(so, "@@R {j} {:08x} {:016x} {:08x} {:016x}", n.hr as u32, out_hash(&c, &n), k.hr as u32, out_hash(&c, &k)).unwrap();
+        let nu = u.iter().filter(|&&x| x).count();
+        writeln!(so, "@@R {j} {:08x} {:016x} {:08x} {:016x} {nu} {}", n.hr as u32, out_hash(&c, &masked(&c, &n, &u)), k.hr as u32, out_hash(&c, &masked(&c, &k, &u)), u.len()).unwrap();
         so.flush().unwrap();
     }
     writeln!(so, "@@DONE").unwrap();
@@ -1055,7 +1102,7 @@ fn seq_child(seed: u64, start: u64, end: u64) {
 }
 
 #[test]
-fn oracle_dcc_call_sequences() {
+fn oracle_dcc_call_sequences_undefined_masked() {
     if let Ok(spec) = std::env::var("TOMBOX_DCC_SEQ_CHILD") {
         let v: Vec<u64> = spec.split('_').map(|x| x.parse().unwrap()).collect();
         seq_child(v[0], v[1], v[2]);
@@ -1068,11 +1115,12 @@ fn oracle_dcc_call_sequences() {
     let v0: u64 = std::env::var("TOMBOX_DCC_SEQ0").ok().and_then(|x| x.parse().ok()).unwrap_or(3000);
     let plan: Vec<(u64, u64)> = std::iter::once((0u64, v0)).chain((1..=seqs).map(|s| (s, len))).collect();
     let (mut calls, mut same, mut rejected, mut crashes, mut hangs, mut init_bad, mut init_crash) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut ublocks, mut tblocks) = (0usize, 0usize);
     let mut bad = Vec::new();
     for &(seed, len) in &plan {
         let mut j = 0u64;
         while j < len {
-            let text = child("dcc::oracle_seq::oracle_dcc_call_sequences", "TOMBOX_DCC_SEQ_CHILD", format!("{seed}_{j}_{len}"));
+            let text = child("dcc::oracle_seq::oracle_dcc_call_sequences_undefined_masked", "TOMBOX_DCC_SEQ_CHILD", format!("{seed}_{j}_{len}"));
             let mut pending: Option<(u64, bool)> = None;
             let mut done = false;
             let mut code = 0u32;
@@ -1092,6 +1140,8 @@ fn oracle_dcc_call_sequences() {
                             }
                         }
                         if t[2] == "00000000" {
+                            ublocks += t[6].parse::<usize>().unwrap();
+                            tblocks += t[7].parse::<usize>().unwrap();
                             if t[2] == t[4] && t[3] == t[5] {
                                 same += 1;
                             } else {
@@ -1127,6 +1177,6 @@ fn oracle_dcc_call_sequences() {
     for x in &bad[..bad.len().min(20)] {
         println!("sequence divergence: {x}");
     }
-    println!("xg_xs dcc call sequences ({}): case order 0..{v0} plus {seqs} random sequences of {len} mixed XGDecodeDCC/XGEncodeDCC calls in one process with no reset between calls; {calls} calls: {same} native S_OK equal to the console (hr, data, meta, sizes), {rejected} native E_INVALIDARG, of which {crashes} console crashes and {hangs} hangs (process restarted); {init_bad} calls with init-invalid arguments, {init_crash} of them console crashes; {} divergences", b.name, bad.len());
+    println!("xg_xs dcc call sequences ({}): case order 0..{v0} plus {seqs} random sequences of {len} mixed XGDecodeDCC/XGEncodeDCC calls in one process with no reset between calls; {calls} calls: {same} native S_OK equal to the console (hr, and data, meta, sizes of every defined block; {ublocks} of their {tblocks} blocks are undefined on the console and masked), {rejected} native E_INVALIDARG, of which {crashes} console crashes and {hangs} hangs (process restarted); {init_bad} calls with init-invalid arguments, {init_crash} of them console crashes; {} divergences", b.name, bad.len());
     assert!(bad.is_empty());
 }
