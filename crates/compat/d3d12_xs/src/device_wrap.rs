@@ -558,7 +558,11 @@ unsafe extern "system" fn create_committed_resource(
         desc_copy[..0x38].copy_from_slice(&d);
         crate::depth_uav::d_real(init_state)
     };
-    let hr = unsafe { f(real, pheap, heap_flags, desc_ptr, init_state, pclear, use_riid, ppv) };
+    let pooled = if depth_uav == crate::depth_uav::Plan::None { unsafe { crate::res_pool::try_create(real, pheap, heap_flags, desc_ptr, init_state, pclear, ppv) } } else { None };
+    let hr = match pooled {
+        Some(hr) => hr,
+        None => unsafe { f(real, pheap, heap_flags, desc_ptr, init_state, pclear, use_riid, ppv) },
+    };
     if hr >= 0 && !ppv.is_null() {
         crate::map_x::ensure_patched(unsafe { *ppv });
         let res = unsafe { *ppv };
@@ -866,6 +870,7 @@ unsafe extern "system" fn create_gfx_pso_sync(
     };
     let ps_opts = if _pext.is_null() || _num_ext == 0 { None } else { crate::pso_ext::ps::options_in_entries(unsafe { core::slice::from_raw_parts(_pext, _num_ext as usize * crate::pso_ext::EXT_STRIDE) }, _num_ext as usize) };
     let mut ps_origin: Option<crate::pso_ext::ps::PsOrigin> = None;
+    let mut edits: Vec<&'static str> = Vec::new();
     let stages = [("VS", 0x08usize), ("PS", 0x18), ("DS", 0x28), ("HS", 0x38), ("GS", 0x48)];
     let present = |o: usize| rd(&desc, o) != 0 && rd(&desc, o + 8) != 0;
     let feeder = if present(0x48) { 0x48 } else if present(0x28) { 0x28 } else { 0x08 };
@@ -891,12 +896,24 @@ unsafe extern "system" fn create_gfx_pso_sync(
                 let code = if stage == "PS" {
                     ps_origin = crate::pso_ext::ps::origin_from_blob(p, n, rtfmt, ps_opts.unwrap_or_default());
                     match (ps_opts, &ps_origin) {
-                        (Some(_), Some(o)) => crate::pso_ext::ps::variant(o, crate::pso_ext::ps::depth_stencil_writes(&desc)).unwrap_or(code),
+                        (Some(_), Some(o)) => match crate::pso_ext::ps::variant(o, crate::pso_ext::ps::depth_stencil_writes(&desc)) {
+                            Some(v) => {
+                                edits.push("ps:pso_ext_variant");
+                                v
+                            }
+                            None => code,
+                        },
                         _ => code,
                     }
                 } else if stage == "VS" {
                     let sems = unsafe { snorm10_semantics(&desc) };
-                    unsafe { crate::vs_snorm::variant(p, n, &sems) }.unwrap_or(code)
+                    match unsafe { crate::vs_snorm::variant(p, n, &sems) } {
+                        Some(v) => {
+                            edits.push("vs:vs_snorm");
+                            v
+                        }
+                        None => code,
+                    }
                 } else {
                     code
                 };
@@ -976,8 +993,18 @@ unsafe extern "system" fn create_gfx_pso_sync(
             unsafe { core::mem::transmute(*real_vtbl(real).add(10)) };
         unsafe { crate::cl2_state::patch_gfx_pso_desc(real, &mut desc) };
         let t0 = std::time::Instant::now();
-        let hr = crate::perf::timed(crate::perf::PSO, || unsafe { crate::pso_ext::create(real, &desc, _num_ext, _pext, riid, ppv).unwrap_or_else(|| f(real, desc.as_ptr(), riid, ppv)) });
+        let mut via_ext = false;
+        let hr = crate::perf::timed(crate::perf::PSO, || unsafe {
+            match crate::pso_ext::create(real, &desc, _num_ext, _pext, riid, ppv) {
+                Some(h) => {
+                    via_ext = true;
+                    h
+                }
+                None => f(real, desc.as_ptr(), riid, ppv),
+            }
+        });
         if hr >= 0 && !ppv.is_null() {
+            crate::hang_cap::note_origin(unsafe { *ppv } as usize, || format!("original edits=[{}] numExt={_num_ext} created_via={}", edits.join(","), if via_ext { "pso_ext::create (Xbox ext entries applied)" } else { "CreateGraphicsPipelineState(desc)" }));
             unsafe { crate::pso_ext::note(*ppv, _num_ext, _pext) };
             crate::pso_ext::ps::note_pso(unsafe { *ppv }, ps_origin.clone());
         }
@@ -1119,6 +1146,16 @@ unsafe fn own_semantic_names(layout: &mut [u8]) -> Vec<Vec<u8>> {
     names
 }
 
+pub(crate) fn pso_record_bytes(pso: usize) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> {
+    let rec = crate::frame_ev::lock(pso_registry()).get(&pso).cloned()?;
+    let rd = |o: usize| u64::from_le_bytes(rec.desc[o..o + 8].try_into().unwrap());
+    let blob = |o: usize| {
+        let (p, n) = (rd(o) as *const u8, rd(o + 8) as usize);
+        if p.is_null() || n == 0 || n > 0x100_0000 { Vec::new() } else { unsafe { core::slice::from_raw_parts(p, n).to_vec() } }
+    };
+    Some((rec.desc.clone(), blob(0x08), blob(0x18), rec._layout.clone(), rec._names.clone()))
+}
+
 pub(crate) unsafe fn register_gfx_pso(pso: *mut c_void, desc: Vec<u8>, shaders: Vec<std::sync::Arc<Vec<u8>>>) {
     unsafe { register_pso(pso, desc, shaders) }
 }
@@ -1181,7 +1218,7 @@ pub fn pso_summary(pso: usize) -> Option<(usize, usize, String)> {
 // method table rather than installed on the wrapper, because the title also reaches the
 // real device directly (ID3D12DeviceChild::GetDevice on a resource or command list returns
 // it) and views created that way would otherwise go unrecorded.
-static REAL_ORIG: [core::sync::atomic::AtomicUsize; 32] = [const { core::sync::atomic::AtomicUsize::new(0) }; 32];
+static REAL_ORIG: [core::sync::atomic::AtomicUsize; 40] = [const { core::sync::atomic::AtomicUsize::new(0) }; 40];
 fn real_orig(slot: usize) -> usize {
     REAL_ORIG[slot].load(Ordering::Relaxed)
 }
@@ -1281,6 +1318,16 @@ unsafe extern "system" fn real_copy_descriptors_simple(real: *mut c_void, n: u32
     let f: unsafe extern "system" fn(*mut c_void, u32, usize, usize, u32) = unsafe { core::mem::transmute(real_orig(24)) };
     unsafe { f(real, n, dest, src, heap_type) }
 }
+unsafe extern "system" fn real_make_resident(real: *mut c_void, n: u32, objs: *const *mut c_void) -> i32 {
+    unsafe { crate::hang_cap::note_residency(false, n, objs) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) -> i32 = unsafe { core::mem::transmute(real_orig(34)) };
+    unsafe { f(real, n, objs) }
+}
+unsafe extern "system" fn real_evict(real: *mut c_void, n: u32, objs: *const *mut c_void) -> i32 {
+    unsafe { crate::hang_cap::note_residency(true, n, objs) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) -> i32 = unsafe { core::mem::transmute(real_orig(35)) };
+    unsafe { f(real, n, objs) }
+}
 /// Patch the real device's method table (shared by every interface version of the device).
 unsafe fn patch_real_device(real: *mut c_void) {
     extern "system" {
@@ -1306,6 +1353,17 @@ unsafe fn patch_real_device(real: *mut c_void) {
         let mut tmp = 0u32;
         VirtualProtect(vt.add(16) as *mut c_void, 9 * 8, old, &mut tmp);
         record("d3d12_xs", "bindtrace", "descriptor hooks installed on the real device method table");
+        if crate::hang_cap::on() {
+            let mut old2 = 0u32;
+            if VirtualProtect(vt.add(34) as *mut c_void, 2 * 8, 0x04, &mut old2) != 0 {
+                for (slot, f) in [(34usize, real_make_resident as usize), (35, real_evict as usize)] {
+                    REAL_ORIG[slot].store(*vt.add(slot), Ordering::Relaxed);
+                    *vt.add(slot) = f;
+                }
+                VirtualProtect(vt.add(34) as *mut c_void, 2 * 8, old2, &mut tmp);
+                record("d3d12_xs", "hang_cap", "MakeResident/Evict hooks installed on the real device method table");
+            }
+        }
     });
 }
 
@@ -1413,8 +1471,18 @@ unsafe extern "system" fn create_derived_pso_x(
     let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(10)) };
     let ext_ptr = ds_ext.as_ref().map_or(core::ptr::null(), |e| e.as_ptr());
-    let hr = unsafe { crate::pso_ext::create(real, &desc, ds_ext.is_some() as u32, ext_ptr, riid, ppv).unwrap_or_else(|| f(real, desc.as_ptr(), riid, ppv)) };
+    let mut via_ext = false;
+    let hr = unsafe {
+        match crate::pso_ext::create(real, &desc, ds_ext.is_some() as u32, ext_ptr, riid, ppv) {
+            Some(h) => {
+                via_ext = true;
+                h
+            }
+            None => f(real, desc.as_ptr(), riid, ppv),
+        }
+    };
     if hr >= 0 && !ppv.is_null() {
+        crate::hang_cap::note_origin(unsafe { *ppv } as usize, || format!("derived from base {base:p} patch tags [{}] ds_ext={} created_via={}", tags.trim(), ds_ext.is_some(), if via_ext { "pso_ext::create" } else { "CreateGraphicsPipelineState(desc)" }));
         unsafe { crate::pso_ext::note(*ppv, ds_ext.is_some() as u32, ext_ptr) };
         crate::pso_ext::ps::note_pso(unsafe { *ppv }, ps_origin.clone());
     }
@@ -1476,6 +1544,22 @@ pub fn wrap_root_signature(rts: &[u8]) -> Vec<u8> {
 
 static ROOT_FROM_SHADER: std::sync::Mutex<Option<std::collections::HashMap<u64, usize>>> = std::sync::Mutex::new(None);
 
+pub(crate) fn shader_root_container(rts: &[u8], raw: bool) -> Vec<u8> {
+    let console = wrap_root_signature(rts);
+    let container = crate::rs_xbox::pc_blob(&console).unwrap_or(console);
+    if !raw {
+        return container;
+    }
+    match crate::cbv_raw::patch_blob(&container) {
+        Ok(Some((b, _))) => b,
+        Ok(None) => container,
+        Err(e) => {
+            record("d3d12_xs", "PSO.rootFromShader", &format!("cbv_raw patch failed ({e}); root signature left as the shader gives it"));
+            container
+        }
+    }
+}
+
 unsafe fn root_from_shaders(real: *mut c_void, desc: &[u8], stages: &[usize]) -> usize {
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     for &o in stages {
@@ -1495,8 +1579,7 @@ unsafe fn root_from_shaders(real: *mut c_void, desc: &[u8], stages: &[usize]) ->
         let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32 =
             unsafe { core::mem::transmute(*real_vtbl(real).add(16)) };
         let mut rs: *mut c_void = core::ptr::null_mut();
-        let console = wrap_root_signature(rts);
-        let container = crate::rs_xbox::pc_blob(&console).unwrap_or(console);
+        let container = shader_root_container(rts, crate::cbv_raw::enabled());
         let hr = unsafe { f(real, 0, container.as_ptr(), container.len(), &IID_ROOT_SIGNATURE, &mut rs) };
         if N.fetch_add(1, Ordering::Relaxed) < 6 {
             record("d3d12_xs", "PSO.rootFromShader", &format!("null pRootSignature; built root signature from the shader's RTS0 part ({} bytes, header {:x?}) -> hr={hr:#010x}", rts.len(), rts.chunks_exact(4).take(6).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>()));

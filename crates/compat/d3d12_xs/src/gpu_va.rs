@@ -15,8 +15,8 @@ pub struct Entry {
 }
 
 struct Tables {
-    ranges: BTreeMap<u64, Entry>,
-    cpu: BTreeMap<u64, Entry>,
+    ranges: Vec<BTreeMap<u64, Entry>>,
+    cpu: Vec<BTreeMap<u64, Entry>>,
     texture_va: HashMap<usize, u64>,
     state: HashMap<usize, u32>,
     width: HashMap<usize, u64>,
@@ -27,24 +27,45 @@ static NEXT_SYNTH: AtomicU64 = AtomicU64::new(SYNTHETIC_TEXTURE_BASE);
 
 fn with<R>(f: impl FnOnce(&mut Tables) -> R) -> R {
     let mut g = T.lock().unwrap_or_else(|e| e.into_inner());
-    let t = g.get_or_insert_with(|| Tables { ranges: BTreeMap::new(), cpu: BTreeMap::new(), texture_va: HashMap::new(), state: HashMap::new(), width: HashMap::new() });
+    let t = g.get_or_insert_with(|| Tables { ranges: Vec::new(), cpu: Vec::new(), texture_va: HashMap::new(), state: HashMap::new(), width: HashMap::new() });
     f(t)
 }
 
-fn insert_into(m: &mut BTreeMap<u64, Entry>, e: Entry) {
+const MAX_LEVELS: usize = 8;
+
+fn overlapping(m: &BTreeMap<u64, Entry>, e: &Entry) -> Vec<Entry> {
     let end = e.start.saturating_add(e.len);
-    let stale: Vec<u64> = m.range(..end).rev()
+    m.range(..end).rev()
         .take_while(|(_, x)| x.start.saturating_add(x.len) > e.start)
-        .map(|(k, _)| *k).collect();
-    for k in stale {
-        m.remove(&k);
-    }
-    m.insert(e.start, e);
+        .map(|(_, x)| *x).collect()
 }
 
-fn find_in(m: &BTreeMap<u64, Entry>, a: u64) -> Option<(Entry, u64)> {
-    m.range(..=a).next_back().map(|(_, e)| *e)
-        .filter(|e| a < e.start.saturating_add(e.len))
+fn insert_into(levels: &mut Vec<BTreeMap<u64, Entry>>, e: Entry) {
+    let mut l = 0;
+    loop {
+        if levels.len() <= l {
+            levels.push(BTreeMap::new());
+        }
+        let mut larger = false;
+        for old in overlapping(&levels[l], &e) {
+            if old.res != e.res && old.len > e.len && l + 1 < MAX_LEVELS {
+                larger = true;
+            } else if let Some(old) = levels[l].remove(&old.start) {
+                crate::hang_cap::note_evict(&old, &e);
+            }
+        }
+        if !larger {
+            levels[l].insert(e.start, e);
+            return;
+        }
+        l += 1;
+    }
+}
+
+fn find_in(levels: &[BTreeMap<u64, Entry>], a: u64) -> Option<(Entry, u64)> {
+    levels.iter()
+        .filter_map(|m| m.range(..=a).next_back().map(|(_, e)| *e).filter(|e| a < e.start.saturating_add(e.len)))
+        .min_by_key(|e| e.len)
         .map(|e| crate::placed_offset::true_entry(e, a))
 }
 
@@ -72,7 +93,13 @@ pub fn near_in(m: &BTreeMap<u64, Entry>, va: u64, n: usize) -> Vec<Entry> {
 }
 
 pub fn near(va: u64, n: usize) -> Vec<Entry> {
-    with(|t| near_in(&t.ranges, va, n))
+    with(|t| {
+        let mut all: BTreeMap<u64, Entry> = BTreeMap::new();
+        for m in t.ranges.iter().rev() {
+            all.extend(m.iter().map(|(k, e)| (*k, *e)));
+        }
+        near_in(&all, va, n)
+    })
 }
 
 pub fn lookup_gpu(va: u64) -> Option<(Entry, u64)> {
@@ -339,6 +366,30 @@ mod tests {
         assert_eq!(lookup(0x1_0000_0800), None);
         assert_eq!(lookup(0x1_0000_2050).map(|(e, _)| e.res), Some(3));
         assert_eq!(lookup(0x1_0000_2f00), None);
+    }
+
+    #[test]
+    fn a_smaller_resource_never_evicts_the_larger_range_it_sits_in() {
+        let base = 0x3_0800_0000u64;
+        insert(Entry { start: base, len: 0x600_0000, res: 0x10, buffer: true });
+        insert(Entry { start: base + 0x4f4_0000, len: 0x1_0000, res: 0x11, buffer: false });
+        assert_eq!(lookup(base + 0x5_6830).map(|(e, o)| (e.res, o)), Some((0x10, 0x5_6830)));
+        assert_eq!(lookup(base + 0x4f4_0100).map(|(e, o)| (e.res, o)), Some((0x11, 0x100)));
+        assert_eq!(lookup(base + 0x5ff_fff0).map(|(e, _)| e.res), Some(0x10));
+        insert(Entry { start: base + 0x4f4_8000, len: 0x1_0000, res: 0x12, buffer: false });
+        assert_eq!(lookup(base + 0x4f4_0100).map(|(e, _)| e.res), Some(0x10));
+        assert_eq!(lookup(base + 0x4f4_9000).map(|(e, _)| e.res), Some(0x12));
+        insert(Entry { start: base + 0x100_0000, len: 0x800, res: 0x13, buffer: false });
+        insert(Entry { start: base + 0x100_0200, len: 0x100, res: 0x14, buffer: false });
+        assert_eq!(lookup(base + 0x100_0250).map(|(e, _)| e.res), Some(0x14));
+        assert_eq!(lookup(base + 0x100_0400).map(|(e, _)| e.res), Some(0x13));
+        assert_eq!(lookup(base + 0x100_0900).map(|(e, _)| e.res), Some(0x10));
+        insert(Entry { start: base, len: 0x600_0000, res: 0x15, buffer: true });
+        assert_eq!(lookup(base + 0x5_6830).map(|(e, _)| e.res), Some(0x15));
+        assert_eq!(lookup(base + 0x100_0250).map(|(e, _)| e.res), Some(0x14));
+        insert(Entry { start: base, len: 0x800_0000, res: 0x16, buffer: true });
+        assert_eq!(lookup(base + 0x700_0000).map(|(e, _)| e.res), Some(0x16));
+        assert_eq!(lookup(base + 0x5_6830).map(|(e, _)| e.res), Some(0x16));
     }
 
     #[test]

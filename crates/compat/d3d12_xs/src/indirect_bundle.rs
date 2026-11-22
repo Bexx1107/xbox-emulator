@@ -706,6 +706,10 @@ pub unsafe fn execute(list: *mut c_void, bundle: *mut c_void, width: u64, offset
     let srcs = distinct(&[bundle as usize, size_buf as usize, title.map_or(0, |t| t.0)]).into_iter().map(|r| (r, crate::gpu_va::state(r))).collect();
     let (live, g) = live_now();
     let c = Call { bundle: bundle as usize, width, offset, max_size, size_buf: size_buf as usize, size_off, title, srcs, live, gens: g, qslots: Vec::new(), carried: None };
+    static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !FIRST.swap(true, Ordering::Relaxed) {
+        record("d3d12_xs", "indirect_bundle", &format!("first call ExecuteIndirectBundleX(list {list:p}, records {bundle:p}, width {width:#x}, offset {offset:#x}, max_size {max_size}, size {size_buf:p}+{size_off:#x}, title predicate {}, live bundles {})", title.is_some(), c.live.len()));
+    }
     if unsafe { split(list, c.clone()) } {
         return;
     }

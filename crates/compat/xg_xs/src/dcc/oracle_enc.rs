@@ -564,7 +564,7 @@ fn oracle_dcc_enc_convert_holes() {
 }
 
 #[test]
-fn oracle_dcc_encode_export_shim() {
+fn oracle_dcc_encode_export_shim_undefined_masked() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
     let cenc: Enc = unsafe { core::mem::transmute(o.f("XGEncodeDCC")) };
@@ -594,7 +594,7 @@ fn oracle_dcc_encode_export_shim() {
             assert_eq!(x, y, "f={:#x} sw={:#x}", f, sw);
         }
     }
-    let (mut asserts, mut skipped, mut nulls) = (0u64, 0u64, 0u64);
+    let (mut asserts, mut skipped, mut nulls, mut masked) = (0u64, 0u64, 0u64, 0u64);
     for f in 1..=0x78u32 {
         if !crate::dcc::safe_format(f) {
             for cnt in [0u32, 1] {
@@ -624,7 +624,14 @@ fn oracle_dcc_encode_export_shim() {
                         skipped += 1;
                         continue;
                     }
+                    let nu = crate::dcc::last_undefined();
                     let y = call(false, cnt, s.as_ptr(), b.as_mut_ptr(), mb.as_mut_ptr(), if z { core::ptr::null_mut() } else { sb.as_mut_ptr() }, f, sw, dim, p.as_ptr());
+                    for (i, _) in nu.iter().enumerate().filter(|(_, &u)| u) {
+                        masked += 1;
+                        a[i * 256..i * 256 + 256].copy_from_slice(&b[i * 256..i * 256 + 256]);
+                        ma[i] = mb[i];
+                        sa[i] = sb[i];
+                    }
                     cases += 1;
                     if z {
                         nulls += 1;
@@ -635,7 +642,7 @@ fn oracle_dcc_encode_export_shim() {
             }
         }
     }
-    println!("dcc encode export shim: {} cases match console (hr, dst, meta, sizes; {} with sizes=NULL), {} unsupported-format calls return E_INVALIDARG, {} native E_INVALIDARG (console not run: color #DE or stack-dependent output)", cases, nulls, asserts, skipped);
+    println!("dcc encode export shim, undefined blocks masked: {} cases match console (hr, and dst, meta, sizes of every defined block; {} with sizes=NULL; {} blocks undefined on the console and masked), {} unsupported-format calls return E_INVALIDARG, {} native E_INVALIDARG (console not run: color #DE)", cases, nulls, masked, asserts, skipped);
 }
 
 fn de_enc_cases(n: usize, fault: bool) -> Vec<((u32, u32, u32, u32, u32), [u8; 256])> {

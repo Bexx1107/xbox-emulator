@@ -727,6 +727,16 @@ unsafe fn ts_freq(queue: *mut c_void) -> u64 {
 unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    let entry = crate::frame::qpc();
+    let mut presented = false;
+    let r = present_x_body(queue, plane_count, planes, n, entry, &mut presented);
+    if !presented && crate::frame_csv::on() {
+        crate::frame_csv::present_skipped(entry);
+    }
+    r
+}
+
+unsafe fn present_x_body(queue: *mut c_void, plane_count: u32, planes: *const u8, n: usize, entry: i64, shown: &mut bool) -> i32 {
     if plane_count != 0 && !planes.is_null() {
         // The frame identified by this token counts as flipped from here on (the title's
         // flip tracking keys off it), even if the host-side present below fails.
@@ -745,7 +755,6 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
         return 0;
     }
     let src = *pp;
-    let entry = crate::frame::qpc();
     crate::perf::on_present();
     crate::qwait::poll();
     crate::gpuprof::on_present();
@@ -784,6 +793,7 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
             if crate::frame_csv::on() {
                 crate::frame_csv::present_done(st.frames, entry);
             }
+            *shown = true;
         }
         Err(e) => {
             if n < 8 {

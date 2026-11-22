@@ -13,6 +13,7 @@
 
 mod device_wrap;
 mod res3d;
+mod res_pool;
 mod dxgi_device;
 mod xone_dxgi;
 mod xone_queue;

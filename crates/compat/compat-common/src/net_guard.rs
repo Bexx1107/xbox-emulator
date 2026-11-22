@@ -549,7 +549,17 @@ unsafe extern "system" fn h_connect(s: usize, name: *const u8, len: i32) -> i32 
         deny_dest("connect", name, len);
         return -1;
     }
-    orig!(H_CONNECT, fn(usize, *const u8, i32) -> i32)(s, name, len)
+    let r = orig!(H_CONNECT, fn(usize, *const u8, i32) -> i32)(s, name, len);
+    note_socket(s, r, name, len);
+    r
+}
+
+unsafe fn note_socket(s: usize, r: i32, remote: *const u8, len: i32) {
+    let e = GetLastError();
+    if r >= 0 || e == 10035 {
+        crate::netview::sockets::report_socket(s, remote, len);
+    }
+    SetLastError(e);
 }
 
 unsafe extern "system" fn h_wsaconnect(s: usize, name: *const u8, len: i32, a: *mut c_void, b: *mut c_void, c: *mut c_void, d: *mut c_void) -> i32 {
@@ -557,7 +567,9 @@ unsafe extern "system" fn h_wsaconnect(s: usize, name: *const u8, len: i32, a: *
         deny_dest("WSAConnect", name, len);
         return -1;
     }
-    orig!(H_WSACONNECT, fn(usize, *const u8, i32, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32)(s, name, len, a, b, c, d)
+    let r = orig!(H_WSACONNECT, fn(usize, *const u8, i32, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32)(s, name, len, a, b, c, d);
+    note_socket(s, r, name, len);
+    r
 }
 
 type ByName<T> = unsafe extern "system" fn(usize, *const T, *const T, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32;
@@ -589,7 +601,9 @@ unsafe extern "system" fn h_sendto(s: usize, buf: *const u8, len: i32, flags: i3
         deny_dest("sendto", to, tolen);
         return -1;
     }
-    orig!(H_SENDTO, fn(usize, *const u8, i32, i32, *const u8, i32) -> i32)(s, buf, len, flags, to, tolen)
+    let r = orig!(H_SENDTO, fn(usize, *const u8, i32, i32, *const u8, i32) -> i32)(s, buf, len, flags, to, tolen);
+    note_socket(s, r, to, tolen);
+    r
 }
 
 unsafe extern "system" fn h_wsasendto(
@@ -599,7 +613,9 @@ unsafe extern "system" fn h_wsasendto(
         deny_dest("WSASendTo", to, tolen);
         return -1;
     }
-    orig!(H_WSASENDTO, fn(usize, *const c_void, u32, *mut u32, u32, *const u8, i32, *mut c_void, *const c_void) -> i32)(s, bufs, count, sent, flags, to, tolen, ov, routine)
+    let r = orig!(H_WSASENDTO, fn(usize, *const c_void, u32, *mut u32, u32, *const u8, i32, *mut c_void, *const c_void) -> i32)(s, bufs, count, sent, flags, to, tolen, ov, routine);
+    note_socket(s, r, to, tolen);
+    r
 }
 
 static LOCAL_PROXY_SESSIONS: Mutex<Vec<usize>> = Mutex::new(Vec::new());

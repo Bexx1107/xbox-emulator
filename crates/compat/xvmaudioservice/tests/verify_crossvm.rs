@@ -116,6 +116,16 @@ fn crossvm_audio_endpoint_and_spatial_queries_match_the_pc() {
 }
 
 #[test]
+fn crossvm_audio_client_items_and_property_vectors_match_the_pc() {
+    run_step("items");
+}
+
+#[test]
+fn crossvm_audio_capture_endpoint_posts_wasapi_packets_to_the_guest_queue() {
+    run_step("capture");
+}
+
+#[test]
 fn inner() {
     let Ok(step) = std::env::var(STEP) else { return };
     let dir = std::env::temp_dir().join(format!("xvmaudio_crossvm_{}", std::process::id()));
@@ -136,6 +146,8 @@ fn inner() {
         "position" => position(&mix),
         "shared" => shared(&mix),
         "endpoint" => endpoint(&mix),
+        "items" => items(&mix),
+        "capture" => capture(),
         _ => objects(&mix),
     }
     println!("STEP OK");
@@ -879,4 +891,308 @@ fn endpoint(_mix: &[u8]) {
         let mut e = envelope(crossvm::RELEASE_OBJECT, o);
         assert_eq!(send(&mut e), 0);
     }
+}
+
+fn items(mix: &[u8]) {
+    use console_sandbox::wasapi;
+    let (object, hr, _) = init_stream(mix, 0);
+    assert_eq!(hr, 0);
+    let (hr, e) = create(crossvm::ITEM_SERVICE_TYPE, 0, object, 0, &[]);
+    assert_eq!(hr, 0, "AudioSes 8516c creates the d19f8e95 service object as type 0xb under the stream");
+    let svc = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::ITEM_COUNT, svc);
+    assert_eq!(send(&mut e), 0);
+    let count = u32_at(&e, 0x10);
+    let mut e = envelope(crossvm::ITEM_FLAG, svc);
+    assert_eq!(send(&mut e), 0);
+    let flag = e[0x10];
+    println!("PC IAudioClient d19f8e95 service: count {count}, flag {flag}");
+    assert!(flag <= 1);
+    for i in 0..count {
+        let mut e = envelope(crossvm::ITEM_GET, svc);
+        e[0x10..0x14].copy_from_slice(&i.to_le_bytes());
+        assert_eq!(send(&mut e), 0, "0x3c index {i} exists on the PC");
+        let mut e = envelope(crossvm::ITEM_VALUE, svc);
+        e[0x10..0x14].copy_from_slice(&i.to_le_bytes());
+        e[0x14..0x18].copy_from_slice(&0xdeadu32.to_le_bytes());
+        assert_eq!(send(&mut e), 0);
+        assert_eq!(u32_at(&e, 0x10), i, "0x3f keeps the index at A+0");
+        let v = u32_at(&e, 0x14);
+        println!("item {i}: value {v} (0x3f R+4)");
+        assert_ne!(v, 0xdead, "0x3f writes the child value over the zero half at R+4");
+    }
+    let mut e = envelope(crossvm::ITEM_GET, svc);
+    e[0x10..0x14].copy_from_slice(&count.to_le_bytes());
+    assert_eq!(send(&mut e) as u32, 0x80070057, "an index past the PC count fails the way the PC Get does");
+    let mut e = envelope(crossvm::ITEM_COUNT, 0x7fff_0000);
+    assert_ne!(send(&mut e), 0, "an object outside a stream has no client to ask");
+
+    let (hr, e) = create(1, 1, 0, 0, &[]);
+    assert_eq!(hr, 0);
+    let enumerator = u32_at(&e, 0x1c);
+    let (hr, e) = create(5, 0, enumerator, crossvm::METHOD_DEFAULT_ENDPOINT, &[0u8; 8]);
+    assert_eq!(hr, 0);
+    let dev = u32_at(&e, 0x1c);
+    let id = crossvm::object_device(dev).unwrap();
+    let (hr, e) = create(0xd, 0, dev, 0x26, &[]);
+    assert_eq!(hr, 0);
+    let ps = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::PROPERTY_GET_COUNT, ps);
+    assert_eq!(send(&mut e), 0);
+    let n = u32_at(&e, 0x10);
+    let (mut vectors, mut served, mut tags) = (0, 0, [0u32; 5]);
+    for i in 0..n {
+        let mut e = envelope(crossvm::PROPERTY_GET_AT, ps);
+        e[0x10..0x14].copy_from_slice(&i.to_le_bytes());
+        assert_eq!(send(&mut e), 0);
+        let mut key = wasapi::PropertyKey::default();
+        key.fmtid.copy_from_slice(&e[0x14..0x24]);
+        key.pid = u32_at(&e, 0x24);
+        let pc = wasapi::property_value(Some(&id), &key);
+        let mut e = envelope(crossvm::PROPERTY_GET_VALUE, ps);
+        e[0x10..0x20].copy_from_slice(&key.fmtid);
+        e[0x20..0x24].copy_from_slice(&key.pid.to_le_bytes());
+        let hr = send(&mut e);
+        let tag = u32_at(&e, 0x24);
+        let len = u64::from_le_bytes(e[0x10 + 0x11c..0x18 + 0x11c].try_into().unwrap()) as usize;
+        let data = &e[0x28..0x28 + len.min(crossvm::PROP_DATA)];
+        if hr == 0 {
+            served += 1;
+            tags[tag.min(4) as usize] += 1;
+        }
+        match pc {
+            Ok(Some(wasapi::Prop::Vector(vt, cnt, bytes))) => {
+                vectors += 1;
+                println!("property {i} pid {} vt {vt:#x}: {cnt} elements, {} bytes", key.pid, bytes.len());
+                if bytes.len() + 8 <= crossvm::PROP_DATA {
+                    assert_eq!(hr, 0);
+                    assert_eq!(tag, 3);
+                    assert_eq!(u16::from_le_bytes([data[0], data[1]]), vt);
+                    assert_eq!(u32_at(data, 4), cnt, "cElems at data+4 (AudioSes 2bf0a)");
+                    assert_eq!(&data[8..], &bytes[..], "elements are a raw copy from data+8");
+                }
+            }
+            Ok(Some(wasapi::Prop::Serialized(vt, bytes))) if bytes.len() + 8 <= crossvm::PROP_DATA => {
+                assert_eq!((hr, tag), (0, 3));
+                assert_eq!(u16::from_le_bytes([data[0], data[1]]), vt);
+                assert_eq!(&data[8..], &bytes[..]);
+            }
+            _ => {}
+        }
+    }
+    println!("{n} PC properties: {served} served (tags empty/text/-/serialised/dword {tags:?}), {vectors} vectors");
+    assert!(served > 0);
+    let v = crossvm::serialized_prop(0x101f, Some(2), &[b'a', 0, 0, 0, b'b', 0, 0, 0]);
+    assert_eq!(&v[..8], &[0x1f, 0x10, 0, 0, 2, 0, 0, 0], "REG_MULTI_SZ serialises as VT_VECTOR|VT_LPWSTR with cElems");
+}
+
+fn capture() {
+    use console_sandbox::wasapi;
+    let Ok(pc_id) = wasapi::default_id(1, 0) else {
+        println!("NO PC CAPTURE ENDPOINT");
+        return;
+    };
+    let (hr, e) = create(1, 1, 0, 0, &[]);
+    assert_eq!(hr, 0);
+    let enumerator = u32_at(&e, 0x1c);
+    let mut args = [0u8; 8];
+    args[0..4].copy_from_slice(&1u32.to_le_bytes());
+    let (hr, e) = create(5, 0, enumerator, crossvm::METHOD_DEFAULT_ENDPOINT, &args);
+    assert_eq!(hr, 0);
+    let dev = u32_at(&e, 0x1c);
+    assert_eq!(crossvm::object_device(dev).unwrap(), pc_id);
+    assert_eq!(wasapi::device_flow(Some(&pc_id)), Ok(1));
+    let mut e = envelope(crossvm::GET_MIX_FORMAT, dev);
+    assert_eq!(send(&mut e), 0);
+    let mix_len = 0x12 + u16::from_le_bytes([e[0x20], e[0x21]]) as usize;
+    let mix = e[0x10..0x10 + mix_len].to_vec();
+    let align = u16::from_le_bytes([mix[0xc], mix[0xd]]) as u64;
+    let rate = u32_at(&mix, 4);
+    let (hr, e) = create(2, 0, dev, 0x2f, &[]);
+    assert_eq!(hr, 0);
+    let object = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::INITIALIZE, object);
+    let a = 0x10;
+    e[a + 8..a + 16].copy_from_slice(&1_000_000i64.to_le_bytes());
+    e[a + 0x18..a + 0x18 + mix.len()].copy_from_slice(&mix);
+    assert_eq!(send(&mut e), 0, "capture Initialize on the PC capture endpoint");
+    let clsid = &e[a + crossvm::INIT_ENDPOINT_CLSID..a + crossvm::INIT_ENDPOINT_CLSID + 16];
+    assert_eq!(clsid, &[0xa6, 0x6d, 0x4a, 0xf6, 0xaf, 0xe8, 0x7b, 0x4b, 0xbc, 0xa8, 0x84, 0x7a, 0xe7, 0x65, 0xd5, 0x38], "reply +0x70 is f64a6da6, which AudioSes 15fb0 maps to CCrossProcessClientInputEndpoint");
+    let (base, _, _, _, _) = crossvm::stream_info(object).unwrap();
+    let cb = base as *mut u8;
+    let r32 = |o: usize| unsafe { (cb.add(o) as *const u32).read_volatile() };
+    let c = crossvm::CB_CONFIG;
+    let (queue, entries) = (r32(c + crossvm::CFG_QUEUE) as usize, r32(c + crossvm::CFG_ENTRIES));
+    let (start, end) = (r32(c + crossvm::CFG_DATA_START), r32(c + crossvm::CFG_DATA_END));
+    assert!(entries > 1 && queue > 0);
+    let mut e = envelope(crossvm::START, object);
+    assert_eq!(send(&mut e), 0);
+    let t = std::time::Instant::now();
+    let (mut packets, mut frames, mut silent, mut last_end, mut back, mut disc) = (0u64, 0u64, 0u64, None::<u64>, 0u64, 0u64);
+    while t.elapsed().as_millis() < 1500 {
+        loop {
+            let r = r32(wasapi::CAPTURE_QUEUE_READ);
+            if r == r32(wasapi::CAPTURE_QUEUE_WRITE) {
+                break;
+            }
+            let ent = queue + r as usize * wasapi::CAPTURE_ENTRY;
+            let off = r32(ent + 4);
+            let kind = r32(ent + 8);
+            let n = r32(ent + 0x38) as u64;
+            let flags = r32(ent + 0x34);
+            let pos = unsafe { (cb.add(ent + 0x18) as *const u64).read_volatile() };
+            let qpc = unsafe { (cb.add(ent + 0x28) as *const u64).read_volatile() } as i64;
+            let erate = unsafe { (cb.add(ent + 0x30) as *const f32).read_volatile() };
+            assert!(n > 0 && (kind == 1 || kind == 2) && flags & !5 == 0);
+            assert_eq!(erate, rate as f32);
+            assert!(qpc <= qpc_100ns(), "the packet QPC is a past PC capture time");
+            if kind == 1 {
+                assert!(off >= start && off as u64 + n * align <= end as u64, "a packet never straddles the data end");
+            } else {
+                silent += 1;
+            }
+            if flags & 1 != 0 {
+                disc += 1;
+            } else if let Some(l) = last_end {
+                back = back.max(l.saturating_sub(pos));
+            }
+            last_end = Some(pos + n);
+            packets += 1;
+            frames += n;
+            unsafe { (*(cb.add(crossvm::CB_READ) as *const std::sync::atomic::AtomicI64)).fetch_add((n * align) as i64, std::sync::atomic::Ordering::SeqCst) };
+            let next = if r + 1 >= entries { 0 } else { r + 1 };
+            unsafe { (*(cb as *const std::sync::atomic::AtomicU32)).swap(next, std::sync::atomic::Ordering::SeqCst) };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let wall = (t.elapsed().as_secs_f64() * rate as f64) as u64;
+    println!("capture: {packets} packets, {frames} frames in {wall} wall frames, {silent} silent, {disc} discontinuities, device position step back {back}");
+    assert!(packets > 10, "the PC capture client delivers packets while started");
+    assert!(frames > wall / 4 && frames <= wall + rate as u64 / 5, "captured frames follow the PC capture clock");
+    assert_eq!(back, 0, "device positions advance by the packet frames");
+    let mut e = envelope(crossvm::STOP, object);
+    assert_eq!(send(&mut e), 0);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut e = envelope(crossvm::RESET, object);
+    assert_eq!(send(&mut e), 0);
+    let t = std::time::Instant::now();
+    while crossvm::stream_records(object).unwrap().2 == 0 && t.elapsed().as_secs() < 2 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(r32(wasapi::CAPTURE_QUEUE_READ), r32(wasapi::CAPTURE_QUEUE_WRITE), "Reset drops unread packets");
+    let mut e = envelope(crossvm::RELEASE_OBJECT, object);
+    assert_eq!(send(&mut e), 0);
+    capture_stall(dev, &mix);
+    capture_period(dev, &mix);
+}
+
+fn capture_queue(object: u32) -> (*mut u8, usize, u32, u32, u32) {
+    let (base, _, _, _, _) = crossvm::stream_info(object).unwrap();
+    let cb = base as *mut u8;
+    let r32 = |o: usize| unsafe { (cb.add(o) as *const u32).read_volatile() };
+    let c = crossvm::CB_CONFIG;
+    (cb, r32(c + crossvm::CFG_QUEUE) as usize, r32(c + crossvm::CFG_ENTRIES), r32(c + crossvm::CFG_DATA_START), r32(c + crossvm::CFG_DATA_END))
+}
+
+fn capture_drain(cb: *mut u8, queue: usize, entries: u32, align: u64) -> Vec<(u32, u32, u32, u64)> {
+    let r32 = |o: usize| unsafe { (cb.add(o) as *const u32).read_volatile() };
+    let mut out = Vec::new();
+    loop {
+        let r = r32(console_sandbox::wasapi::CAPTURE_QUEUE_READ);
+        if r == r32(console_sandbox::wasapi::CAPTURE_QUEUE_WRITE) {
+            return out;
+        }
+        let ent = queue + r as usize * console_sandbox::wasapi::CAPTURE_ENTRY;
+        let n = r32(ent + 0x38) as u64;
+        out.push((r32(ent + 4), r32(ent + 8), r32(ent + 0x34), n));
+        unsafe { (*(cb.add(crossvm::CB_READ) as *const std::sync::atomic::AtomicI64)).fetch_add((n * align) as i64, std::sync::atomic::Ordering::SeqCst) };
+        let next = if r + 1 >= entries { 0 } else { r + 1 };
+        unsafe { (*(cb as *const std::sync::atomic::AtomicU32)).swap(next, std::sync::atomic::Ordering::SeqCst) };
+    }
+}
+
+fn capture_stall(dev: u32, mix: &[u8]) {
+    let align = u16::from_le_bytes([mix[0xc], mix[0xd]]) as u64;
+    let (hr, e) = create(2, 0, dev, 0x2f, &[]);
+    assert_eq!(hr, 0);
+    let object = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::INITIALIZE, object);
+    e[0x18..0x20].copy_from_slice(&1_000_000i64.to_le_bytes());
+    e[0x28..0x28 + mix.len()].copy_from_slice(mix);
+    assert_eq!(send(&mut e), 0);
+    let (cb, queue, entries, start, end) = capture_queue(object);
+    let r32 = |o: usize| unsafe { (cb.add(o) as *const u32).read_volatile() };
+    let mut e = envelope(crossvm::START, object);
+    assert_eq!(send(&mut e), 0);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let (r, w) = (r32(console_sandbox::wasapi::CAPTURE_QUEUE_READ), r32(console_sandbox::wasapi::CAPTURE_QUEUE_WRITE));
+    let queued = (w + entries - r) % entries;
+    let mut ranges = Vec::new();
+    let mut i = r;
+    while i != w {
+        let ent = queue + i as usize * console_sandbox::wasapi::CAPTURE_ENTRY;
+        if r32(ent + 8) == 1 {
+            let off = r32(ent + 4) as u64;
+            ranges.push((off, off + r32(ent + 0x38) as u64 * align));
+        }
+        i = if i + 1 >= entries { 0 } else { i + 1 };
+    }
+    ranges.sort();
+    println!("stalled 400 ms: {queued} packets queued of {} slots, {} data ranges in [{start:#x}, {end:#x})", entries - 1, ranges.len());
+    assert!(queued <= entries - 1, "the queue never fills past capacity - 1");
+    assert!(queued > 0);
+    for (lo, hi) in &ranges {
+        assert!(*lo >= start as u64 && *hi <= end as u64, "every queued packet lies inside the data region");
+    }
+    for p in ranges.windows(2) {
+        assert!(p[0].1 <= p[1].0, "no two unread packets overlap");
+    }
+    let first = capture_drain(cb, queue, entries, align);
+    assert_eq!(first.len() as u32, queued);
+    let t = std::time::Instant::now();
+    let mut after = Vec::new();
+    while after.is_empty() && t.elapsed().as_secs() < 2 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        after = capture_drain(cb, queue, entries, align);
+    }
+    println!("first packet after the stall: flags {:#x}", after[0].2);
+    assert_eq!(after[0].2 & 1, 1, "the first packet after host drops carries DATA_DISCONTINUITY");
+    let mut e = envelope(crossvm::STOP, object);
+    assert_eq!(send(&mut e), 0);
+    let mut e = envelope(crossvm::RELEASE_OBJECT, object);
+    assert_eq!(send(&mut e), 0);
+}
+
+fn capture_period(dev: u32, mix: &[u8]) {
+    let align = u16::from_le_bytes([mix[0xc], mix[0xd]]) as u64;
+    let mut e = envelope(crossvm::GET_SHARED_MODE_ENGINE_PERIOD, dev);
+    e[0x10..0x10 + mix.len()].copy_from_slice(mix);
+    assert_eq!(send(&mut e), 0);
+    let (def, min) = (u32_at(&e, 0x58), u32_at(&e, 0x60));
+    let (hr, e) = create(2, 0, dev, 0x2f, &[]);
+    assert_eq!(hr, 0);
+    let object = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::INITIALIZE_SHARED_AUDIO_STREAM, object);
+    e[0x10..0x10 + mix.len()].copy_from_slice(mix);
+    e[0x10 + crossvm::SHARED_INIT_PERIOD..0x14 + crossvm::SHARED_INIT_PERIOD].copy_from_slice(&min.to_le_bytes());
+    assert_eq!(send(&mut e), 0, "0x0f on the capture endpoint goes through PC IAudioClient3::InitializeSharedAudioStream");
+    let (cb, queue, entries, _, _) = capture_queue(object);
+    let mut e = envelope(crossvm::START, object);
+    assert_eq!(send(&mut e), 0);
+    let t = std::time::Instant::now();
+    let mut got = Vec::new();
+    while t.elapsed().as_millis() < 500 {
+        got.extend(capture_drain(cb, queue, entries, align));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let mut e = envelope(crossvm::STOP, object);
+    assert_eq!(send(&mut e), 0);
+    let mut sizes: Vec<u64> = got.iter().map(|p| p.3).collect();
+    sizes.sort();
+    let median = sizes.get(sizes.len() / 2).copied().unwrap_or(0);
+    println!("capture engine periods default {def} min {min}; 0x0f({min}) packets {} median {median} frames", got.len());
+    assert!(!got.is_empty());
+    assert_eq!(median, min as u64, "PC capture packets follow the period requested through 0x0f");
+    let mut e = envelope(crossvm::RELEASE_OBJECT, object);
+    assert_eq!(send(&mut e), 0);
 }

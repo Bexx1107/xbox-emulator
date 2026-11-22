@@ -1025,6 +1025,9 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
         }
         spray(0);
         let _ = smear(0);
+        if std::env::var("TOMBOX_DCC_UNDEF_WHY").is_ok() {
+            println!("undef-why case {id}");
+        }
         let (nat, u) = native_masked(nd, ne, &c);
         if nat.hr != 0 {
             if !c.enc && crate::dcc::dec::last_unmodeled() {

@@ -1,11 +1,34 @@
 pub const TB_CBRAW_SPACE: u32 = 4_100_000;
 const MAX_TITLE_SPACE: u32 = 100_000;
 
+pub fn space_base() -> u32 {
+    static B: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *B.get_or_init(|| base_from(std::env::var("TOMBOX_CBRAW_SPACE").ok().as_deref()))
+}
+
+fn base_from(v: Option<&str>) -> u32 {
+    v.and_then(|s| s.trim().parse::<u32>().ok()).filter(|b| *b >= MAX_TITLE_SPACE && b.checked_add(MAX_TITLE_SPACE).is_some_and(|e| e <= 4_000_000)).unwrap_or(TB_CBRAW_SPACE)
+}
+
 pub fn map_space(space: u32) -> Result<u32, String> {
     if space >= MAX_TITLE_SPACE {
         return Err(format!("register space {space} is above the {MAX_TITLE_SPACE} spaces reserved for constant buffers"));
     }
-    Ok(TB_CBRAW_SPACE + space)
+    Ok(space_base() + space)
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+
+    #[test]
+    fn space_base_knob_accepts_only_free_ranges() {
+        assert_eq!(base_from(None), TB_CBRAW_SPACE);
+        assert_eq!(base_from(Some("100000")), 100_000);
+        assert_eq!(base_from(Some("5")), TB_CBRAW_SPACE);
+        assert_eq!(base_from(Some("3950000")), TB_CBRAW_SPACE);
+        assert_eq!(base_from(Some("x")), TB_CBRAW_SPACE);
+    }
 }
 
 fn ident(c: u8) -> bool {

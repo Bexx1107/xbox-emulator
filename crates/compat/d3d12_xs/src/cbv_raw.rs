@@ -23,16 +23,72 @@ static PREV_RS: AtomicUsize = AtomicUsize::new(0);
 static PREV_CBV: AtomicUsize = AtomicUsize::new(0);
 static REAL_ROOT_SRV: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
-pub fn enabled() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Auto,
+    On,
+    Off,
+}
+
+pub fn parse_mode(v: Option<&str>) -> Result<Mode, String> {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("auto") => Ok(Mode::Auto),
+        Some("1") | Some("on") => Ok(Mode::On),
+        Some("0") | Some("off") => Ok(Mode::Off),
+        Some(other) => Err(format!("cbv_raw={other:?} is not one of auto, on, off, 1, 0; using auto")),
+    }
+}
+
+pub fn mode_setting(cbv_raw: Option<String>, cbraw: Option<String>, cfg: Option<String>) -> Option<String> {
+    cbv_raw.or(cbraw).or(cfg)
+}
+
+pub fn mode() -> Mode {
+    static M: OnceLock<Mode> = OnceLock::new();
+    *M.get_or_init(|| {
+        let raw = mode_setting(std::env::var("TOMBOX_CBV_RAW").ok(), std::env::var("TOMBOX_CBRAW").ok(), compat_common::cfg("cbv_raw"));
+        parse_mode(raw.as_deref()).unwrap_or_else(|e| {
+            record("d3d12_xs", "cbv_raw", &e);
+            Mode::Auto
+        })
+    })
+}
+
+pub fn xbox_one_title() -> bool {
+    static X: OnceLock<bool> = OnceLock::new();
+    *X.get_or_init(|| {
         extern "system" {
             fn GetModuleHandleW(n: *const u16) -> *mut c_void;
         }
         let name: Vec<u16> = "d3d12_x.dll".encode_utf16().chain(Some(0)).collect();
-        let on = !unsafe { GetModuleHandleW(name.as_ptr()) }.is_null();
+        !unsafe { GetModuleHandleW(name.as_ptr()) }.is_null()
+    })
+}
+
+pub fn shader_kind_refusal(xbox_one: bool, durango: bool) -> Option<&'static str> {
+    (xbox_one && !durango).then_some("Xbox One title shader is not a Durango program")
+}
+
+pub fn enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        let mode = mode();
+        let xbox_one = xbox_one_title();
+        let on = match mode {
+            Mode::Auto => xbox_one,
+            Mode::On => true,
+            Mode::Off => false,
+        };
+        let why = match (mode, xbox_one) {
+            (Mode::Auto, _) => "Xbox One title (d3d12_x.dll loaded)",
+            (Mode::On, _) => "cbv_raw=on",
+            (Mode::Off, true) => "cbv_raw=off on an Xbox One title (d3d12_x.dll loaded)",
+            (Mode::Off, false) => "cbv_raw=off",
+        };
         if on {
-            record("d3d12_xs", "cbv_raw", &format!("Xbox One title (d3d12_x.dll loaded): constant buffers are bound as raw SRVs in space {TB_CBRAW_SPACE}+n so a CBV may start at any 16-byte-aligned address like on the console"));
+            record("d3d12_xs", "cbv_raw", &format!("{why}: constant buffers are bound as raw SRVs in space {}+n so a CBV may start at any 16-byte-aligned address like on the console", tombox_xshader::cbv_raw_hlsl::space_base()));
+        } else if mode == Mode::Off {
+            record("d3d12_xs", "cbv_raw", &format!("{why}: constant buffers stay PC CBVs (BufferLocation must be 256-byte aligned)"));
         }
         on
     })
@@ -292,6 +348,53 @@ pub fn parse_clamp(v: &str) -> Option<(u32, u32, Option<u64>)> {
     Some((a.trim().parse().ok()?, lim, only))
 }
 
+pub fn hoist_hashes() -> &'static Vec<u64> {
+    static S: OnceLock<Vec<u64>> = OnceLock::new();
+    S.get_or_init(|| std::env::var("TOMBOX_CBRAW_HOIST").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default())
+}
+
+pub fn hoist_const_loads(h: &str) -> (String, usize) {
+    let Some(at) = h.find("uint tb_pc = 0u;") else { return (h.to_string(), 0) };
+    let ls = h[..at].rfind('\n').map_or(0, |x| x + 1);
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut out = String::with_capacity(h.len());
+    let mut i = 0;
+    while i < h.len() {
+        if h[i..].starts_with("tb_cbr") {
+            let ns = i + 6;
+            let ne = ns + h[ns..].bytes().take_while(|c| c.is_ascii_digit()).count();
+            let rest = &h[ne..];
+            if ne > ns && rest.starts_with(".Load4((") {
+                let ds = ne + 8;
+                let de = ds + h[ds..].bytes().take_while(|c| c.is_ascii_digit()).count();
+                if de > ds && h[de..].starts_with(") * 16u)") && i >= ls {
+                    let slot = &h[ns..ne];
+                    let idx = &h[ds..de];
+                    let name = format!("tb_h{slot}_{idx}");
+                    if !seen.iter().any(|(n, _)| *n == name) {
+                        seen.push((name.clone(), format!("tb_cbr{slot}.Load4(({idx}) * 16u)")));
+                    }
+                    out.push_str(&name);
+                    i = de + 8;
+                    continue;
+                }
+            }
+        }
+        let c = h[i..].chars().next().unwrap();
+        out.push(c);
+        i += c.len_utf8();
+    }
+    if seen.is_empty() {
+        return (h.to_string(), 0);
+    }
+    let decl: String = seen.iter().map(|(n, e)| format!("    uint4 {n} = {e};\n")).collect();
+    let mut r = String::with_capacity(out.len() + decl.len());
+    r.push_str(&out[..ls]);
+    r.push_str(&decl);
+    r.push_str(&out[ls..]);
+    (r, seen.len())
+}
+
 pub fn clamp_reads(h: &str, slot: u32, lim: u32) -> String {
     let decl = format!("ByteAddressBuffer tb_cbr{slot} : register(");
     let Some(at) = h.find(&decl) else { return h.to_string() };
@@ -474,6 +577,73 @@ pub fn install_draw_check(xbox_vt: &[AtomicUsize]) {
 mod tests {
     use super::*;
     use crate::gpu_va::Entry;
+
+    #[test]
+    fn hoist_moves_constant_raw_loads_before_the_dispatcher() {
+        let h = "ByteAddressBuffer tb_cbr13 : register(t13, space4100000);
+void main() {
+    uint a = tb_cbr13.Load4((3) * 16u).x;
+    uint tb_pc = 0u; uint tb_guard = 0u;
+    while (tb_pc != 9u) {
+    uint b = tb_cbr13.Load4((5) * 16u).y + tb_cbr13.Load4((5) * 16u).z;
+    uint c = tb_cbr13.Load4((t1) * 16u).w;
+    }
+}
+";
+        let (o, n) = hoist_const_loads(h);
+        assert_eq!(n, 1, "{o}");
+        assert!(o.contains("    uint4 tb_h13_5 = tb_cbr13.Load4((5) * 16u);
+    uint tb_pc = 0u;"), "{o}");
+        assert!(o.contains("uint b = tb_h13_5.y + tb_h13_5.z;"), "{o}");
+        assert!(o.contains("uint a = tb_cbr13.Load4((3) * 16u).x;"), "{o}");
+        assert!(o.contains("tb_cbr13.Load4((t1) * 16u).w"), "{o}");
+        assert_eq!(hoist_const_loads("void f() {}
+").1, 0);
+    }
+
+    #[test]
+    fn root_signature_built_from_a_shader_gets_the_raw_rebind() {
+        let body = rts0(2, &[[2, 1, 0, 0]], true);
+        let plain = crate::device_wrap::shader_root_container(&body, false);
+        let raw = crate::device_wrap::shader_root_container(&body, true);
+        let cbvs = |b: &[u8]| root_cbv_params(b).len();
+        assert_eq!(cbvs(&plain), 1);
+        assert_eq!(cbvs(&raw), 0);
+        let (o, n) = crate::console_slots_mesh::rts0_range(&raw).unwrap();
+        let r = &raw[o..o + n];
+        let po = u32::from_le_bytes(r[8..12].try_into().unwrap()) as usize;
+        let last = po + 12;
+        assert_eq!(u32::from_le_bytes(r[last..last + 4].try_into().unwrap()), PARAM_SRV);
+    }
+
+    #[test]
+    fn cbv_raw_mode_setting_is_validated() {
+        assert_eq!(parse_mode(None), Ok(Mode::Auto));
+        assert_eq!(parse_mode(Some("")), Ok(Mode::Auto));
+        assert_eq!(parse_mode(Some("auto")), Ok(Mode::Auto));
+        assert_eq!(parse_mode(Some(" ON ")), Ok(Mode::On));
+        assert_eq!(parse_mode(Some("1")), Ok(Mode::On));
+        assert_eq!(parse_mode(Some("off")), Ok(Mode::Off));
+        assert_eq!(parse_mode(Some("0")), Ok(Mode::Off));
+        assert!(parse_mode(Some("yes")).is_err());
+    }
+
+    #[test]
+    fn cbv_raw_wins_over_the_cbraw_alias_then_cfg() {
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(mode_setting(s("off"), s("1"), s("on")), s("off"));
+        assert_eq!(mode_setting(None, s("1"), s("off")), s("1"));
+        assert_eq!(mode_setting(None, None, s("auto")), s("auto"));
+        assert_eq!(mode_setting(None, None, None), None);
+    }
+
+    #[test]
+    fn only_xbox_one_titles_require_durango_programs() {
+        assert_eq!(shader_kind_refusal(true, true), None);
+        assert!(shader_kind_refusal(true, false).is_some());
+        assert_eq!(shader_kind_refusal(false, false), None);
+        assert_eq!(shader_kind_refusal(false, true), None);
+    }
 
     #[test]
     fn clamp_knob_takes_an_optional_shader_scope() {

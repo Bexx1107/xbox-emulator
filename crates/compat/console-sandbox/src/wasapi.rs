@@ -17,6 +17,9 @@ const IID_IAUDIO_SESSION_CONTROL2: Guid = Guid { data1: 0xBFB7FF88, data2: 0x723
 const IID_ISPATIAL_AUDIO_CLIENT: Guid = Guid { data1: 0xBBF8E066, data2: 0xAAAA, data3: 0x49BE, data4: [0x9A, 0x4D, 0xFD, 0x2A, 0x85, 0x8E, 0xA2, 0x7F] };
 const IID_ISPATIAL_AUDIO_CLIENT2: Guid = Guid { data1: 0xCAABE452, data2: 0xA66A, data3: 0x4BEE, data4: [0xA9, 0x3E, 0xE3, 0x20, 0x46, 0x3F, 0x6A, 0x53] };
 const IID_IAUDIO_CLOCK: Guid = Guid { data1: 0xCD63314F, data2: 0x3FBA, data3: 0x4A1B, data4: [0x81, 0x2C, 0xEF, 0x96, 0x35, 0x87, 0x28, 0xE7] };
+const IID_IAUDIO_CAPTURE_CLIENT: Guid = Guid { data1: 0xC8ADBD64, data2: 0xE71E, data3: 0x48A0, data4: [0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17] };
+const IID_IMM_ENDPOINT: Guid = Guid { data1: 0x1BE09788, data2: 0x6894, data3: 0x4089, data4: [0x85, 0x86, 0x9A, 0x2A, 0x6C, 0x26, 0x5A, 0xC5] };
+const IID_CLIENT_ITEM_SERVICE: Guid = Guid { data1: 0xD19F8E95, data2: 0xB126, data3: 0x4446, data4: [0x89, 0x0C, 0x5D, 0xCB, 0x7A, 0xD7, 0x14, 0x53] };
 const IID_IAUDIO_CLOCK_ADJUSTMENT: Guid = Guid { data1: 0xF6E4C0A0, data2: 0x46D9, data3: 0x4FB8, data4: [0xBE, 0x21, 0x57, 0xA3, 0xEF, 0x2B, 0x62, 0x6C] };
 pub const STREAMFLAGS_RATEADJUST: u32 = 0x0010_0000;
 pub const AUDIO_CATEGORIES: u32 = 12;
@@ -354,6 +357,7 @@ pub enum Prop {
     Text(Vec<u16>),
     Dword(u32),
     Serialized(u16, Vec<u8>),
+    Vector(u16, u32, Vec<u8>),
 }
 
 unsafe fn property_store(id: Option<&str>) -> Result<Com, i32> {
@@ -416,6 +420,43 @@ pub fn property_value(id: Option<&str>, key: &PropertyKey) -> Result<Option<Prop
                 let cb = v.a as u32 as usize;
                 let p = v.b as *const u8;
                 Some(Prop::Serialized(65, if p.is_null() { Vec::new() } else { core::slice::from_raw_parts(p, cb).to_vec() }))
+            }
+            72 => {
+                let p = v.a as *const u8;
+                Some(Prop::Serialized(72, if p.is_null() { vec![0; 16] } else { core::slice::from_raw_parts(p, 16).to_vec() }))
+            }
+            30 => {
+                let p = v.a as *const u8;
+                let mut n = 0;
+                while !p.is_null() && *p.add(n) != 0 {
+                    n += 1;
+                }
+                let mut b = if p.is_null() { Vec::new() } else { core::slice::from_raw_parts(p, n).to_vec() };
+                b.push(0);
+                Some(Prop::Serialized(30, b))
+            }
+            t if t & 0x1000 != 0 => {
+                let count = v.a as u32;
+                let p = v.b as *const u8;
+                match (t & 0xfff, scalar_size(t & 0xfff)) {
+                    (_, Some(n)) => Some(Prop::Vector(t, count, if p.is_null() { Vec::new() } else { core::slice::from_raw_parts(p, n * count as usize).to_vec() })),
+                    (31, None) => {
+                        let mut b = Vec::new();
+                        for i in 0..count as usize {
+                            let w = *(p as *const *const u16).add(i);
+                            let mut n = 0;
+                            while !w.is_null() && *w.add(n) != 0 {
+                                n += 1;
+                            }
+                            if !w.is_null() {
+                                b.extend(core::slice::from_raw_parts(w, n).iter().flat_map(|c| c.to_le_bytes()));
+                            }
+                            b.extend_from_slice(&[0, 0]);
+                        }
+                        Some(Prop::Vector(t, count, b))
+                    }
+                    _ => None,
+                }
             }
             t => scalar_size(t).map(|n| Prop::Serialized(t, v.a.to_le_bytes()[..n].to_vec())),
         };
@@ -747,6 +788,45 @@ impl Renderer {
             hr
         }
     }
+    unsafe fn item_service(&self) -> Result<Com, i32> {
+        let c = self.shared.client.load(Ordering::SeqCst) as *mut c_void;
+        if c.is_null() {
+            return Err(AUDCLNT_E_NOT_INITIALIZED);
+        }
+        let mut svc = core::ptr::null_mut();
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(c, 14)(c, &IID_CLIENT_ITEM_SERVICE, &mut svc);
+        if hr < 0 { Err(hr) } else { Ok(Com(svc)) }
+    }
+    pub fn item_count(&self) -> Result<u32, i32> {
+        unsafe {
+            let svc = self.item_service()?;
+            let mut n = 0u32;
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(svc.0, 3)(svc.0, &mut n);
+            if hr < 0 { Err(hr) } else { Ok(n) }
+        }
+    }
+    pub fn item_flag(&self) -> Result<bool, i32> {
+        unsafe {
+            let svc = self.item_service()?;
+            let mut b = 0i32;
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut i32) -> i32>(svc.0, 5)(svc.0, &mut b);
+            if hr < 0 { Err(hr) } else { Ok(b != 0) }
+        }
+    }
+    pub fn item_value(&self, index: u32) -> Result<u32, i32> {
+        unsafe {
+            let svc = self.item_service()?;
+            let mut ch = core::ptr::null_mut();
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32>(svc.0, 4)(svc.0, index, &mut ch);
+            if hr < 0 {
+                return Err(hr);
+            }
+            let ch = Com(ch);
+            let mut v = 0u32;
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(ch.0, 3)(ch.0, &mut v);
+            if hr < 0 { Err(hr) } else { Ok(v) }
+        }
+    }
     pub fn current_rate(&self) -> f32 {
         f32::from_bits(self.shared.rate.load(Ordering::SeqCst))
     }
@@ -947,4 +1027,230 @@ unsafe fn pump(c: *mut c_void, rc: *mut c_void, frames: u32, ring: &Ring, align:
     slot::<unsafe extern "system" fn(*mut c_void, u32, u32) -> i32>(rc, 4)(rc, n as u32, 0);
     let _ = ring.read_pos().compare_exchange(r, r + total as i64, Ordering::AcqRel, Ordering::Acquire);
     s.rendered.fetch_add(total as i64, Ordering::SeqCst);
+}
+
+pub const CAPTURE_QUEUE_READ: usize = 0;
+pub const CAPTURE_QUEUE_WRITE: usize = 4;
+pub const CAPTURE_ENTRY: usize = 0x40;
+pub const CAPTURE_KIND_DATA: u32 = 1;
+pub const CAPTURE_KIND_SILENT: u32 = 2;
+pub const CAPTURE_DISCONTINUITY: u32 = 1;
+pub const CAPTURE_TIMESTAMP_ERROR: u32 = 4;
+const BUFFERFLAGS_SILENT: u32 = 2;
+
+pub fn device_flow(id: Option<&str>) -> Result<u32, i32> {
+    unsafe {
+        let dev = device(id)?;
+        let mut ep = core::ptr::null_mut();
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(dev.0, 0)(dev.0, &IID_IMM_ENDPOINT, &mut ep);
+        if hr < 0 {
+            return Err(hr);
+        }
+        let ep = Com(ep);
+        let mut flow = 0u32;
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(ep.0, 3)(ep.0, &mut flow);
+        if hr < 0 { Err(hr) } else { Ok(flow) }
+    }
+}
+
+pub struct CaptureQueue {
+    pub base: usize,
+    pub queue: usize,
+    pub entries: u32,
+}
+
+impl CaptureQueue {
+    fn index(&self, o: usize) -> &AtomicU32 {
+        unsafe { &*((self.base + o) as *const AtomicU32) }
+    }
+    fn next(&self, i: u32) -> u32 {
+        if i + 1 >= self.entries { 0 } else { i + 1 }
+    }
+    fn entry(&self, i: u32) -> *mut u8 {
+        (self.base + self.queue + i as usize * CAPTURE_ENTRY) as *mut u8
+    }
+    pub fn drop_unread(&self) {
+        let r = self.index(CAPTURE_QUEUE_READ).load(Ordering::Acquire);
+        self.index(CAPTURE_QUEUE_WRITE).swap(r, Ordering::AcqRel);
+    }
+    fn oldest_offset(&self) -> Option<u32> {
+        let mut r = self.index(CAPTURE_QUEUE_READ).load(Ordering::Acquire);
+        let w = self.index(CAPTURE_QUEUE_WRITE).load(Ordering::Acquire);
+        while r != w {
+            let e = self.entry(r);
+            unsafe {
+                if (e.add(8) as *const u32).read_volatile() != CAPTURE_KIND_SILENT {
+                    return Some((e.add(4) as *const u32).read_volatile());
+                }
+            }
+            r = self.next(r);
+        }
+        None
+    }
+    fn place(&self, ring: &Ring, at: u32, bytes: u32) -> Option<u32> {
+        let at = if at + bytes > ring.end { ring.start } else { at };
+        if at + bytes > ring.end {
+            return None;
+        }
+        match self.oldest_offset() {
+            None => Some(at),
+            Some(old) if at <= old && at + bytes <= old => Some(at),
+            Some(old) if at > old && at + bytes <= ring.end => Some(at),
+            _ => None,
+        }
+    }
+    pub unsafe fn post(&self, ring: &Ring, at: &mut u32, data: Option<&[u8]>, frames: u32, devpos: u64, qpc: u64, rate: f32, flags: u32) -> bool {
+        let w = self.index(CAPTURE_QUEUE_WRITE).load(Ordering::Acquire);
+        let n = self.next(w);
+        if n == self.index(CAPTURE_QUEUE_READ).load(Ordering::Acquire) {
+            return false;
+        }
+        let (kind, off) = match data {
+            Some(d) => {
+                let Some(off) = self.place(ring, *at, d.len() as u32) else {
+                    return false;
+                };
+                core::ptr::copy_nonoverlapping(d.as_ptr(), (ring.base + off as usize) as *mut u8, d.len());
+                *at = off + d.len() as u32;
+                (CAPTURE_KIND_DATA, off)
+            }
+            None => (CAPTURE_KIND_SILENT, *at),
+        };
+        let e = self.entry(w);
+        core::ptr::write_bytes(e, 0, CAPTURE_ENTRY);
+        (e as *mut u32).write_volatile(1);
+        (e.add(4) as *mut u32).write_volatile(off);
+        (e.add(8) as *mut u32).write_volatile(kind);
+        (e.add(0x10) as *mut u64).write_volatile(devpos);
+        (e.add(0x18) as *mut u64).write_volatile(devpos);
+        (e.add(0x28) as *mut u64).write_volatile(qpc);
+        (e.add(0x30) as *mut f32).write_volatile(rate);
+        (e.add(0x34) as *mut u32).write_volatile(flags);
+        (e.add(0x38) as *mut u32).write_volatile(frames);
+        self.index(CAPTURE_QUEUE_WRITE).swap(n, Ordering::AcqRel);
+        ring.write_pos().fetch_add(frames as i64 * ring.align as i64, Ordering::AcqRel);
+        true
+    }
+}
+
+pub fn open_capture(o: Open, ring: Ring, queue: CaptureQueue) -> Result<(Renderer, u32), i32> {
+    let shared = Arc::new(Shared::default());
+    let (tx, rx) = std::sync::mpsc::channel::<Result<u32, i32>>();
+    let s2 = shared.clone();
+    let t = std::thread::spawn(move || unsafe { run_capture(o, ring, queue, s2, tx) });
+    match rx.recv() {
+        Ok(Ok(frames)) => Ok((Renderer { shared, thread: Some(t) }, frames)),
+        Ok(Err(hr)) => {
+            let _ = t.join();
+            Err(hr)
+        }
+        Err(_) => Err(-2147467259),
+    }
+}
+
+unsafe fn run_capture(o: Open, ring: Ring, q: CaptureQueue, s: Arc<Shared>, tx: std::sync::mpsc::Sender<Result<u32, i32>>) {
+    let c = match client(o.device.as_deref()) {
+        Ok(c) => c,
+        Err(hr) => {
+            let _ = tx.send(Err(hr));
+            return;
+        }
+    };
+    if let Some(p) = o.properties {
+        let props = [16u32, p[0], p[1], p[2]];
+        slot::<unsafe extern "system" fn(*mut c_void, *const u32) -> i32>(c.0, 16)(c.0, props.as_ptr());
+    }
+    let flags = o.flags & STREAMFLAGS_RATEADJUST;
+    let hr = match o.period_frames {
+        Some(p) => {
+            let mut c3 = core::ptr::null_mut();
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(c.0, 0)(c.0, &IID_IAUDIO_CLIENT3, &mut c3);
+            if hr < 0 {
+                let _ = tx.send(Err(hr));
+                return;
+            }
+            let c3 = Com(c3);
+            slot::<unsafe extern "system" fn(*mut c_void, u32, u32, *const u8, *const Guid) -> i32>(c3.0, 20)(c3.0, flags, p, o.format.as_ptr(), &o.session)
+        }
+        None => slot::<unsafe extern "system" fn(*mut c_void, u32, u32, i64, i64, *const u8, *const Guid) -> i32>(c.0, 3)(c.0, SHARED, AUTOCONVERT | flags, o.duration, 0, o.format.as_ptr(), &o.session),
+    };
+    if hr < 0 {
+        let _ = tx.send(Err(hr));
+        return;
+    }
+    let mut frames = 0u32;
+    slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(c.0, 4)(c.0, &mut frames);
+    let mut lat = 0i64;
+    slot::<unsafe extern "system" fn(*mut c_void, *mut i64) -> i32>(c.0, 5)(c.0, &mut lat);
+    s.latency.store(lat, Ordering::SeqCst);
+    let (mut dp, mut mp) = (0i64, 0i64);
+    slot::<unsafe extern "system" fn(*mut c_void, *mut i64, *mut i64) -> i32>(c.0, 9)(c.0, &mut dp, &mut mp);
+    s.period.store(dp.max(10_000), Ordering::SeqCst);
+    let mut cc = core::ptr::null_mut();
+    let hr = slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(c.0, 14)(c.0, &IID_IAUDIO_CAPTURE_CLIENT, &mut cc);
+    if hr < 0 {
+        let _ = tx.send(Err(hr));
+        return;
+    }
+    let cc = Com(cc);
+    let nominal = sample_rate(&o.format) as f32;
+    s.rate.store(nominal.to_bits(), Ordering::SeqCst);
+    s.client.store(c.0 as usize, Ordering::SeqCst);
+    let _ = tx.send(Ok(frames));
+    let align = ring.align.max(1) as usize;
+    let rate = sample_rate(&o.format).max(1) as i64;
+    let tick = ((frames as i64 * 1000 / rate) / 4).clamp(1, 10) as u32;
+    let mut playing = false;
+    let mut at = ring.start;
+    let mut lost = false;
+    while !s.quit.load(Ordering::SeqCst) {
+        let want = s.running.load(Ordering::SeqCst);
+        if s.reset.swap(false, Ordering::SeqCst) {
+            if playing {
+                slot::<unsafe extern "system" fn(*mut c_void) -> i32>(c.0, 11)(c.0);
+                playing = false;
+            }
+            slot::<unsafe extern "system" fn(*mut c_void) -> i32>(c.0, 12)(c.0);
+            q.drop_unread();
+            at = ring.start;
+            lost = false;
+            s.rebases.fetch_add(1, Ordering::SeqCst);
+        }
+        if want != playing {
+            slot::<unsafe extern "system" fn(*mut c_void) -> i32>(c.0, if want { 10 } else { 11 })(c.0);
+            playing = want;
+        }
+        let mut posted = false;
+        while playing {
+            let mut next = 0u32;
+            if slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(cc.0, 5)(cc.0, &mut next) < 0 || next == 0 {
+                break;
+            }
+            let (mut data, mut n, mut f, mut devpos, mut qpc) = (core::ptr::null_mut::<u8>(), 0u32, 0u32, 0u64, 0u64);
+            if slot::<unsafe extern "system" fn(*mut c_void, *mut *mut u8, *mut u32, *mut u32, *mut u64, *mut u64) -> i32>(cc.0, 3)(cc.0, &mut data, &mut n, &mut f, &mut devpos, &mut qpc) != 0 {
+                break;
+            }
+            let bytes = n as usize * align;
+            let payload = if f & BUFFERFLAGS_SILENT != 0 || data.is_null() { None } else { Some(core::slice::from_raw_parts(data, bytes)) };
+            let pf = (f & (CAPTURE_DISCONTINUITY | CAPTURE_TIMESTAMP_ERROR)) | if lost { CAPTURE_DISCONTINUITY } else { 0 };
+            if n != 0 && q.post(&ring, &mut at, payload, n, devpos, qpc, nominal, pf) {
+                lost = false;
+                posted = true;
+                s.records.fetch_add(1, Ordering::SeqCst);
+                s.rendered.fetch_add(bytes as i64, Ordering::SeqCst);
+            } else if n != 0 {
+                lost = true;
+            }
+            slot::<unsafe extern "system" fn(*mut c_void, u32) -> i32>(cc.0, 4)(cc.0, n);
+        }
+        if posted {
+            for &e in s.signal.lock().unwrap().iter() {
+                SetEvent(e as usize);
+            }
+            s.signals.fetch_add(1, Ordering::SeqCst);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(tick as u64));
+    }
+    slot::<unsafe extern "system" fn(*mut c_void) -> i32>(c.0, 11)(c.0);
+    s.client.store(0, Ordering::SeqCst);
 }

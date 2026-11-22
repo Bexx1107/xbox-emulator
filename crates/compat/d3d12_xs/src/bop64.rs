@@ -146,6 +146,10 @@ pub unsafe extern "system" fn write64(this: *mut c_void, va: u64, value: u64, fl
             return;
         }
         Plan::Write { eop, diagnostic } => {
+            static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+            if !FIRST.swap(true, Ordering::Relaxed) {
+                record("d3d12_xs", "bop64", &format!("first call {W}(va={va:#x}, value={value:#x}, flush={flush:#x}, flags={flags:#x}) list type {ty}: recorded as {:?}", eop.kind));
+            }
             if let Some(d) = diagnostic {
                 if once(16) {
                     record("d3d12_xs", "bop64", &format!("{W}(va={va:#x}, value={value:#x}, flush={flush:#x}, flags={flags:#x}): debug UMD reports \"{d}\"; the console UMD still emits the end-of-pipe packet it encodes ({eop:?}), emulated the same"));

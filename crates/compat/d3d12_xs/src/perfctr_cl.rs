@@ -531,6 +531,10 @@ pub unsafe extern "system" fn begin_counters_x(this: *mut c_void, set: *mut c_vo
     let ty = unsafe { crate::fill::list_type(this) };
     let closed = crate::cl2_state::title_closed(this);
     let begin_slot = if needs_clock && gpu_recordable(ty) && !closed { unsafe { record_begin(this) } } else { None };
+    static FIRST: AtomicBool = AtomicBool::new(false);
+    if !FIRST.swap(true, Ordering::Relaxed) {
+        record("d3d12_xs", "perfctr_cl", &format!("first call BeginCountersX({set:p}) list type {ty}: {} counters, clock begin {}", cells.len(), if begin_slot.is_some() { "recorded" } else { "not needed or not recordable" }));
+    }
     if needs_clock && begin_slot.is_none() && once(16) {
         record("d3d12_xs", "perfctr_cl", &format!("BeginCountersX({set:p}): no begin timestamp recorded (list type {ty}, closed {closed}); clock counters of this set will not be written"));
     }
@@ -589,6 +593,10 @@ pub unsafe extern "system" fn sample_counters_x(this: *mut c_void, dst: *mut c_v
         }
         return;
     };
+    static FIRST: AtomicBool = AtomicBool::new(false);
+    if !FIRST.swap(true, Ordering::Relaxed) {
+        record("d3d12_xs", "perfctr_cl", &format!("first call SampleCountersX({dst:p}, {offset:#x}) list type {ty}: {} counter writes recorded, {} without a PC source", writes.len(), missing.len()));
+    }
     unsafe { record_sample(this, dst, offset, b, &writes) };
 }
 

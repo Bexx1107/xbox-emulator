@@ -56,6 +56,11 @@ pub const SPATIAL_STREAM_AVAILABLE: u32 = 0x35;
 pub const FORMAT_ENUM_COUNT: u32 = 0x3a;
 pub const FORMAT_ENUM_GET: u32 = 0x3b;
 pub const CLOCK_SET_SAMPLE_RATE: u32 = 0x47;
+pub const ITEM_GET: u32 = 0x3c;
+pub const ITEM_COUNT: u32 = 0x3d;
+pub const ITEM_FLAG: u32 = 0x3e;
+pub const ITEM_VALUE: u32 = 0x3f;
+pub const ITEM_SERVICE_TYPE: u32 = 0xb;
 pub const ENDPOINT_REGISTER: u32 = 0x4f;
 pub const ENDPOINT_UNREGISTER: u32 = 0x50;
 pub const ENDPOINT_CHANNEL_COUNT: u32 = 0x51;
@@ -188,6 +193,7 @@ pub const KIND_NONE: u32 = 0;
 pub const KIND_CROSS_VM_EVENT: u32 = 2;
 pub const KIND_CROSS_VM_MEMORY: u32 = 3;
 
+pub const CLSID_CLIENT_INPUT_ENDPOINT: Guid = Guid { data1: 0xF64A6DA6, data2: 0xE8AF, data3: 0x4B7B, data4: [0xBC, 0xA8, 0x84, 0x7A, 0xE7, 0x65, 0xD5, 0x38] };
 pub const CLSID_CLIENT_OUTPUT_ENDPOINT: Guid = Guid { data1: 0xCD773740, data2: 0xB187, data3: 0x4974, data4: [0xA1, 0xD5, 0xE0, 0xFF, 0x91, 0x37, 0x22, 0x77] };
 pub const CLSID_XVM_EVENT: Guid = Guid { data1: 0x148EC3BF, data2: 0x349C, data3: 0x4EAC, data4: [0xB3, 0x73, 0x9F, 0xD5, 0x7C, 0xB4, 0x6D, 0x88] };
 pub const GUID_XVM_EVENT: Guid = Guid { data1: 0xA963C7E3, data2: 0x8A0A, data3: 0x45FA, data4: [0xBD, 0x23, 0xAA, 0x51, 0xE4, 0xCF, 0x85, 0x1E] };
@@ -660,6 +666,22 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
             }
             Err(hr) => hr,
         },
+        ITEM_GET | ITEM_COUNT | ITEM_FLAG | ITEM_VALUE => {
+            let s = state();
+            let Some(st) = stream_owner(&s, object).and_then(|k| s.objects.get(&k)).and_then(|o| o.stream.as_ref()) else {
+                return AUDCLNT_E_NOT_INITIALIZED;
+            };
+            let r = &st.renderer;
+            let index: u32 = rd(a, 0);
+            match id {
+                ITEM_COUNT => r.item_count().map(|n| wr(a, 0, n)),
+                ITEM_FLAG => r.item_flag().map(|b| wr(a, 0, b as u8)),
+                ITEM_GET => r.item_value(index).map(|_| ()),
+                _ => r.item_value(index).map(|v| wr(a, 4, v)),
+            }
+            .err()
+            .unwrap_or(S_OK)
+        }
         CLOCK_SET_SAMPLE_RATE => {
             let r: f32 = rd(a, 0);
             let s = state();
@@ -928,6 +950,16 @@ pub fn notifications_registered(object: u32) -> bool {
     state().objects.get(&object).map(|o| o.notify).unwrap_or(false)
 }
 
+pub fn serialized_prop(vt: u16, count: Option<u32>, bytes: &[u8]) -> Vec<u8> {
+    let mut d = vec![0u8; 8];
+    d[0..2].copy_from_slice(&vt.to_le_bytes());
+    if let Some(n) = count {
+        d[4..8].copy_from_slice(&n.to_le_bytes());
+    }
+    d.extend_from_slice(bytes);
+    d
+}
+
 unsafe fn property_value(object: u32, a: *mut u8) -> i32 {
     let mut key = wasapi::PropertyKey::default();
     core::ptr::copy_nonoverlapping(a, key.fmtid.as_mut_ptr(), 16);
@@ -941,12 +973,8 @@ unsafe fn property_value(object: u32, a: *mut u8) -> i32 {
         Some(wasapi::Prop::Empty) => (0, Vec::new()),
         Some(wasapi::Prop::Text(w)) => (1, w.iter().flat_map(|c| c.to_le_bytes()).collect()),
         Some(wasapi::Prop::Dword(d)) => (4, d.to_le_bytes().to_vec()),
-        Some(wasapi::Prop::Serialized(vt, bytes)) => {
-            let mut d = vec![0u8; 8];
-            d[0..2].copy_from_slice(&vt.to_le_bytes());
-            d.extend_from_slice(&bytes);
-            (3, d)
-        }
+        Some(wasapi::Prop::Serialized(vt, bytes)) => (3, serialized_prop(vt, None, &bytes)),
+        Some(wasapi::Prop::Vector(vt, count, bytes)) => (3, serialized_prop(vt, Some(count), &bytes)),
         None => {
             compat_common::record_raw("crossvm-audio", "property", "PC property type has no decoded guest serialisation; E_NOTIMPL");
             return E_NOTIMPL;
@@ -1234,7 +1262,13 @@ unsafe fn initialize(object: u32, a: *mut u8, room: usize, lay: &InitLayout) -> 
     write_control_block(base, &format, hns, &l);
     let ring = wasapi::Ring { base, start: l.start, end: l.end, align };
     let open = wasapi::Open { device: dev.clone(), format: format.clone(), duration: hns, session, properties: props, flags, period_frames: period };
-    let (renderer, device_frames) = match wasapi::open(open, ring) {
+    let capture = dev.is_some() && wasapi::device_flow(dev.as_deref()) == Ok(1);
+    let opened = if capture {
+        wasapi::open_capture(open, ring, wasapi::CaptureQueue { base, queue: l.queue as usize, entries: l.entries })
+    } else {
+        wasapi::open(open, ring)
+    };
+    let (renderer, device_frames) = match opened {
         Ok(r) => r,
         Err(hr) => {
             crate::logan::pool_release(index as usize);
@@ -1256,7 +1290,7 @@ unsafe fn initialize(object: u32, a: *mut u8, room: usize, lay: &InitLayout) -> 
     };
     core::ptr::write_bytes(a.add(lay.clsid), 0, lay.size - lay.clsid);
     core::ptr::copy_nonoverlapping(format.as_ptr(), a.add(lay.format), flen);
-    core::ptr::copy_nonoverlapping(guid_bytes(&CLSID_CLIENT_OUTPUT_ENDPOINT).as_ptr(), a.add(lay.clsid), 16);
+    core::ptr::copy_nonoverlapping(guid_bytes(if capture { &CLSID_CLIENT_INPUT_ENDPOINT } else { &CLSID_CLIENT_OUTPUT_ENDPOINT }).as_ptr(), a.add(lay.clsid), 16);
     wr(a, lay.event1, KIND_NONE);
     wr(a, lay.event2, KIND_NONE);
     write_event_descriptor(a.add(lay.event3), EVENT_KIND_GAMECORE, event_id as u16);
@@ -1264,7 +1298,7 @@ unsafe fn initialize(object: u32, a: *mut u8, room: usize, lay: &InitLayout) -> 
     core::ptr::copy_nonoverlapping(guid_bytes(&CLSID_XVM_BUFFER).as_ptr(), a.add(lay.memory + 4), 16);
     core::ptr::copy_nonoverlapping(guid_bytes(&GUID_XVM_BUFFER).as_ptr(), a.add(lay.memory + 0x14), 16);
     wr(a, lay.memory + 0x24, index as u32);
-    compat_common::record_raw("crossvm-audio", "Initialize", &format!("object {object:#x}: {frames} frames ({} bytes) at pool page {index}, WASAPI buffer {device_frames} frames, period {period:?}, flags {flags:#x}, period event {name}", l.bytes));
+    compat_common::record_raw("crossvm-audio", "Initialize", &format!("object {object:#x}: {frames} frames ({} bytes) at pool page {index}, WASAPI buffer {device_frames} frames, period {period:?}, flags {flags:#x}, period event {name}, {}", l.bytes, if capture { "capture" } else { "render" }));
     let mut s = state();
     s.session.get_or_insert(session);
     if let Some(o) = s.objects.get_mut(&object) {

@@ -70,6 +70,10 @@ pub fn title_dir(title: &str) -> PathBuf {
     root().join("titles").join(title)
 }
 
+pub fn runtime_mode_path(title: &str) -> PathBuf {
+    title_dir(title).join("runtime_mode.txt")
+}
+
 pub fn src_dir(title: &str) -> PathBuf {
     title_dir(title).join("src")
 }
