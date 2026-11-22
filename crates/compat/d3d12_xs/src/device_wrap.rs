@@ -41,6 +41,8 @@ const DEVICE_IIDS: [Guid; 9] = [
     Guid { d1: 0x9218_e6bb, d2: 0xf944, d3: 0x4f7e, d4: [0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3] }, // Device8
 ];
 
+const IID_XSX_DEVICE8: Guid = Guid { d1: 0x728f1fa2, d2: 0xea11, d3: 0x4a9f, d4: [0x9b, 0x52, 0x9b, 0x42, 0xa4, 0x84, 0xd5, 0xc9] };
+
 fn is_device_iid(g: &Guid) -> bool {
     DEVICE_IIDS.iter().any(|d| d == g)
 }
@@ -69,7 +71,7 @@ unsafe extern "system" fn qi(this: *mut DeviceWrapper, riid: *const Guid, ppv: *
     }
     unsafe { *ppv = core::ptr::null_mut() };
     let g = unsafe { &*riid };
-    if is_device_iid(g) || *g == IID_IUNKNOWN {
+    if is_device_iid(g) || *g == IID_IUNKNOWN || *g == IID_XSX_DEVICE8 {
         unsafe {
             *ppv = this as *mut c_void;
             (*this).refs.fetch_add(1, Ordering::SeqCst);
@@ -2106,4 +2108,20 @@ pub(crate) fn wrapper_qi(real: *mut c_void, riid: *const Guid, ppv: *mut *mut c_
 
 fn unregister_wrapper(w: usize) {
     WRAPPED.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.1 != w);
+}
+
+#[cfg(test)]
+mod xsx_device8_tests {
+    use super::*;
+
+    #[test]
+    fn qi_answers_the_scarlett_device8_iid_with_the_wrapper() {
+        let mut w = DeviceWrapper { vtable: core::ptr::null(), real: core::ptr::null_mut(), refs: AtomicU32::new(1) };
+        let mut out: *mut c_void = core::ptr::null_mut();
+        let hr = unsafe { qi(&mut w, &IID_XSX_DEVICE8, &mut out) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(out, &mut w as *mut DeviceWrapper as *mut c_void);
+        assert_eq!(w.refs.load(Ordering::SeqCst), 2);
+        assert_eq!(guid_str(&IID_XSX_DEVICE8), "{728f1fa2-ea11-4a9f-9b52-9b42a484d5c9}");
+    }
 }
