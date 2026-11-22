@@ -159,6 +159,7 @@ enum Vop2Map {
     Vop3Swap(u32),
     Vop3Carry(u32),
     Legacy(bool),
+    PkU8,
 }
 
 fn vop2_map(op: u32) -> Result<Vop2Map, String> {
@@ -185,7 +186,7 @@ fn vop2_map(op: u32) -> Result<Vop2Map, String> {
         0x31 => Vop3(0x36b),
         0x0d => Legacy(false),
         0x0e => Legacy(true),
-        0x2c => return Err("v_cvt_pkaccum_u8_f32 (gfx7 VOP2 0x2c) has no RDNA2 equivalent yet".into()),
+        0x2c => PkU8,
         _ => return Err(format!("gfx7 VOP2 opcode {op:#x} is not defined")),
     })
 }
@@ -368,6 +369,11 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
                     v
                 }
                 Vop2Map::Legacy(max) => legacy_minmax(max, vdst, src0, vsrc1, lit).map_err(&err)?,
+                Vop2Map::PkU8 => {
+                    let mut v = vop3(0x15e, vdst, 0, 0, [src0, vsrc1, 256 + vdst], 0, 0).to_vec();
+                    v.extend(lit);
+                    v
+                }
             }
         }
         Enc::Vop1 => {
@@ -419,6 +425,12 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
                                 return Err(err("v_min_legacy_f32 / v_max_legacy_f32 VOP3 literal source is not supported".into()));
                             }
                             legacy_minmax(max, vdst, s[0], s[1], None).map_err(&err)?
+                        }
+                        Vop2Map::PkU8 => {
+                            if clamp | omod != 0 || abs & 6 != 0 || neg & 6 != 0 {
+                                return Err(err("v_cvt_pkaccum_u8_f32 modifiers other than abs/neg on the float are not supported".into()));
+                            }
+                            vop3(0x15e, vdst, abs, 0, [s[0], s[1], 256 + vdst], 0, neg).to_vec()
                         }
                     },
                 },
@@ -951,6 +963,10 @@ mod tests {
         (op << 25) | (vdst << 17) | (vsrc1 << 9) | src0
     }
 
+    fn pk_word(op: u32, vdst: u32, vsrc1: u32, src0: u32) -> u32 {
+        (op << 25) | (vdst << 17) | (vsrc1 << 9) | src0
+    }
+
     fn translate_lowered(isa: &[u8]) -> Result<String, String> {
         let ex = crate::ShaderExtract {
             stage: crate::Stage::Compute,
@@ -1029,6 +1045,29 @@ mod tests {
         let op = legacy_word(0x0d, 1, 2, 256);
         let e = to_rdna2(&bytes(&[0xbee80380, op, 0xbf810000])).unwrap_err();
         assert!(e.contains("s104"), "{e}");
+    }
+
+    #[test]
+    fn pkaccum_u8_updates_the_byte_selected_by_its_integer_source() {
+        let op = pk_word(0x2c, 1, 2, 256);
+        let l = to_rdna2(&bytes(&[op, 0xbf810000])).unwrap();
+        let d = crate::rdna2::disassemble(&l.isa[..l.code_len]);
+        assert_eq!(d[0].mnemonic, "v_cvt_pk_u8_f32");
+        use crate::rdna2::Opnd;
+        assert_eq!(d[0].src, vec![Opnd::Vgpr(0), Opnd::Vgpr(2), Opnd::Vgpr(1)]);
+        assert_eq!(d[0].dst, vec![Opnd::Vgpr(1)]);
+        let h = translate_lowered(&l.isa[..l.code_len]).unwrap();
+        assert!(h.contains("((v2) & 3u) * 8u"), "{h}");
+        assert!(h.contains("((v1) & ~(0xffu <<"), "{h}");
+        assert!(h.contains("clamp(tb_rne("), "{h}");
+        assert!(h.contains("tb_nan("), "{h}");
+        let vop3 = [0xd000_0001 | (0x12c << 17), 256 | (258 << 9)];
+        let e = to_rdna2(&bytes(&[vop3[0] | (1 << 11), vop3[1], 0xbf810000])).unwrap_err();
+        assert!(e.contains("modifiers"), "{e}");
+        let l = to_rdna2(&bytes(&[vop3[0], vop3[1], 0xbf810000])).unwrap();
+        let d = crate::rdna2::disassemble(&l.isa[..l.code_len]);
+        assert_eq!(d[0].mnemonic, "v_cvt_pk_u8_f32");
+        assert_eq!(d[0].src, vec![Opnd::Vgpr(0), Opnd::Vgpr(2), Opnd::Vgpr(1)]);
     }
 
     #[test]

@@ -2411,3 +2411,31 @@ fn legacy_minmax_on_warp_keeps_a_nan_in_either_source() {
     assert_eq!(legacy(0x0e, 0, 0x8000_0000), 0, "max of +0 and -0 keeps source 0");
     assert_eq!(legacy(0x0e, 0x8000_0000, 0), 0x8000_0000, "max of -0 and +0 keeps source 0");
 }
+
+#[test]
+fn pkaccum_u8_packs_four_bytes_into_one_register() {
+    fn mov_lit(dst: u32, val: u32) -> [u32; 2] {
+        [0x7e00_0000 | (dst << 17) | (1 << 9) | 255, val]
+    }
+    fn mov_imm(dst: u32, imm: u32) -> u32 {
+        0x7e00_0000 | (dst << 17) | (1 << 9) | (128 + imm)
+    }
+    let mut code = vec![mov_imm(1, 0)];
+    for (i, bits) in [0x3f80_0000u32, 0x4000_0000, 0x4040_0000, 0x4080_0000].into_iter().enumerate() {
+        code.extend_from_slice(&mov_lit(0, bits));
+        code.push(mov_imm(2, i as u32));
+        code.push((0x2c << 25) | (1 << 17) | (2 << 9) | 256);
+    }
+    code.push(S_ENDPGM);
+    let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let lowered = tombox_xshader::gcn::to_rdna2(&bytes).unwrap_or_else(|e| panic!("{e}"));
+    let mut words: Vec<u32> = lowered.isa[..lowered.code_len]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(words.pop(), Some(S_ENDPGM));
+    let mut p = Prog::new();
+    p.raw(&words);
+    let got = run(&p.words()).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got[1], 0x0403_0201, "{got:08x?}");
+}
