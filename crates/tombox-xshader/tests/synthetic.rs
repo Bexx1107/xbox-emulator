@@ -718,3 +718,20 @@ fn raw_uav_buffer_atomics_share_ubuf_instead_of_overlapping_utb() {
         tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
     }
 }
+
+#[test]
+fn unmapped_position_export_without_clip_or_cull_distance_is_ignored() {
+    let words = [
+        EXP_POS0_V0_V3[0], EXP_POS0_V0_V3[1],
+        0xf800_08df, 0x0302_0100,
+        S_ENDPGM,
+    ];
+    let position = || vec![sig("SV_Position", 1, 3, 0, 0xf)];
+    let ex = shader(Stage::Vertex, &words, vec![], position(), None);
+    let t = translate(&ex).expect("translate position export 13 without clip or cull distance");
+    assert!(t.hlsl.contains("o.o0 ="), "{}", t.hlsl);
+    if tombox_xshader::dxc::available() {
+        let profile = tombox_xshader::dxc::profile_for(t.profile);
+        tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
+    }
+}

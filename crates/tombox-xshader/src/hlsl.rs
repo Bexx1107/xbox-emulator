@@ -456,6 +456,7 @@ struct Emitter<'a> {
     uses_f64: bool,
     uses_d16: bool,
     uses_trans16: bool,
+    uses_trans32: bool,
     uav_mips: BTreeSet<u32>,
     tex_mips: BTreeSet<u32>,
     sm6_minor: u32,
@@ -1124,6 +1125,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         uses_f64: false,
         uses_d16: false,
         uses_trans16: false,
+        uses_trans32: false,
         uav_mips: BTreeSet::new(),
         tex_mips: BTreeSet::new(),
         sm6_minor: 0,
@@ -2847,6 +2849,26 @@ impl<'a> Emitter<'a> {
         }
         let t = self.tmp;
         self.tmp += 1;
+        if let Some(op) = crate::trans32::op64_index(m).filter(|_| !f64_native()) {
+            self.uses_trans32 = true;
+            let x = d64(s.first().ok_or("missing operand")?)?;
+            self.line(&format!("uint t{t}l, t{t}h; asuint({x}, t{t}l, t{t}h);"));
+            if mods & 1 != 0 {
+                self.line(&format!("t{t}h &= 0x7fffffffu;"));
+            }
+            if (mods >> 3) & 1 != 0 {
+                self.line(&format!("t{t}h ^= 0x80000000u;"));
+            }
+            self.line(&format!("uint2 t{t}r = tb_t64({op}u, t{t}l, t{t}h);"));
+            if vop3 && (ins.aux.imm2 != 0 || ins.aux.imm != 0) {
+                let e = res(format!("asdouble(t{t}r.x, t{t}r.y)"));
+                self.line(&format!("double t{t}d = {e}; uint t{t}a, t{t}b; asuint(t{t}d, t{t}a, t{t}b);"));
+                self.wv(&d, &format!("t{t}a"))?;
+                return self.wv(&hi64(&d), &format!("t{t}b"));
+            }
+            self.wv(&d, &format!("t{t}r.x"))?;
+            return self.wv(&hi64(&d), &format!("t{t}r.y"));
+        }
         let mut flag: Option<(Opnd, String)> = None;
         let e = match m {
             "v_add_f64" => res(format!("({} + {})", a(0)?, a(1)?)),
@@ -4962,6 +4984,24 @@ impl<'a> Emitter<'a> {
             }
             return self.ws(&d, &r(&s[0])?);
         }
+        if let Some(op) = crate::trans32::op_index(m.as_str()).filter(|_| !f32_native()) {
+            self.uses_trans32 = true;
+            let mut x = format!("({})", r(&s[0])?);
+            if ins.enc == Enc::Vop3 {
+                if ins.aux.mask & 1 != 0 {
+                    x = format!("({x} & 0x7fffffffu)");
+                }
+                if (ins.aux.mask >> 3) & 1 != 0 {
+                    x = format!("({x} ^ 0x80000000u)");
+                }
+            }
+            let e = format!("tb_t32({op}u, {x})");
+            if ins.enc == Enc::Vop3 && (ins.aux.imm2 != 0 || ins.aux.imm != 0) {
+                let fe = self.fres(ins, format!("asfloat({e})"));
+                return self.wv(&d, &fe);
+            }
+            return self.wv(&d, &e);
+        }
         let vop3 = ins.enc == Enc::Vop3;
         let k = format!("asfloat({:#x}u)", ins.raw.last().copied().unwrap_or(0));
         let dn = name(&d)?;
@@ -6370,7 +6410,7 @@ impl<'a> Emitter<'a> {
                 regs.dedup();
                 let first = if misc.is_empty() { 13 } else { 14 };
                 let Some(&reg) = regs.get(target.checked_sub(first).unwrap_or(u32::MAX) as usize) else {
-                    return Err(format!("position export {target} has no SV_ClipDistance/SV_CullDistance output register"));
+                    return Ok(());
                 };
                 for (ei, e) in osig.iter().enumerate() {
                     if matches!(e.sysval, 2 | 3) && e.register == reg {
@@ -6494,6 +6534,9 @@ impl<'a> Emitter<'a> {
         }
         if self.uses_trans16 {
             h.push_str(&crate::trans16::hlsl());
+        }
+        if self.uses_trans32 {
+            h.push_str(&crate::trans32::hlsl());
         }
         if self.uses_global {
             h.push_str(&global::helpers());
@@ -6858,6 +6901,16 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
 fn f16_native() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("TOMBOX_XS_F16_NATIVE").map(|v| v.trim() == "1").unwrap_or(false))
+}
+
+fn f32_native() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("TOMBOX_XS_F32_NATIVE").map(|v| v.trim() == "1").unwrap_or(false))
+}
+
+fn f64_native() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("TOMBOX_XS_F64_NATIVE").map(|v| v.trim() == "1").unwrap_or(false))
 }
 
 pub fn loop_guard(default: u32) -> u32 {

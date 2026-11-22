@@ -145,3 +145,92 @@ Results (gfx1036):
   32-segment cubic in the low 18 mantissa bits (sqrt 16 segments) with the square and cube terms
   taken from the mantissa without its lowest bit; the remaining ~0.015 ulp is not modelled yet.
 
+
+f32 rcp, rcp_iflag, rsq, sqrt (trans32_solve.cpp, trans32_gen.py)
+------------------------------------------------------------------
+
+v_rcp_f64, v_rsq_f64 and v_sqrt_f64 return the transcendental unit's internal value with no
+final rounding (34 bits for rcp, 35 for rsq/sqrt). The f32 instructions round that same value:
+
+    f32 = round_to_nearest_even(internal + shift) to 24 bits, shift = -2^-27
+    (0 in the table entry whose results reach 1.0: rcp and rsq segment 0, sqrt segment 15)
+
+so the f64 outputs show the datapath directly. Per table segment (rcp and rsq: top 5 mantissa
+bits, t = low 18 bits; sqrt: exponent parity and top 4 bits, t = low 19 bits), in units of the
+internal LSB, with every rounding half-to-even:
+
+    P      = c1 * t / 2^bits(t), held with a 24-bit significand (quantum q below the switch, 2q above)
+    coarse = c0 + P, rounded to 2^-29
+    S      = ((t >> k)^2) >> 10            k = 1 (rcp, rsq) or 2 (sqrt)
+    H      = c2 + Q * rne(M * (4t + 1) / (4 Dn))       (sqrt: M * (2t + 1) / (2 Dn))
+             (trans32_solve fits the f32-equivalent floor((M t + phi) / Dn); trans32_gen drops phi)
+    fine   = H * S / 2^24, held with a 24-bit significand
+    internal = coarse + fine
+
+Denormal inputs and results are flushed to signed zero whatever MODE says; NaN inputs are
+returned unchanged; rsq/sqrt of a negative nonzero input give 0xffc00000; sqrt(-0) = -0,
+rsq(-0) = -inf, rcp(+-0) = +-inf, rcp(+-inf) = +-0. v_rcp_iflag_f32 equals v_rcp_f32.
+
+Data (trans_probe.py kernels, every sweep run twice and kept only when identical):
+
+    trans_runner k.co v_rcp_f32_d3 8388608 0x3f800000 1 data/v_rcp_f32_d3_e0.bin       (and 0x40000000 -> _e1,
+                                                                                       rsq, sqrt, rcp_iflag)
+    trans_runner k.co v_rcp_f64_d3 1048576 0x3ff00000 $((k << 29)) data/rcp64_k$k.bin 2           (k = 0..7)
+    trans_runner k.co v_rsq_f64_d3 1048576 $((0x3ff00000 + (e << 20))) $((k << 29)) data/rsq64_e${e}_k$k.bin 2
+    trans_runner k.co v_rcp_f32_d3 1048576 0 4099 data/edge_rcp_d3.bin           (whole float range; d0 too)
+
+Tables (C++17, g++ -O3 trans32_solve.cpp -o trans32_solve; arguments: first segment, last segment,
+2 2 (half-even ties), output file):
+
+    OP=rcp SC=0 MUL=256 ./trans32_solve 0 31 2 2 rcp64_tables.txt
+    OP=rsq EX=e SC=2 MUL=256 ./trans32_solve 0 31 2 2 rsq64_e$e.txt
+    OP=sqrt EX=e SC=4 SB=19 SQ=2 MUL=256 ./trans32_solve 0 15 2 2 sqrt64_e$e.txt
+
+Every row reports 0 mismatches against all of its f64 outputs. Then
+
+    python3 trans32_gen.py <dir> crates/tombox-xshader/src/trans32/tables.rs crates/tombox-xshader/src/trans32/rdna2_hw.rs gfx1036 "<machine>"
+
+writes the tables and FNV-1a-64 digests of the recorded f32 results (every mantissa of [1,4), and the
+whole-range sweep in both denormal modes) that crates/tombox-xshader/src/trans32 is tested against.
+
+
+f32 log, exp, sin, cos (crates/tombox-xshader/src/trans32/amd.rs)
+-----------------------------------------------------------------
+
+These are ported from AMD rocjitsu (ROCm/rocm-systems, emulation/rocjitsu/lib/util/include/util/
+amdgpu_{exp,log,trig}.h, MIT; see trans32/LICENSE-rocjitsu.txt), which was fitted to gfx1100 and
+gfx1201 captures. Compiled unchanged against the gfx1036 data here (quiet_snan = false, denormal mode 3)
+it reproduces every recorded result: 25 complete 2^23-input ranges and the whole-range sweep in both
+denormal modes. Denormal mode 0 equals mode 3 with denormal inputs and results flushed to signed zero.
+
+    trans_runner k.co v_sin_f32_d3 8388608 0x39800000 1 data/x_sin_0x39800000.bin
+    (log: 0x3f000000 0x00800000 0x7f000000; exp: 0x40000000 0xc0000000 0x42800000 0xc2800000 0x33800000;
+     sin, cos: 0x3f000000 0x3f800000 0x40800000 0x4a800000 0x39800000 0x39000000 0xbe800000 0x00800000)
+
+
+f64 rcp, rsq, sqrt (trans32::eval64, tb_t64)
+--------------------------------------------
+
+v_rcp_f64, v_rsq_f64 and v_sqrt_f64 run the same unit and write its internal value unrounded
+(rcp A * 2^(-35-E), rsq A * 2^(-36-Eh), sqrt A * 2^(-35+Eh)). They read the top 29 mantissa bits
+(truncated), so the datapath above sees a 24-bit t: the linear term uses all of it (rsq table
+entry 31: the top two extra bits are ignored there), the cubic coefficient uses its top 20 bits
+(TH, in rne(M * (TH + 1) / (4 Dn)) above, or 2 Dn for sqrt), the square term the same 17 as f32.
+Other behaviour, from the whole-range sweeps in both denormal modes:
+
+    denormal inputs are normalized (mode 3) or flushed (mode 0); results are exact (mode 3) or flushed
+    rcp: mantissa top 29 bits zero, low bits not -> the power of two minus one ulp (of the result format)
+         mantissa all ones                         -> the power of two plus one ulp
+    rsq, even exponent: mantissa top 29 bits zero, low bits not -> the power of two minus one ulp
+    exact powers of two: rcp and rsq exact; sqrt one 2^-26 step above (sqrt(4.0) = 0x4000000004000000)
+    NaN in -> unchanged; rsq/sqrt of a negative -> 0xfff8000000000000
+
+Recorded: the whole-range sweep (x = (i * 4099) << 32 | lo, lo = 0, 0x9e3779b9, 0xffffffff, both modes),
+every mantissa of [1, 4) for each of the 32 combinations of the 3 mantissa bits and 2 extra bits the
+low word carries, and every low-bit pattern at both mantissa corners: 723,517,440 results, all reproduced.
+
+    trans_runner k.co v_rcp_f64x_d3 1048576 0 0x9e3779b9 data/edge64_rcp_d3_0x9e3779b9.bin 2      (hi = i * 4099, lo fixed)
+    trans_runner k.co v_rcp_f64_d0 1048576 0x3ff00000 $(( (ml << 29) | (eh << 27) | (15 << 23) )) \
+                 data/exh/rcp_0x3ff00000_$(( (ml << 29) | (eh << 27) | (15 << 23) )).bin 2       (hi = 0x3ff00000 + i)
+    trans_runner k.co v_rcp_f64m_d0 8388608 1 0x3ff00000 data/cz_rcp_0x3ff00000.bin 2            (lo = i, hi fixed)
+    trans_runner k.co v_rcp_f64m_d0 8388608 0xffffffff 0x3fffffff data/co_rcp_0x3fffffff.bin 2   (lo = -i)
