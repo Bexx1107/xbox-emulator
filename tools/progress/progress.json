@@ -2330,10 +2330,7 @@
           "Minecraft"
         ]
       },
-      "status": {
-        "XPersistentLocalStorage(d29411df) slot 6 (pls_prompt_async)": "pending",
-        "XPersistentLocalStorage(d29411df) slot 7 (pls_prompt_result_slot)": "pending"
-      }
+      "status": {}
     },
     "GDK XStore (QueryApiImpl)": {
       "file": "crates/compat/compat-common/src/gdk/store.rs",

@@ -11,9 +11,13 @@
   [int]$TerrariaSeconds = 600,
   [int]$MinecraftSeconds = 600,
   [int]$CaptureEvery = 60,
+  [switch]$Visible,
   [int]$IdleSeconds = 120,
   [string]$PadScript = '',
   [string]$MinecraftGameArgs = '',
+  [ValidateSet('', 'TrainingFirst')][string]$TrackmaniaTestBoot = '',
+  [string]$TrackmaniaGameArgs = '',
+  [string]$TrackmaniaTestBootFile = '',
   [string]$CompatDir = 'D:\TomBox\tools\dev\compat',
   [string]$Root = 'D:\TomBox',
   [string]$Report = 'D:\TomBox\tools\dev\batch_report.md',
@@ -62,6 +66,14 @@ $Titles = @(
     Exe = 'D:\xbox-pc-port\games\Microsoft.MinecraftBeta_1.18.3064.0_neutral__8wekyb3d8bbwe_xs-PATCHED\Microsoft.MinecraftBeta_1.18.3064.0_neutral__8wekyb3d8bbwe_xs\Minecraft.Windows.exe'
     Saved = @('D:\xbox-pc-port\emulator\run-minecraft') }
 )
+if ($TrackmaniaTestBoot) {
+  foreach ($t in @($Titles | Where-Object { $_.Slug -eq 'trackmania' })) {
+    $t.Args['TestBoot'] = $TrackmaniaTestBoot
+    $t.Saved = @('D:\xbox-pc-port\emulator\run-xone-test\Trackmania')
+    $t.Name = "Trackmania (test boot $TrackmaniaTestBoot)"
+    $t.PadScript = "5:connect;#start+2:press a;/init challenge 'Training - 01'/+25:press a;+3:press a;+2:down rt+a;+10:stick l 0.5 0 800;+6:stick l -0.5 0 800"
+  }
+}
 if ($Only.Count) { $Titles = @($Titles | Where-Object { $Only -contains $_.Slug }) }
 foreach ($t in $Titles) {
   if ($t.Xone -and -not $t.Exe) {
@@ -275,13 +287,15 @@ public static class TbIdle {
   public static double Seconds() { LII l = new LII(); l.cbSize = 8; if (!GetLastInputInfo(ref l)) return -1; return ((uint)GetTickCount64() - l.dwTime) / 1000.0; }
 }
 '@ }
-if (-not ('TbFrame' -as [type])) { Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
+if (-not ('TbFrame2' -as [type])) { Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.IO;
 using System.Runtime.InteropServices;
-public static class TbFrame {
+public static class TbFrame2 {
   delegate bool EnumProc(IntPtr h, IntPtr l);
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc p, IntPtr l);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
@@ -348,14 +362,59 @@ public static class TbFrame {
     bmp.Dispose();
     return s;
   }
+  public static string CaptureDir;
+  static int seq;
+  public static Shot Grab(uint[] pids, string path) { return string.IsNullOrEmpty(CaptureDir) ? Capture(pids, path) : Backbuffer(pids, path, 3000); }
+  public static Shot Backbuffer(uint[] pids, string path, int timeoutMs) {
+    int w, h;
+    IntPtr hw = Find(pids, out w, out h);
+    if (hw == IntPtr.Zero) return null;
+    var s = new Shot { W = w, H = h };
+    Directory.CreateDirectory(CaptureDir);
+    if (Directory.GetFiles(CaptureDir, "alive.*").Length == 0) { s.Method = "backbuffer: title has not presented yet"; s.Verdict = "no present"; return s; }
+    string stem = "b" + System.Diagnostics.Process.GetCurrentProcess().Id + "_" + (++seq);
+    string bmpPath = Path.Combine(CaptureDir, stem + ".bmp");
+    string done = Path.Combine(CaptureDir, stem + ".done");
+    string req = Path.Combine(CaptureDir, stem + ".req");
+    string tmp = Path.Combine(CaptureDir, stem + ".reqtmp");
+    File.WriteAllText(tmp, bmpPath + Environment.NewLine);
+    File.Move(tmp, req);
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    while (!File.Exists(done) && sw.ElapsedMilliseconds < timeoutMs) System.Threading.Thread.Sleep(20);
+    if (!File.Exists(done)) {
+      try { File.Delete(req); } catch { }
+      s.Method = "backbuffer: no present within " + timeoutMs + " ms"; s.Verdict = "no present"; return s;
+    }
+    string line = File.ReadAllText(done).Trim();
+    try { File.Delete(done); } catch { }
+    if (!line.StartsWith("ok ")) { s.Method = "backbuffer " + line; s.Verdict = "capture error"; try { File.Delete(bmpPath); } catch { } return s; }
+    string[] f = line.Split(new[] { ' ' }, 6);
+    bool scaled;
+    using (var src = new Bitmap(bmpPath)) {
+      scaled = src.Width != w || src.Height != h;
+      using (var outb = new Bitmap(w, h, PixelFormat.Format32bppArgb)) {
+        using (var g = Graphics.FromImage(outb)) {
+          g.InterpolationMode = scaled ? InterpolationMode.HighQualityBilinear : InterpolationMode.NearestNeighbor;
+          g.PixelOffsetMode = PixelOffsetMode.Half;
+          g.CompositingMode = CompositingMode.SourceCopy;
+          g.DrawImage(src, new Rectangle(0, 0, w, h));
+        }
+        Stats(outb, s);
+        outb.Save(path, ImageFormat.Png);
+      }
+      s.Method = "backbuffer " + src.Width + "x" + src.Height + " fmt " + f[4] + " frame " + f[3] + (scaled ? " scaled to client" : "");
+    }
+    try { File.Delete(bmpPath); } catch { }
+    return s;
+  }
 }
 '@ }
 
 function Invoke-FrameCapture($res, [uint32[]]$Pids, [double]$El, [string]$Tag) {
   $png = Join-Path $res.Dir ("frame_{0:0000}s{1}.png" -f [int]$El, $Tag)
-  try { $s = [TbFrame]::Capture($Pids, $png) } catch { $res.Notes.Add("frame capture at +$([int]$El)s failed: $($_.Exception.Message)"); return }
+  try { $s = [TbFrame2]::Grab($Pids, $png) } catch { $res.Notes.Add("frame capture at +$([int]$El)s failed: $($_.Exception.Message)"); return }
   if (-not $s) { $res.Frames.Add([pscustomobject]@{ T = [int]$El; Png = ''; W = 0; H = 0; Mean = 0; Std = 0; Distinct = 0; Drawn = $false; Verdict = 'no window'; Method = '' }); return }
-  if ($s.Verdict -eq 'hung') { $png = '' }
+  if ($s.Verdict -in 'hung', 'no present', 'capture error') { $png = '' }
   $res.Frames.Add([pscustomobject]@{ T = [int]$El; Png = $png; W = $s.W; H = $s.H; Mean = [Math]::Round($s.Mean, 1); Std = [Math]::Round($s.Std, 1); Distinct = $s.Distinct; Drawn = $s.Drawn; Verdict = $s.Verdict; Method = $s.Method })
   Say ("  +{0:N0}s frame {1}x{2} mean {3:N1} std {4:N1} colours {5}: {6}" -f $El, $s.W, $s.H, $s.Mean, $s.Std, $s.Distinct, $s.Verdict) $(if ($s.Drawn) { 'Green' } else { 'Yellow' })
   if ($s.Drawn) { Test-FrameScreens $res $png $El }
@@ -437,6 +496,7 @@ function Set-BatchEnv {
   $env:TOMBOX_NET_BACKEND = 'builtin'
   $env:TOMBOX_HOST_PAD = '0'
   $env:TOMBOX_TEST_RUN = '1'
+  if ($Visible) { Remove-Item Env:TOMBOX_HEADLESS -ErrorAction SilentlyContinue } else { $env:TOMBOX_HEADLESS = '1' }
   $env:TOMBOX_HOST_KBM = '0'
   $env:TOMBOX_PRELAUNCH_UI = '0'
   $env:TOMBOX_FN_GAMESERVER = '127.0.0.1:7777'
@@ -456,6 +516,8 @@ function Get-ArgList($t, [switch]$Dry) {
   if ($Profile -ne 'release') { $a += '-Profile'; $a += $Profile }
   if (($t.Xone -or $t.DbgArgs) -and $DbgLayer) { $a += '-Agility'; $a += $Agility; $a += '-AgilityVersion'; $a += "$AgilityVersion"; $a += '-D3d12Debug' }
   if ($t.Slug -eq 'minecraft' -and $MinecraftGameArgs) { $a += '-GameArgs'; $a += ('"' + $MinecraftGameArgs.Trim() + '"') }
+  if ($t.Slug -eq 'trackmania' -and $TrackmaniaGameArgs) { $a += '-GameArgs'; $a += ('"' + $TrackmaniaGameArgs.Trim() + '"') }
+  if ($t.Slug -eq 'trackmania' -and $TrackmaniaTestBoot -and $TrackmaniaTestBootFile) { $a += '-TestBootFile'; $a += ('"' + $TrackmaniaTestBootFile.Trim() + '"') }
   if ($Dry) { $a += '-DryRun' } else { $a += '-Seconds'; $a += "$($t.Seconds + 120)" }
   return $a
 }
@@ -468,7 +530,7 @@ function W([string]$s = '') { [void]$sb.AppendLine($s) }
 
 Say "batch test $Mode -> $RunRoot" 'Cyan'
 $oldEnv = @{}
-foreach ($v in 'TOMBOX_ALLOW_NETWORK', 'TOMBOX_NET_LOCAL_PORT', 'TOMBOX_NET_REDIRECT', 'TOMBOX_NET_BACKEND', 'TOMBOX_FN_GAMESERVER', 'TOMBOX_D3D12_DEBUG', 'TOMBOX_AGILITY_PATH', 'TOMBOX_AGILITY_VERSION') { $oldEnv[$v] = [Environment]::GetEnvironmentVariable($v) }
+foreach ($v in 'TOMBOX_ALLOW_NETWORK', 'TOMBOX_NET_LOCAL_PORT', 'TOMBOX_NET_REDIRECT', 'TOMBOX_NET_BACKEND', 'TOMBOX_FN_GAMESERVER', 'TOMBOX_D3D12_DEBUG', 'TOMBOX_AGILITY_PATH', 'TOMBOX_AGILITY_VERSION', 'TOMBOX_HEADLESS', 'TOMBOX_CAPTURE_DIR') { $oldEnv[$v] = [Environment]::GetEnvironmentVariable($v) }
 Set-BatchEnv
 
 $pre = New-Object System.Collections.Generic.List[string]
@@ -604,6 +666,17 @@ foreach ($t in $Titles) {
   $env:TOMBOX_TAKEOVER_FILE = $takeFile
   $env:TOMBOX_USER_PLAYING_FILE = $userPlaying
   $takenOver = $false
+  if ($env:TOMBOX_HEADLESS -eq '1') {
+    $capDir = Join-Path $dir 'capture'
+    Remove-Item -LiteralPath $capDir -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $capDir | Out-Null
+    $env:TOMBOX_CAPTURE_DIR = $capDir
+    [TbFrame2]::CaptureDir = $capDir
+    $res.Notes.Add("headless: windows cloaked (TOMBOX_HEADLESS=1), frames read back from the presented title back buffer via $capDir")
+  } else {
+    Remove-Item Env:TOMBOX_CAPTURE_DIR -ErrorAction SilentlyContinue
+    [TbFrame2]::CaptureDir = $null
+  }
   $start = Get-Date
   $ps = Start-Process -FilePath 'powershell.exe' -ArgumentList $la -RedirectStandardOutput $launcher -RedirectStandardError (Join-Path $dir 'launcher.err.txt') -WindowStyle Hidden -PassThru
   $streams = @(foreach ($f in Get-SourceFiles $t.LogDir) { if ($f.Src -ne 'launcher') { [pscustomobject]@{ Src = $f.Src; Path = $f.Path; Pos = 0L; Rest = '' } } })
@@ -739,7 +812,7 @@ W "- Run folder: ``$RunRoot`` (all copied logs, stage plans, dumps)"
 W "- Build ($Profile): $(ConvertTo-MdText $build)"
 W "- Network: forced offline/private (TOMBOX_NET_REDIRECT=127.0.0.1, TOMBOX_NET_BACKEND=builtin, TOMBOX_ALLOW_NETWORK removed, Fortnite game server 127.0.0.1:7777); enforced in-process by compat-common net_guard"
 W "- D3D12 debug layer: $(if ($DbgLayer) { "ON via Agility SDK $AgilityVersion ($Agility); FPS is measured with the layer on" } else { 'off (-NoD3d12Debug)' }). DRED: not enabled by any compat crate; only device-removal log lines are captured"
-W "- Audio: each title's WASAPI session is muted from the batch (polled every 0.1 s for the first 2 min, then 0.5 s; each session's prior mute state is restored after the title exits); input: none injected; windows: shown by the title"
+W "- Audio: each title's WASAPI session is muted from the batch (polled every 0.1 s for the first 2 min, then 0.5 s; each session's prior mute state is restored after the title exits); input: none injected; windows: $(if ($Visible) { 'shown by the title (-Visible)' } else { 'headless: TOMBOX_HEADLESS=1 cloaks every title window (tool window, no activation, never composed onto the desktop); frames are read back from the presented title back buffer (TOMBOX_CAPTURE_DIR request files), scaled to the window client size' })"
 foreach ($p in $pre) { W "- **Preflight problem:** $(ConvertTo-MdText $p)" }
 W
 W "- Build: $($BuildStamp.Stamp)"

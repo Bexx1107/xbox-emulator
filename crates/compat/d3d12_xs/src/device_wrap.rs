@@ -401,6 +401,24 @@ unsafe extern "system" fn get_resource_alloc_info(
     info
 }
 
+pub(crate) fn title_layout_size_with(desc: &[u8], xg: Option<&dyn Fn(&[u8]) -> Result<(u64, u64), i32>>) -> u64 {
+    let d = &desc[..crate::device_console_fix::RES_DESC_SIZE];
+    let s = match xg {
+        Some(xg) => crate::device_console_fix::alloc_info_with(d, 1, |d| crate::device_console_fix::texture_part(xg(d), || console_desc_estimate(d))).0,
+        None => 0,
+    };
+    if s != 0 { s } else { crate::gpu_va::xbox_texture_size(desc) }
+}
+
+pub(crate) fn title_layout_size(desc: &[u8]) -> u64 {
+    let fam = crate::device_console_fix::title_family();
+    if crate::device_console_fix::xg_available(fam) {
+        title_layout_size_with(desc, Some(&|d: &[u8]| crate::device_console_fix::xg_texture_alloc(d, fam)))
+    } else {
+        title_layout_size_with(desc, None)
+    }
+}
+
 fn console_desc_estimate(d: &[u8]) -> (u64, u64) {
     let u16at = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]) as u64;
     let u32at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
@@ -931,6 +949,7 @@ unsafe extern "system" fn create_gfx_pso_sync(
             }
         }
         if hr == 0 && !ppv.is_null() {
+            crate::dred_marks::note(unsafe { *ppv }, unsafe { crate::dred_marks::gfx_hashes(pdesc) }, false);
             unsafe { register_pso(*ppv, desc.clone(), keep.clone()) };
         }
         hr
@@ -1269,6 +1288,7 @@ unsafe extern "system" fn create_derived_pso_x(
         if n <= 4 || n % 100 == 0 {
             record("d3d12_xs", "CreateDerivedPSO_X", &format!("derived PSO #{n} created (patch tags: {tags})"));
         }
+        crate::dred_marks::inherit(unsafe { *ppv }, base);
         unsafe { register_pso(*ppv, desc, shaders) };
     } else if FAIL.fetch_add(1, Ordering::Relaxed) < 10 {
         record("d3d12_xs", "CreateDerivedPSO_X", &format!("real CreateGraphicsPipelineState FAILED hr={hr:#010x} (tags: {tags})"));
@@ -1420,6 +1440,7 @@ unsafe extern "system" fn create_compute_pso_sync(
         crate::rtcap::note_compute_pso(unsafe { *ppv } as usize, code.as_ptr() as usize);
     }
     if hr == 0 && !ppv.is_null() {
+        crate::dred_marks::note(unsafe { *ppv }, unsafe { crate::dred_marks::compute_hashes(pdesc) }, false);
         crate::device_x::register_compute(unsafe { *ppv }, &desc, code.clone());
     }
     if hr == 0 {
@@ -1567,7 +1588,7 @@ unsafe extern "system" fn create_placed_resource_x(
     let heap: [u32; 5] = [1 /* DEFAULT */, 0, 0, 1, 1];
     let f: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(27)) };
-    let xbox_size = crate::gpu_va::xbox_texture_size(&orig);
+    let xbox_size = if dim >= 2 { title_layout_size(&orig) } else { crate::gpu_va::xbox_texture_size(&orig) };
     let made = unsafe { crate::placed_offset::create(real, va, &d, xbox_size, init_state, pclear, ppv) }
         .or_else(|| unsafe { crate::alias::create_placed_x(real, va, &d, xbox_size, init_state, pclear, ppv) });
     let hr = match &made {

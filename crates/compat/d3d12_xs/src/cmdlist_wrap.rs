@@ -393,6 +393,7 @@ pub fn apply(real_list: *mut c_void) {
             crate::dbcount::install(&XBOX_VT);
             crate::cl_console_fix::install_family_tail(&XBOX_VT);
             crate::resolve_x::install(&XBOX_VT);
+            crate::dred_marks::install(&XBOX_VT);
             crate::pso_async::install(&XBOX_VT);
             XBOX_VT[CONSOLE_NULL_SLOT].store(0, Ordering::Relaxed);
             record("d3d12_xs", "cmdlist.vtable",

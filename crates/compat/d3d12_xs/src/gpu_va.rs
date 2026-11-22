@@ -64,6 +64,17 @@ pub fn lookup(va: u64) -> Option<(Entry, u64)> {
     with(|t| find_in(&t.ranges, va).or_else(|| find_in(&t.cpu, va)))
 }
 
+pub fn near_in(m: &BTreeMap<u64, Entry>, va: u64, n: usize) -> Vec<Entry> {
+    let mut below: Vec<Entry> = m.range(..=va).rev().take(n).map(|(_, e)| *e).collect();
+    below.reverse();
+    below.extend(m.range(va.saturating_add(1)..).take(n).map(|(_, e)| *e));
+    below
+}
+
+pub fn near(va: u64, n: usize) -> Vec<Entry> {
+    with(|t| near_in(&t.ranges, va, n))
+}
+
 pub fn lookup_gpu(va: u64) -> Option<(Entry, u64)> {
     with(|t| find_in(&t.ranges, va))
 }

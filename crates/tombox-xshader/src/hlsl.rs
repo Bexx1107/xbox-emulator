@@ -2346,7 +2346,11 @@ impl<'a> Emitter<'a> {
     fn ws(&mut self, dst: &Opnd, expr: &str) -> Result<(), String> {
         self.touch(dst);
         let d = name(dst)?;
-        self.line(&format!("{d} = {expr};"));
+        match d.as_str() {
+            "exec_lo" => self.line(&format!("exec_lo = ({expr}) & 1u;")),
+            "exec_hi" => self.line("exec_hi = 0u;"),
+            _ => self.line(&format!("{d} = {expr};")),
+        }
         Ok(())
     }
 

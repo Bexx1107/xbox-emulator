@@ -35,7 +35,7 @@ pub fn origin_hash(code: usize) -> Option<u64> {
 }
 
 pub fn origin(code: usize) -> Option<(u64, Arc<Vec<u8>>)> {
-    ORIGIN.get()?.lock().unwrap().get(&code).cloned()
+    ORIGIN.get()?.lock().unwrap_or_else(|e| e.into_inner()).get(&code).cloned()
 }
 
 pub(crate) fn fnv1a(b: &[u8]) -> u64 {
@@ -304,7 +304,7 @@ pub unsafe fn translate(ptr: *const u8, len: usize) -> Cached {
 pub fn retranslate(blob: &Arc<Vec<u8>>, hash: u64, rtfmt: [u8; 8], link: &InputInterp) -> Result<Arc<Vec<u8>>, String> {
     let v = std::panic::catch_unwind(|| translate_uncached(blob, hash, &rtfmt, link)).unwrap_or_else(|_| Err("translator panicked".to_string()))?;
     let v = Arc::new(v);
-    ORIGIN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().insert(v.as_ptr() as usize, (hash, blob.clone()));
+    ORIGIN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner()).insert(v.as_ptr() as usize, (hash, blob.clone()));
     Ok(v)
 }
 
@@ -454,12 +454,12 @@ fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, _key: u6
 
 fn cell(key: u64) -> Arc<OnceLock<Cached>> {
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    cache.lock().unwrap().entry(key).or_insert_with(|| Arc::new(OnceLock::new())).clone()
+    cache.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert_with(|| Arc::new(OnceLock::new())).clone()
 }
 
 fn mesh_root_cell(hash: u64, root: &[u8]) -> Arc<OnceLock<Cached>> {
     let cache = MESH_ROOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().unwrap();
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     let roots = cache.entry(hash).or_default();
     if let Some(entry) = roots.get(root) {
         return entry.clone();
@@ -483,7 +483,7 @@ fn finish_with(res: Result<Vec<u8>, String>, hash: u64, len: usize, origin_blob:
             let v = Arc::new(v);
             note_origin_hash(v.as_ptr() as usize, hash);
             if let Some(blob) = origin_blob.filter(|_| crate::rtcap::enabled() || crate::hot_reload::enabled()) {
-                ORIGIN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().insert(v.as_ptr() as usize, (hash, Arc::new(blob.to_vec())));
+                ORIGIN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner()).insert(v.as_ptr() as usize, (hash, Arc::new(blob.to_vec())));
             }
             Ok(v)
         }
@@ -549,7 +549,7 @@ pub fn start_prewarm() {
                 let t0 = std::time::Instant::now();
                 let mut done = 0usize;
                 loop {
-                    let next = q.lock().unwrap().pop();
+                    let next = q.lock().unwrap_or_else(|e| e.into_inner()).pop();
                     let Some((p, h, rt)) = next else { break };
                     let Ok(blob) = std::fs::read(&p) else { continue };
                     if fnv1a(&blob) != h {
@@ -683,6 +683,29 @@ pub fn counts() -> (usize, usize) {
 mod tests {
     use super::*;
 
+    fn poison<T: Send + 'static>(m: &'static Mutex<T>) {
+        let _ = std::thread::spawn(move || {
+            let _g = m.lock();
+            panic!("poison");
+        })
+        .join();
+        assert!(m.is_poisoned());
+    }
+
+    #[test]
+    fn poisoned_shader_globals_recover_instead_of_panicking() {
+        poison(ORIGIN.get_or_init(|| Mutex::new(HashMap::new())));
+        poison(CACHE.get_or_init(|| Mutex::new(HashMap::new())));
+        poison(MESH_ROOT_CACHE.get_or_init(|| Mutex::new(HashMap::new())));
+        let out = finish(Ok(vec![4, 3, 2, 1]), 0x0dd0_0000_0000_0109, 4, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(origin_hash(out.as_ptr() as usize), Some(0x0dd0_0000_0000_0109));
+        assert!(origin(1).is_none());
+        let a = cell(0x0109);
+        assert!(Arc::ptr_eq(&a, &cell(0x0109)));
+        let r = mesh_root_cell(0x0109, &[9]);
+        assert!(Arc::ptr_eq(&r, &mesh_root_cell(0x0109, &[9])));
+    }
+
     #[test]
     fn mesh_pipeline_root_cache_separates_layouts_and_keeps_embedded_roots() {
         let body = [0; 24];
@@ -704,7 +727,7 @@ mod tests {
     #[test]
     fn mesh_root_translation_is_not_recorded_as_a_replayable_origin() {
         let out = finish_with(Ok(vec![5, 6, 7, 8]), 0x0bad_cafe_0000_0001, 4, None).unwrap();
-        assert!(ORIGIN.get().map_or(true, |m| !m.lock().unwrap().contains_key(&(out.as_ptr() as usize))));
+        assert!(ORIGIN.get().map_or(true, |m| !m.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(out.as_ptr() as usize))));
     }
 
     #[test]
@@ -726,7 +749,7 @@ mod tests {
         assert!(!unsafe { prefetch(known.as_ptr(), known.len(), [0; 8], &no_link()) });
         let sent = std::sync::mpsc::channel::<u8>();
         let job: Job = Box::new(move || { let _ = sent.0.send(9); });
-        assert!(helper_pool().lock().unwrap().send(job).is_ok());
+        assert!(helper_pool().lock().unwrap_or_else(|e| e.into_inner()).send(job).is_ok());
         assert_eq!(sent.1.recv_timeout(std::time::Duration::from_secs(5)), Ok(9));
     }
 
