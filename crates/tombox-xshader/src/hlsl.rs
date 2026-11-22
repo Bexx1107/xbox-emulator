@@ -444,6 +444,7 @@ struct Emitter<'a> {
     ps_attrs: Vec<u32>,
     /// VS parameter-export index -> output register.
     out_params: Vec<u32>,
+    prim_params: Vec<u32>,
     user_base_override: Option<usize>,
     durango: Option<Vec<(u32, u32)>>,
     rm_mode: std::cell::Cell<Option<bool>>,
@@ -1111,6 +1112,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
             e.sysval == 0 && ex.input_sig.iter().any(|o| o.register == e.register && o.rw_mask != 0)
         })),
         out_params: distinct_regs(ex.output_sig.iter().filter(|e| e.sysval == 0)),
+        prim_params: distinct_regs(ex.prim_sig.iter().filter(|e| e.sysval == 0)),
         user_base_override,
         durango: durango::layout(ex)?,
         rm_mode: std::cell::Cell::new(None),
@@ -1279,6 +1281,31 @@ impl<'a> Emitter<'a> {
             at -= n;
         }
         None
+    }
+
+    fn static_sgpr_init(&mut self) -> String {
+        let mut init = String::new();
+        if self.dg().is_some() || self.rootmem() {
+            return init;
+        }
+        let Some(rs) = self.ex.root_sig.as_ref() else { return init };
+        let base = self.user_base();
+        let mut sgpr = base as u8;
+        while let Some((p, k)) = self.root_param_at(sgpr, base) {
+            if let Some(param) = rs.params.get(p) {
+                if let crate::meta::RootParamKind::Constants { .. } = &param.kind {
+                    let r = format!("s{sgpr}");
+                    if self.live.contains(&r) {
+                        self.rm_used.insert(p);
+                        self.regs.insert(r.clone());
+                        let _ = writeln!(init, "    {r} = tb_rc{p}_{k};");
+                    }
+                }
+            }
+            let Some(next) = sgpr.checked_add(1) else { break };
+            sgpr = next;
+        }
+        init
     }
 
     fn is_root_desc(&self, sgpr: u8) -> bool {
@@ -6250,7 +6277,8 @@ impl<'a> Emitter<'a> {
             }
             return Ok(());
         }
-        if !is_ps && (32..64).contains(&target) && (target - 32) as usize >= self.out_params.len() {
+        let max_params = self.out_params.len() + if self.is_ms() { self.prim_params.len() } else { 0 };
+        if !is_ps && (32..64).contains(&target) && (target - 32) as usize >= max_params {
             // Hardware needs at least one parameter export; with no matching output
             // element nothing downstream can read it.
             self.line("// (parameter export with no output-signature element: ignored)");
@@ -6333,12 +6361,38 @@ impl<'a> Emitter<'a> {
             }
             }
         } else if (32..64).contains(&target) {
-            let reg = self.out_params[(target - 32) as usize];
-            for (ei, e) in osig.iter().enumerate() {
-                if e.sysval == 0 && e.register == reg {
-                    let sw: String = (0..4).filter(|c| (e.mask >> c) & 1 != 0).map(|c| XYZW[c]).collect();
-                    assigns.push((ei, sw));
+            let p = (target - 32) as usize;
+            if p < self.out_params.len() {
+                let reg = self.out_params[p];
+                for (ei, e) in osig.iter().enumerate() {
+                    if e.sysval == 0 && e.register == reg {
+                        let sw: String = (0..4).filter(|c| (e.mask >> c) & 1 != 0).map(|c| XYZW[c]).collect();
+                        assigns.push((ei, sw));
+                    }
                 }
+            } else if self.is_ms() && p - self.out_params.len() < self.prim_params.len() {
+                let reg = self.prim_params[p - self.out_params.len()];
+                let mut plines = Vec::new();
+                for (ei, e) in self.ex.prim_sig.iter().enumerate() {
+                    if e.sysval == 0 && e.register == reg {
+                        let sw: String = (0..4).filter(|c| (e.mask >> c) & 1 != 0).map(|c| XYZW[c]).collect();
+                        let (ty, _) = sig_type(e);
+                        let val = match (e.comp_type, &raw) {
+                            (1, Some(rc)) => format!("uint4({})", rc.join(", ")),
+                            (2, Some(rc)) => format!("int4(uint4({}))", rc.join(", ")),
+                            (1 | 2, None) => return Err("integer output element fed by a packed export without a recognised pack epilogue".into()),
+                            (_, Some(rc)) if compr => format!("float4({})", rc.iter().map(|x| format!("asfloat({x})")).collect::<Vec<_>>().join(", ")),
+                            _ => v4.clone(),
+                        };
+                        plines.push(format!("if (exec_lo & 1u) tb_pout.p{ei} = ({ty})({val}.{sw});"));
+                    }
+                }
+                for l in plines {
+                    self.line(&l);
+                }
+                return Ok(());
+            } else {
+                return Err(format!("export target {target} beyond output parameters"));
             }
         } else {
             return Err(format!("export target {target} unsupported"));
@@ -6397,6 +6451,7 @@ impl<'a> Emitter<'a> {
 
     fn finish(&mut self, is_ps: bool) -> Result<String, String> {
         let dg_init = self.dg_sgpr_init();
+        let static_init = self.static_sgpr_init();
         let ex = self.ex;
         let mut h = String::new();
         let _ = writeln!(h, "// Generated by tombox-xshader from RDNA2 microcode ({:?}, {} instrs).", ex.stage, self.insns.len());
@@ -6562,10 +6617,10 @@ impl<'a> Emitter<'a> {
             h.push_str(&x);
         }
         if self.is_ms() {
-            return self.finish_mesh(h);
+            return self.finish_mesh(h, &static_init);
         }
         if self.is_as() {
-            return self.finish_amp(h);
+            return self.finish_amp(h, &static_init);
         }
         if self.is_cs {
             // Compute ABI (from ClearCS + FSSM metadata): local thread id in v0..v2, the
@@ -6593,6 +6648,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let _ = writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;");
             let _ = writeln!(h, "    s{} = gid.x; s{} = gid.y; s{} = gid.z;", g, g + 1, g + 2);
             h.push_str(&dg_init);
+            h.push_str(&static_init);
             h.push_str(&self.body);
             h.push_str("}
 ");
@@ -6757,6 +6813,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             }
         }
         init.push_str(&dg_init);
+        init.push_str(&static_init);
         let (init, body) = centroid::lower(ex, &pos_field, &init, &self.body);
         h.push_str(&init);
         h.push_str(&body);
