@@ -272,7 +272,8 @@ pub fn console_to_pc(stream: &[u8], recs: &[Rec], per_face_ok: &dyn Fn() -> bool
     for &(ty, at, sz) in recs.iter().filter(|r| r.0 >= 25) {
         let (_, name, off, len) = *CONSOLE_EXT.iter().find(|e| e.0 == ty).unwrap();
         let p = &stream[at + off..at + off + len];
-        let tag = format!("console subobject {ty} ({name}, {sz}-byte record, payload [{}])", hex_words(p));
+        let handler = match ty { 25 => 0x8a540u32, 26 => 0x8a5f0, 27 => 0x8a6d0, 28 => 0x8a7f0, 29 => 0x8a870, _ => 0x8ecb0 };
+        let tag = format!("console subobject {ty} ({name}, {sz}-byte record, payload [{}], xgs12_10d parser 0x8e100 handler {handler:#x})", hex_words(p));
         match ty {
             25 if p.iter().all(|&b| b == 0) => notes.push(format!("{tag}: all fields default, so the console stream parser leaves the extension unset; dropped")),
             25 => return Err(format!("{tag}: non-default pixel-shader options {:?} are not emulated in a pipeline stream", crate::pso_ext::Block::PsOptions.non_default(p))),
