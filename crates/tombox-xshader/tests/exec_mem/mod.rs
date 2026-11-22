@@ -16,6 +16,8 @@ mod rootmem;
 mod user_data;
 
 pub const R32G32B32A32_FLOAT: u32 = 2;
+pub const R32G32B32A32_UINT: u32 = 3;
+pub const R32G32B32A32_SINT: u32 = 4;
 pub const R32_FLOAT: u32 = 41;
 pub const R32_UINT: u32 = 42;
 
