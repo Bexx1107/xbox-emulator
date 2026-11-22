@@ -241,8 +241,11 @@ mod sweep_race_tests {
         s.encode_utf16().chain(Some(0)).collect()
     }
 
+    static MSIMG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn sweep_skips_a_module_unloaded_after_enumeration() {
+        let _g = MSIMG.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let name = w("msimg32.dll");
             if !GetModuleHandleW(name.as_ptr()).is_null() {
@@ -263,6 +266,7 @@ mod sweep_race_tests {
 
     #[test]
     fn pinning_a_live_module_keeps_it_loaded_and_releases_the_reference() {
+        let _g = MSIMG.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let name = w("msimg32.dll");
             if !GetModuleHandleW(name.as_ptr()).is_null() {

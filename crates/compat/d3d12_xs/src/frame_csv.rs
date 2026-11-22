@@ -147,7 +147,7 @@ pub unsafe fn list_begin(device: *mut c_void, list: *mut c_void, frame: u64, fre
         }
     }
     let c = g.as_mut().unwrap();
-    if c.qheap != 0 {
+    if c.qheap != 0 && !crate::dred::removed() {
         let slot = (frame % 2) as u32;
         let i = slot as usize;
         c.snap[i] = unsafe { (core::ptr::read_volatile(c.map.add(i * 2)), core::ptr::read_volatile(c.map.add(i * 2 + 1))) };
@@ -158,7 +158,7 @@ pub unsafe fn list_begin(device: *mut c_void, list: *mut c_void, frame: u64, fre
 pub unsafe fn list_end(list: *mut c_void, frame: u64) {
     let g = CSV.lock().unwrap();
     let Some(c) = g.as_ref() else { return };
-    if c.qheap != 0 {
+    if c.qheap != 0 && !crate::dred::removed() {
         let slot = (frame % 2) as u32;
         unsafe {
             vc!(list, 53, fn(usize, u32, u32) -> (), c.qheap, 2, slot * 2 + 1);
@@ -206,7 +206,7 @@ pub fn present_done(frame: u64, entry: i64) {
     let slot = (frame % 2) as usize;
     let old = c.pending[slot];
     let (mut gpu_frame, mut gpu_list) = (String::new(), String::new());
-    if old.valid && c.qheap != 0 {
+    if old.valid && c.qheap != 0 && !crate::dred::removed() {
         let (a, z) = c.snap[slot];
         if z >= a && a != 0 {
             gpu_list = format!("{:.1}", (z - a) as f64 * 1e6 / c.freq as f64);

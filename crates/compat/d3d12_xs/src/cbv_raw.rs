@@ -28,6 +28,7 @@ pub enum Mode {
     Auto,
     On,
     Off,
+    Copy,
 }
 
 pub fn parse_mode(v: Option<&str>) -> Result<Mode, String> {
@@ -35,7 +36,8 @@ pub fn parse_mode(v: Option<&str>) -> Result<Mode, String> {
         None | Some("") | Some("auto") => Ok(Mode::Auto),
         Some("1") | Some("on") => Ok(Mode::On),
         Some("0") | Some("off") => Ok(Mode::Off),
-        Some(other) => Err(format!("cbv_raw={other:?} is not one of auto, on, off, 1, 0; using auto")),
+        Some("copy") => Ok(Mode::Copy),
+        Some(other) => Err(format!("cbv_raw={other:?} is not one of auto, on, off, copy, 1, 0; using auto")),
     }
 }
 
@@ -52,6 +54,23 @@ pub fn mode() -> Mode {
             Mode::Auto
         })
     })
+}
+
+pub fn copy_on() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| mode() == Mode::Copy)
+}
+
+pub fn pack_mode(xbox_one: bool) -> tombox_xshader::pack_key::CbvRaw {
+    pack_mode_of(mode(), enabled(), xbox_one)
+}
+
+pub fn pack_mode_of(mode: Mode, enabled: bool, xbox_one: bool) -> tombox_xshader::pack_key::CbvRaw {
+    if mode == Mode::Copy {
+        tombox_xshader::pack_key::CbvRaw::Copy
+    } else {
+        tombox_xshader::pack_key::CbvRaw::of(enabled, xbox_one)
+    }
 }
 
 pub fn xbox_one_title() -> bool {
@@ -77,9 +96,10 @@ pub fn enabled() -> bool {
         let on = match mode {
             Mode::Auto => xbox_one,
             Mode::On => true,
-            Mode::Off => false,
+            Mode::Off | Mode::Copy => false,
         };
         let why = match (mode, xbox_one) {
+            (Mode::Copy, _) => "cbv_raw=copy",
             (Mode::Auto, _) => "Xbox One title (d3d12_x.dll loaded)",
             (Mode::On, _) => "cbv_raw=on",
             (Mode::Off, true) => "cbv_raw=off on an Xbox One title (d3d12_x.dll loaded)",
@@ -87,6 +107,8 @@ pub fn enabled() -> bool {
         };
         if on {
             record("d3d12_xs", "cbv_raw", &format!("{why}: constant buffers are bound as raw SRVs in space {}+n so a CBV may start at any 16-byte-aligned address like on the console", tombox_xshader::cbv_raw_hlsl::space_base()));
+        } else if mode == Mode::Copy {
+            record("d3d12_xs", "cbv_raw", &format!("{why}: constant buffers stay PC CBVs; a root CBV whose address is not 256-byte aligned is copied on the GPU timeline into a 256-aligned emulator ring before each draw or dispatch and bound as a real root CBV (xbox_one_title={xbox_one})"));
         } else if mode == Mode::Off {
             record("d3d12_xs", "cbv_raw", &format!("{why}: constant buffers stay PC CBVs (BufferLocation must be 256-byte aligned)"));
         }
@@ -630,6 +652,7 @@ void main() {
         assert_eq!(parse_mode(Some("1")), Ok(Mode::On));
         assert_eq!(parse_mode(Some("off")), Ok(Mode::Off));
         assert_eq!(parse_mode(Some("0")), Ok(Mode::Off));
+        assert_eq!(parse_mode(Some(" Copy ")), Ok(Mode::Copy));
         assert!(parse_mode(Some("yes")).is_err());
     }
 

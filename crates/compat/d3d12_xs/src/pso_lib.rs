@@ -13,8 +13,9 @@ const CS_DESC: usize = 0x38;
 const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
 const ADAPTER_NOT_FOUND: i32 = 0x887e_0001_u32 as i32;
 const DRIVER_MISMATCH: i32 = 0x887e_0002_u32 as i32;
-const SAVE_EVERY: u64 = 64;
-const SAVE_SECS: u64 = 20;
+const SAVE_SECS: u64 = 30;
+const SAVE_FORCE_SECS: u64 = 120;
+const SAVE_QUIET_SECS: u64 = 3;
 const CACHED_SALT: u128 = 0x7462_706c_6361_6368_6564_7073_6f00_0001;
 
 const IID_DEVICE1: Guid = Guid { d1: 0x77ac_ce80, d2: 0x638e, d3: 0x4e65, d4: [0x88, 0x95, 0xc1, 0xf2, 0x33, 0x86, 0x86, 0x3e] };
@@ -39,6 +40,58 @@ static CACHED_HITS: AtomicU64 = AtomicU64::new(0);
 static CACHED_MISSES: AtomicU64 = AtomicU64::new(0);
 static SAVED_AT: AtomicU64 = AtomicU64::new(0);
 static SAVING: AtomicBool = AtomicBool::new(false);
+static LAST_STORE_AT: AtomicU64 = AtomicU64::new(0);
+static LOCK_WAITS: AtomicU64 = AtomicU64::new(0);
+static LOCK_WAIT_US: AtomicU64 = AtomicU64::new(0);
+static SAVE_HOLD_US: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static WAITED_US: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+pub fn take_lock_wait_us() -> u64 {
+    WAITED_US.with(|w| w.replace(0))
+}
+
+fn waited(t0: std::time::Instant) {
+    let us = t0.elapsed().as_micros() as u64;
+    LOCK_WAITS.fetch_add(1, Relaxed);
+    LOCK_WAIT_US.fetch_add(us, Relaxed);
+    WAITED_US.with(|w| w.set(w.get() + us));
+}
+
+fn read_lib(l: &Lib) -> std::sync::RwLockReadGuard<'_, ()> {
+    match l.rw.try_read() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let _s = crate::frame_ev::begin(crate::frame_ev::LOCK);
+            let t0 = std::time::Instant::now();
+            let g = l.rw.read().unwrap_or_else(|e| e.into_inner());
+            waited(t0);
+            g
+        }
+    }
+}
+
+fn write_lib(l: &Lib) -> std::sync::RwLockWriteGuard<'_, ()> {
+    match l.rw.try_write() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let _s = crate::frame_ev::begin(crate::frame_ev::LOCK);
+            let t0 = std::time::Instant::now();
+            let g = l.rw.write().unwrap_or_else(|e| e.into_inner());
+            waited(t0);
+            g
+        }
+    }
+}
+
+pub fn save_due(now: u64, saved_at: u64, last_store: u64) -> bool {
+    let since = now.saturating_sub(saved_at);
+    since >= SAVE_FORCE_SECS || (since >= SAVE_SECS && now.saturating_sub(last_store) >= SAVE_QUIET_SECS)
+}
 static PREV_RS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn enabled() -> bool {
@@ -304,6 +357,7 @@ struct Lib {
     path: std::path::PathBuf,
     ident: String,
     rejected: Mutex<HashSet<u128>>,
+    stored: Mutex<HashSet<u128>>,
 }
 
 unsafe impl Send for Lib {}
@@ -370,7 +424,7 @@ unsafe fn open(real: *mut c_void) -> Option<Lib> {
         path.display(), blob.len(), t0.elapsed().as_secs_f64() * 1000.0, unsafe { luid(real) }, ident, note.map(|n| format!("; {n}")).unwrap_or_default()));
     SAVED_AT.store(now_s(), Relaxed);
     register_exit_save();
-    Some(Lib { lib, rw: RwLock::new(()), path, ident, rejected: Mutex::new(HashSet::new()) })
+    Some(Lib { lib, rw: RwLock::new(()), path, ident, rejected: Mutex::new(HashSet::new()), stored: Mutex::new(HashSet::new()) })
 }
 
 fn now_s() -> u64 {
@@ -411,8 +465,8 @@ fn note_counts() {
 }
 
 pub fn summary() -> String {
-    format!("pipeline library: {} hits, {} misses (compiled by the driver), {} stored, {} rejected loads, {} unkeyed; CachedPSO fallback {} hits {} misses",
-        HITS.load(Relaxed), MISSES.load(Relaxed), STORED.load(Relaxed), REJECTED.load(Relaxed), UNKEYED.load(Relaxed), CACHED_HITS.load(Relaxed), CACHED_MISSES.load(Relaxed))
+    format!("pipeline library: {} hits, {} misses (compiled by the driver), {} stored, {} rejected loads, {} unkeyed; CachedPSO fallback {} hits {} misses; {} library lock waits {:.1} ms total",
+        HITS.load(Relaxed), MISSES.load(Relaxed), STORED.load(Relaxed), REJECTED.load(Relaxed), UNKEYED.load(Relaxed), CACHED_HITS.load(Relaxed), CACHED_MISSES.load(Relaxed), LOCK_WAITS.load(Relaxed), LOCK_WAIT_US.load(Relaxed) as f64 / 1000.0)
 }
 
 unsafe fn try_load(l: &Lib, k: u128, load: &dyn Fn(usize, *const u16) -> i32) -> bool {
@@ -420,7 +474,7 @@ unsafe fn try_load(l: &Lib, k: u128, load: &dyn Fn(usize, *const u16) -> i32) ->
         return false;
     }
     let w = wide(k);
-    let _r = l.rw.read().unwrap_or_else(|e| e.into_inner());
+    let _r = read_lib(l);
     let mut ev = crate::frame_ev::begin(crate::frame_ev::PSO_LIB_HIT);
     let hr = load(l.lib, w.as_ptr());
     if hr < 0 {
@@ -432,17 +486,19 @@ unsafe fn try_load(l: &Lib, k: u128, load: &dyn Fn(usize, *const u16) -> i32) ->
 }
 
 unsafe fn store(l: &Lib, k: u128, pso: *mut c_void) {
+    if !l.stored.lock().unwrap_or_else(|e| e.into_inner()).insert(k) {
+        return;
+    }
     let w = wide(k);
     let hr = {
-        let _w = l.rw.write().unwrap_or_else(|e| e.into_inner());
+        let _w = write_lib(l);
         let f: unsafe extern "system" fn(*mut c_void, *const u16, *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(l.lib as *mut c_void, LIB_STORE)) };
         unsafe { f(l.lib as *mut c_void, w.as_ptr(), pso) }
     };
     if hr >= 0 {
         let n = STORED.fetch_add(1, Relaxed) + 1;
-        if n % SAVE_EVERY == 0 {
-            save_async();
-        }
+        let _ = n;
+        LAST_STORE_AT.store(now_s(), Relaxed);
     } else {
         l.rejected.lock().unwrap_or_else(|e| e.into_inner()).insert(k);
         let n = REJECTED.fetch_add(1, Relaxed);
@@ -542,7 +598,7 @@ pub(crate) unsafe fn prebuild(real: *mut c_void, kind: u8, k: u128, desc: &[u8])
         let w = wide(k);
         let f: unsafe extern "system" fn(*mut c_void, *const u16, *const u8, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(l.lib as *mut c_void, if gfx { LIB_LOAD_GFX } else { LIB_LOAD_CS })) };
         let hr = {
-            let _r = l.rw.read().unwrap_or_else(|e| e.into_inner());
+            let _r = read_lib(l);
             unsafe { f(l.lib as *mut c_void, w.as_ptr(), desc.as_ptr(), &IID_PSO, &mut pso) }
         };
         if hr >= 0 && !pso.is_null() {
@@ -598,6 +654,9 @@ pub unsafe fn stream(real: *mut c_void, desc: &[u8], extra: &str, sd: *const [us
 }
 
 fn save(exiting: bool) -> Result<String, String> {
+    if crate::dred::removed() {
+        return Err("device removed; the pipeline library is not serialized or written".into());
+    }
     let Some(Some(l)) = LIB.get() else { return Err("no library".into()) };
     let blob = {
         let _w = if exiting {
@@ -607,8 +666,9 @@ fn save(exiting: bool) -> Result<String, String> {
                 Err(std::sync::TryLockError::WouldBlock) => return Err("a PSO thread held the library at exit; keeping the last periodic save".into()),
             }
         } else {
-            l.rw.write().unwrap_or_else(|e| e.into_inner())
+            write_lib(l)
         };
+        let held = std::time::Instant::now();
         let size: unsafe extern "system" fn(*mut c_void) -> usize = unsafe { core::mem::transmute(vslot(l.lib as *mut c_void, LIB_SIZE)) };
         let n = unsafe { size(l.lib as *mut c_void) };
         if n == 0 {
@@ -620,6 +680,7 @@ fn save(exiting: bool) -> Result<String, String> {
         if hr < 0 {
             return Err(format!("Serialize hr={hr:#010x}"));
         }
+        SAVE_HOLD_US.store(held.elapsed().as_micros() as u64, Relaxed);
         v
     };
     let bytes = file_bytes(&l.ident, &blob);
@@ -644,7 +705,7 @@ fn save_logged(why: &str) {
     let r = save(why == "process exit");
     SAVING.store(false, Relaxed);
     match r {
-        Ok(m) => record("d3d12_xs", "pso_lib", &format!("{m} ({why}; {stored} PSOs stored this run); {}", summary())),
+        Ok(m) => record("d3d12_xs", "pso_lib", &format!("{m} ({why}; {stored} PSOs stored this run; the library was locked {:.1} ms for Serialize); {}", SAVE_HOLD_US.load(Relaxed) as f64 / 1000.0, summary())),
         Err(e) => record("d3d12_xs", "pso_lib", &format!("save ({why}) failed: {e}")),
     }
 }
@@ -686,7 +747,7 @@ pub fn on_present() {
         return;
     }
     let s = STORED.load(Relaxed);
-    if s != LAST_SAVED_STORED.load(Relaxed) && now_s().saturating_sub(SAVED_AT.load(Relaxed)) >= SAVE_SECS {
+    if s != LAST_SAVED_STORED.load(Relaxed) && save_due(now, SAVED_AT.load(Relaxed), LAST_STORE_AT.load(Relaxed)) {
         LAST_SAVED_STORED.store(s, Relaxed);
         save_async();
     }
@@ -854,6 +915,15 @@ void main() { o.Store(0, 5u); }
     }
 
     #[test]
+    fn saves_wait_for_a_quiet_moment_but_never_longer_than_the_force_interval() {
+        assert!(!save_due(100, 90, 0));
+        assert!(save_due(130, 100, 120));
+        assert!(!save_due(130, 100, 129));
+        assert!(!save_due(219, 100, 219));
+        assert!(save_due(220, 100, 220));
+    }
+
+    #[test]
     fn totals_are_logged_every_ten_seconds_even_without_new_entries() {
         assert!(summary_due(100, 0));
         assert!(!summary_due(105, 100));
@@ -867,5 +937,16 @@ void main() { o.Store(0, 5u); }
         let w = wide(0xabc);
         assert_eq!(w[32], 0);
         assert_eq!(String::from_utf16_lossy(&w[..32]), format!("{:032x}", 0xabcu128));
+    }
+}
+
+#[cfg(test)]
+mod removed_gate {
+    #[test]
+    fn no_library_blob_is_written_after_device_removal() {
+        crate::dred::mark_removed();
+        let e = super::save(false).unwrap_err();
+        crate::dred::clear_removed_for_test();
+        assert!(e.contains("device removed"), "{e}");
     }
 }

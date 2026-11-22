@@ -225,7 +225,9 @@ const H_LISTEN: usize = 24;
 const H_ACCEPT: usize = 25;
 const H_WSAACCEPT: usize = 26;
 const H_CLOSESOCKET: usize = 27;
-static ORIG: [AtomicUsize; 28] = [const { AtomicUsize::new(0) }; 28];
+const H_WSAIOCTL: usize = 28;
+const H_SETSOCKOPT: usize = 29;
+static ORIG: [AtomicUsize; 30] = [const { AtomicUsize::new(0) }; 30];
 static GAME_CB: Mutex<Vec<(usize, usize, u32)>> = Mutex::new(Vec::new());
 static PARENT: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
@@ -561,8 +563,10 @@ unsafe extern "system" fn h_connect(s: usize, name: *const u8, len: i32) -> i32 
 
 unsafe fn note_socket(s: usize, r: i32, remote: *const u8, len: i32) {
     let e = GetLastError();
-    if r >= 0 || e == 10035 {
+    if r >= 0 {
         crate::netview::sockets::report_socket(s, remote, len);
+    } else if e == WSAEWOULDBLOCK {
+        crate::netview::sockets::report_event(s, crate::netview::sockets::Event::Connecting, remote, len);
     }
     SetLastError(e);
 }
@@ -611,10 +615,208 @@ unsafe extern "system" fn h_wsaaccept(s: usize, addr: *mut u8, len: *mut i32, co
 
 unsafe extern "system" fn h_closesocket(s: usize) -> i32 {
     crate::netview::sockets::forget(s as u64);
+    PENDING_ACCEPTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, a)| *a != s);
     orig!(H_CLOSESOCKET, fn(usize) -> i32)(s)
 }
 
-const SOCKET_TABLE_HOOKS: usize = 5;
+const WSAEWOULDBLOCK: u32 = 10035;
+const ERROR_IO_PENDING: u32 = 997;
+const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
+const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
+const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
+const WSAID_ACCEPTEX: [u8; 16] = [0xf1, 0x7d, 0x36, 0xb5, 0xac, 0xcb, 0xcf, 0x11, 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92];
+const WSAID_GETACCEPTEXSOCKADDRS: [u8; 16] = [0xf2, 0x7d, 0x36, 0xb5, 0xac, 0xcb, 0xcf, 0x11, 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92];
+const WSAID_CONNECTEX: [u8; 16] = [0xb9, 0x07, 0xa2, 0x25, 0xf3, 0xdd, 0x60, 0x46, 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e];
+
+static REAL_ACCEPTEX: AtomicUsize = AtomicUsize::new(0);
+static REAL_GETACCEPTEXSOCKADDRS: AtomicUsize = AtomicUsize::new(0);
+static REAL_CONNECTEX: AtomicUsize = AtomicUsize::new(0);
+static UNWRAPPED_EXTENSIONS: AtomicUsize = AtomicUsize::new(0);
+static PENDING_ACCEPTS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+type AcceptExFn = unsafe extern "system" fn(usize, usize, *mut u8, u32, u32, u32, *mut u32, *mut c_void) -> i32;
+type GetAcceptExSockaddrsFn = unsafe extern "system" fn(*mut u8, u32, u32, u32, *mut *mut u8, *mut i32, *mut *mut u8, *mut i32);
+type ConnectExFn = unsafe extern "system" fn(usize, *const u8, i32, *const c_void, u32, *mut u32, *mut c_void) -> i32;
+
+unsafe extern "system" fn w_acceptex(listen: usize, accept: usize, buf: *mut u8, recv: u32, local_len: u32, remote_len: u32, got: *mut u32, ov: *mut c_void) -> i32 {
+    let f: AcceptExFn = core::mem::transmute(REAL_ACCEPTEX.load(Ordering::SeqCst));
+    {
+        let mut g = PENDING_ACCEPTS.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|(b, a)| *b != buf as usize && *a != accept);
+        g.push((buf as usize, accept));
+    }
+    let r = f(listen, accept, buf, recv, local_len, remote_len, got, ov);
+    let e = GetLastError();
+    if r == 0 && e != ERROR_IO_PENDING {
+        PENDING_ACCEPTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(b, _)| *b != buf as usize);
+    }
+    SetLastError(e);
+    r
+}
+
+unsafe extern "system" fn w_getacceptexsockaddrs(buf: *mut u8, recv: u32, local_len: u32, remote_len: u32, local: *mut *mut u8, ll: *mut i32, remote: *mut *mut u8, rl: *mut i32) {
+    let f: GetAcceptExSockaddrsFn = core::mem::transmute(REAL_GETACCEPTEXSOCKADDRS.load(Ordering::SeqCst));
+    f(buf, recv, local_len, remote_len, local, ll, remote, rl);
+    let e = GetLastError();
+    let accept = {
+        let mut g = PENDING_ACCEPTS.lock().unwrap_or_else(|e| e.into_inner());
+        let found = g.iter().find(|(b, _)| *b == buf as usize).map(|(_, a)| *a);
+        g.retain(|(b, _)| *b != buf as usize);
+        found
+    };
+    if let Some(a) = accept {
+        if !local.is_null() && !remote.is_null() && !ll.is_null() && !rl.is_null() {
+            crate::netview::sockets::report_accepted(a, *local, *ll, *remote, *rl);
+        }
+    }
+    SetLastError(e);
+}
+
+unsafe extern "system" fn w_connectex(s: usize, name: *const u8, len: i32, send: *const c_void, send_len: u32, sent: *mut u32, ov: *mut c_void) -> i32 {
+    if !dest_allowed(name, len) {
+        deny_dest("ConnectEx", name, len);
+        return 0;
+    }
+    let f: ConnectExFn = core::mem::transmute(REAL_CONNECTEX.load(Ordering::SeqCst));
+    let r = f(s, name, len, send, send_len, sent, ov);
+    let e = GetLastError();
+    if r != 0 {
+        crate::netview::sockets::report_socket(s, name, len);
+    } else if e == ERROR_IO_PENDING {
+        crate::netview::sockets::report_event(s, crate::netview::sockets::Event::Connecting, name, len);
+    }
+    SetLastError(e);
+    r
+}
+
+fn wrap_extension(guid: &[u8; 16], real: usize) -> usize {
+    let (slot, wrapper) = match *guid {
+        WSAID_ACCEPTEX => (&REAL_ACCEPTEX, w_acceptex as *const () as usize),
+        WSAID_GETACCEPTEXSOCKADDRS => (&REAL_GETACCEPTEXSOCKADDRS, w_getacceptexsockaddrs as *const () as usize),
+        WSAID_CONNECTEX => (&REAL_CONNECTEX, w_connectex as *const () as usize),
+        _ => return real,
+    };
+    if real == 0 || real == wrapper {
+        return real;
+    }
+    match slot.compare_exchange(0, real, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => wrapper,
+        Err(known) if known == real => wrapper,
+        Err(_) => {
+            if UNWRAPPED_EXTENSIONS.fetch_add(1, Ordering::SeqCst) == 0 {
+                note("a second provider returned its own AcceptEx/ConnectEx/GetAcceptExSockaddrs; its sockets are not reported");
+            }
+            real
+        }
+    }
+}
+
+const WSAEFAULT: u32 = 10014;
+const WSAEINVAL: u32 = 10022;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetEvent(h: *mut c_void) -> i32;
+    fn QueueUserAPC(f: unsafe extern "system" fn(usize), thread: *mut c_void, data: usize) -> u32;
+    fn GetCurrentThread() -> *mut c_void;
+    fn DuplicateHandle(sp: *mut c_void, s: *mut c_void, tp: *mut c_void, t: *mut *mut c_void, access: u32, inherit: i32, options: u32) -> u32;
+    fn CloseHandle(h: *mut c_void) -> i32;
+}
+
+type WsaCompletion = unsafe extern "system" fn(u32, u32, *mut c_void, u32);
+
+struct SortApc {
+    cr: WsaCompletion,
+    bytes: u32,
+    ov: *mut c_void,
+    thread: *mut c_void,
+}
+
+unsafe extern "system" fn sort_apc(data: usize) {
+    let a = Box::from_raw(data as *mut SortApc);
+    (a.cr)(0, a.bytes, a.ov, 0);
+    CloseHandle(a.thread);
+}
+
+pub unsafe fn emulated_address_list_sort(input: *const c_void, in_len: u32, out: *mut c_void, out_len: u32, ret: *mut u32, ov: *mut c_void, cr: *mut c_void) -> i32 {
+    if input.is_null() || out.is_null() || (in_len as usize) < 4 {
+        SetLastError(WSAEINVAL);
+        return -1;
+    }
+    let n = core::ptr::read_unaligned(input as *const i32);
+    let need = if n < 0 { usize::MAX } else { 8 + 16 * n as usize };
+    if (in_len as usize) < need {
+        SetLastError(WSAEINVAL);
+        return -1;
+    }
+    if (out_len as usize) < need {
+        SetLastError(WSAEFAULT);
+        return -1;
+    }
+    if input as usize != out as usize {
+        core::ptr::copy(input as *const u8, out as *mut u8, need);
+    }
+    let bytes = match crate::netview::iphlp::address_list_sort(out as *mut u8, out_len) {
+        Ok(b) => b,
+        Err(_) => {
+            SetLastError(WSAEINVAL);
+            return -1;
+        }
+    };
+    if !ret.is_null() {
+        *ret = bytes;
+    }
+    if !ov.is_null() {
+        let o = ov as *mut usize;
+        *o = 0;
+        *o.add(1) = bytes as usize;
+        let ev = *o.add(3);
+        if cr.is_null() && ev != 0 && ev & 1 == 0 {
+            SetEvent(ev as *mut c_void);
+        }
+    }
+    if !cr.is_null() {
+        let mut t: *mut c_void = core::ptr::null_mut();
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &mut t, 0, 0, 2);
+        let a = Box::into_raw(Box::new(SortApc { cr: core::mem::transmute::<*mut c_void, WsaCompletion>(cr), bytes, ov, thread: t }));
+        if QueueUserAPC(sort_apc, t, a as usize) == 0 {
+            drop(Box::from_raw(a));
+            CloseHandle(t);
+        }
+    }
+    SetLastError(0);
+    0
+}
+
+unsafe extern "system" fn h_wsaioctl(s: usize, code: u32, input: *const c_void, in_len: u32, out: *mut c_void, out_len: u32, ret: *mut u32, ov: *mut c_void, cr: *mut c_void) -> i32 {
+    if code == crate::netview::iphlp::SIO_ADDRESS_LIST_SORT {
+        return emulated_address_list_sort(input, in_len, out, out_len, ret, ov, cr);
+    }
+    let r = orig!(H_WSAIOCTL, fn(usize, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *mut c_void) -> i32)(s, code, input, in_len, out, out_len, ret, ov, cr);
+    if r == 0 && code == SIO_GET_EXTENSION_FUNCTION_POINTER && !input.is_null() && in_len as usize >= 16 && !out.is_null() && out_len as usize >= core::mem::size_of::<usize>() {
+        let guid = core::ptr::read_unaligned(input as *const [u8; 16]);
+        let real = core::ptr::read_unaligned(out as *const usize);
+        core::ptr::write_unaligned(out as *mut usize, wrap_extension(&guid, real));
+    }
+    r
+}
+
+unsafe extern "system" fn h_setsockopt(s: usize, level: i32, name: i32, val: *const u8, len: i32) -> i32 {
+    let r = orig!(H_SETSOCKOPT, fn(usize, i32, i32, *const u8, i32) -> i32)(s, level, name, val, len);
+    if r == 0 && level == 0xffff {
+        match name {
+            SO_UPDATE_ACCEPT_CONTEXT => {
+                PENDING_ACCEPTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, a)| *a != s);
+                note_event(s, crate::netview::sockets::Event::Accepted, core::ptr::null(), 0);
+            }
+            SO_UPDATE_CONNECT_CONTEXT => note_event(s, crate::netview::sockets::Event::Connected, core::ptr::null(), 0),
+            _ => {}
+        }
+    }
+    r
+}
+
+const SOCKET_TABLE_HOOKS: usize = 7;
 
 fn install_socket_table_hooks() -> (usize, Vec<String>) {
     let ws = b"ws2_32.dll\0";
@@ -624,6 +826,8 @@ fn install_socket_table_hooks() -> (usize, Vec<String>) {
         (b"accept\0", H_ACCEPT, h_accept as *const () as usize),
         (b"WSAAccept\0", H_WSAACCEPT, h_wsaaccept as *const () as usize),
         (b"closesocket\0", H_CLOSESOCKET, h_closesocket as *const () as usize),
+        (b"WSAIoctl\0", H_WSAIOCTL, h_wsaioctl as *const () as usize),
+        (b"setsockopt\0", H_SETSOCKOPT, h_setsockopt as *const () as usize),
     ];
     let (mut hooked, mut missing) = (0, Vec::new());
     for (f, idx, hook) in table {
@@ -1255,7 +1459,7 @@ mod socket_table_tests {
     fn arm() -> std::sync::MutexGuard<'static, ()> {
         let g = sockets::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = std::net::UdpSocket::bind("127.0.0.1:0");
-        for (idx, name) in [(H_BIND, &b"bind\0"[..]), (H_LISTEN, b"listen\0"), (H_ACCEPT, b"accept\0"), (H_WSAACCEPT, b"WSAAccept\0"), (H_CLOSESOCKET, b"closesocket\0")] {
+        for (idx, name) in [(H_BIND, &b"bind\0"[..]), (H_LISTEN, b"listen\0"), (H_ACCEPT, b"accept\0"), (H_WSAACCEPT, b"WSAAccept\0"), (H_CLOSESOCKET, b"closesocket\0"), (H_CONNECT, b"connect\0"), (H_WSAIOCTL, b"WSAIoctl\0"), (H_SETSOCKOPT, b"setsockopt\0")] {
             let p = unsafe { resolve_export(b"ws2_32.dll\0", name) };
             assert!(!p.is_null());
             ORIG[idx].store(p as usize, Ordering::SeqCst);
@@ -1350,5 +1554,239 @@ mod socket_table_tests {
         let raw = std::os::windows::io::AsRawSocket::as_raw_socket(&l);
         drop(l);
         assert!(!sockets::endpoints().iter().any(|e| e.socket == raw && e.pid == std::process::id()));
+    }
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn ioctlsocket(s: usize, cmd: i32, arg: *mut u32) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateEventW(sa: *mut c_void, manual: i32, initial: i32, name: *const u16) -> *mut c_void;
+        fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+    }
+
+    const FIONBIO: i32 = 0x8004_667Eu32 as i32;
+
+    fn sin(ip: [u8; 4], port: u16) -> [u8; 16] {
+        let mut a = [0u8; 16];
+        a[0] = 2;
+        a[2..4].copy_from_slice(&port.to_be_bytes());
+        a[4..8].copy_from_slice(&ip);
+        a
+    }
+
+    fn settled(s: usize) -> Option<sockets::Endpoint> {
+        let pid = std::process::id();
+        sockets::endpoints().into_iter().find(|e| e.socket == s as u64 && e.pid == pid)
+    }
+
+    fn wait_for(ms: u64, mut f: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed().as_millis() < ms as u128 {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        f()
+    }
+
+    unsafe fn extension(s: usize, guid: &[u8; 16]) -> usize {
+        let mut p = 0usize;
+        let mut got = 0u32;
+        let r = h_wsaioctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, guid.as_ptr() as *const c_void, 16, &mut p as *mut usize as *mut c_void, 8, &mut got, core::ptr::null_mut(), core::ptr::null_mut());
+        assert_eq!(r, 0);
+        p
+    }
+
+    struct Overlapped {
+        raw: Box<[usize; 4]>,
+    }
+
+    impl Overlapped {
+        unsafe fn new() -> Overlapped {
+            let ev = CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null());
+            assert!(!ev.is_null());
+            Overlapped { raw: Box::new([0, 0, 0, ev as usize]) }
+        }
+        fn ptr(&mut self) -> *mut c_void {
+            self.raw.as_mut_ptr() as *mut c_void
+        }
+        unsafe fn wait(&self) {
+            assert_eq!(WaitForSingleObject(self.raw[3] as *mut c_void, 5000), 0);
+        }
+    }
+
+    #[test]
+    fn nonblocking_connects_show_syn_sent_then_established_or_vanish_on_failure() {
+        let _g = arm();
+        unsafe {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let s = socket(2, 1, 6);
+            let mut on = 1u32;
+            assert_eq!(ioctlsocket(s, FIONBIO, &mut on), 0);
+            let a = sin([127, 0, 0, 1], port);
+            assert_eq!(h_connect(s, a.as_ptr(), 16), -1);
+            assert_eq!(GetLastError(), WSAEWOULDBLOCK);
+            let row = mine(s).expect("in-progress connect recorded");
+            assert_eq!(row.state, sockets::MIB_TCP_STATE_SYN_SENT);
+            assert_eq!(row.remote.unwrap().port(), port);
+            assert!(wait_for(5000, || settled(s).map(|e| e.state) == Some(MIB_TCP_STATE_ESTAB)));
+            let local = settled(s).unwrap().local.port();
+            assert!(tcp_ports().contains(&(local, MIB_TCP_STATE_ESTAB)));
+            assert_eq!(h_closesocket(s), 0);
+            let dead = {
+                let t = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                t.local_addr().unwrap().port()
+            };
+            let f = socket(2, 1, 6);
+            assert_eq!(ioctlsocket(f, FIONBIO, &mut on), 0);
+            let b = sin([127, 0, 0, 1], dead);
+            assert_eq!(h_connect(f, b.as_ptr(), 16), -1);
+            assert_eq!(GetLastError(), WSAEWOULDBLOCK);
+            assert_eq!(mine(f).unwrap().state, sockets::MIB_TCP_STATE_SYN_SENT);
+            assert!(wait_for(10000, || settled(f).is_none()));
+            assert!(mine(f).is_none());
+            assert_eq!(h_closesocket(f), 0);
+        }
+    }
+
+    #[test]
+    fn connectex_pointers_are_wrapped_and_report_the_connection() {
+        let _g = arm();
+        unsafe {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let s = socket(2, 1, 6);
+            assert_eq!(h_bind(s, loopback_any().as_ptr(), 16), 0);
+            let p = extension(s, &WSAID_CONNECTEX);
+            assert_eq!(p, w_connectex as *const () as usize);
+            let transmit = [0xf0, 0x7d, 0x36, 0xb5, 0xac, 0xcb, 0xcf, 0x11, 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92];
+            let mut real = 0usize;
+            let mut got = 0u32;
+            assert_eq!(orig!(H_WSAIOCTL, fn(usize, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *mut c_void) -> i32)(s, SIO_GET_EXTENSION_FUNCTION_POINTER, transmit.as_ptr() as *const c_void, 16, &mut real as *mut usize as *mut c_void, 8, &mut got, core::ptr::null_mut(), core::ptr::null_mut()), 0);
+            assert_eq!(extension(s, &transmit), real);
+            let connect_ex: ConnectExFn = core::mem::transmute(p);
+            let mut ov = Overlapped::new();
+            let a = sin([127, 0, 0, 1], port);
+            let r = connect_ex(s, a.as_ptr(), 16, core::ptr::null(), 0, core::ptr::null_mut(), ov.ptr());
+            if r == 0 {
+                assert_eq!(GetLastError(), ERROR_IO_PENDING);
+            }
+            assert!(mine(s).is_some());
+            ov.wait();
+            assert!(wait_for(5000, || settled(s).map(|e| e.state) == Some(MIB_TCP_STATE_ESTAB)));
+            assert_eq!(h_setsockopt(s, 0xffff, SO_UPDATE_CONNECT_CONTEXT, core::ptr::null(), 0), 0);
+            let row = mine(s).unwrap();
+            assert_eq!(row.state, MIB_TCP_STATE_ESTAB);
+            assert_eq!(row.remote.unwrap().port(), port);
+            assert_eq!(h_closesocket(s), 0);
+            let d = socket(2, 1, 6);
+            assert_eq!(h_bind(d, loopback_any().as_ptr(), 16), 0);
+            LAST_REFRESH.store(GetTickCount64() as usize, Ordering::Relaxed);
+            let far = sin([203, 0, 113, 1], 9);
+            let mut ov2 = Overlapped::new();
+            assert_eq!(connect_ex(d, far.as_ptr(), 16, core::ptr::null(), 0, core::ptr::null_mut(), ov2.ptr()), 0);
+            assert_eq!(GetLastError(), WSAENETUNREACH);
+            assert_ne!(mine(d).map(|e| e.state), Some(sockets::MIB_TCP_STATE_SYN_SENT));
+            assert_eq!(h_closesocket(d), 0);
+        }
+    }
+
+    #[test]
+    fn acceptex_connections_appear_once_their_addresses_are_read() {
+        let _g = arm();
+        unsafe {
+            let ls = socket(2, 1, 6);
+            assert_eq!(h_bind(ls, loopback_any().as_ptr(), 16), 0);
+            assert_eq!(h_listen(ls, 4), 0);
+            let port = mine(ls).unwrap().local.port();
+            let accept_ex: AcceptExFn = core::mem::transmute(extension(ls, &WSAID_ACCEPTEX));
+            let p = extension(ls, &WSAID_GETACCEPTEXSOCKADDRS);
+            assert_eq!(p, w_getacceptexsockaddrs as *const () as usize);
+            let addrs: GetAcceptExSockaddrsFn = core::mem::transmute(p);
+            let acc = socket(2, 1, 6);
+            let mut buf = [0u8; 64];
+            let mut got = 0u32;
+            let mut ov = Overlapped::new();
+            let r = accept_ex(ls, acc, buf.as_mut_ptr(), 0, 32, 32, &mut got, ov.ptr());
+            if r == 0 {
+                assert_eq!(GetLastError(), ERROR_IO_PENDING);
+            }
+            assert!(mine(acc).is_none());
+            let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            ov.wait();
+            assert!(mine(acc).is_none());
+            let (mut lp, mut rp) = (core::ptr::null_mut(), core::ptr::null_mut());
+            let (mut ll, mut rl) = (0i32, 0i32);
+            addrs(buf.as_mut_ptr(), 0, 32, 32, &mut lp, &mut ll, &mut rp, &mut rl);
+            let row = mine(acc).expect("AcceptEx connection reported");
+            assert_eq!(row.state, MIB_TCP_STATE_ESTAB);
+            assert_eq!(row.local.port(), port);
+            assert_eq!(row.remote.unwrap().port(), client.local_addr().unwrap().port());
+            assert_eq!(h_closesocket(acc), 0);
+            assert!(mine(acc).is_none());
+            let acc2 = socket(2, 1, 6);
+            let mut buf2 = [0u8; 64];
+            let mut ov2 = Overlapped::new();
+            let r = accept_ex(ls, acc2, buf2.as_mut_ptr(), 0, 32, 32, &mut got, ov2.ptr());
+            if r == 0 {
+                assert_eq!(GetLastError(), ERROR_IO_PENDING);
+            }
+            let client2 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            ov2.wait();
+            assert_eq!(h_setsockopt(acc2, 0xffff, SO_UPDATE_ACCEPT_CONTEXT, &ls as *const usize as *const u8, 8), 0);
+            let row = mine(acc2).expect("context-updated AcceptEx socket reported");
+            assert_eq!(row.state, MIB_TCP_STATE_ESTAB);
+            assert_eq!(row.remote.unwrap().port(), client2.local_addr().unwrap().port());
+            assert!(PENDING_ACCEPTS.lock().unwrap().iter().all(|(_, a)| *a != acc2));
+            assert_eq!(h_closesocket(acc2), 0);
+            assert_eq!(h_closesocket(ls), 0);
+        }
+    }
+
+    #[test]
+    fn address_list_sort_is_answered_from_the_emulated_view() {
+        let _g = arm();
+        let mk = |ip: std::net::Ipv6Addr| {
+            let mut b = [0u8; 28];
+            b[0] = 0x17;
+            b[8..24].copy_from_slice(&ip.octets());
+            b
+        };
+        let root4 = mk(std::net::Ipv4Addr::new(198, 41, 0, 4).to_ipv6_mapped());
+        let lo6 = mk(std::net::Ipv6Addr::LOCALHOST);
+        let mut list = [0u8; 8 + 32];
+        list[0] = 2;
+        list[8..16].copy_from_slice(&(root4.as_ptr() as usize).to_le_bytes());
+        list[16] = 28;
+        list[24..32].copy_from_slice(&(lo6.as_ptr() as usize).to_le_bytes());
+        list[32] = 28;
+        let mut out = [0u8; 40];
+        let mut got = 0u32;
+        unsafe {
+            let s = socket(23, 2, 0);
+            assert_ne!(s, usize::MAX);
+            let r = h_wsaioctl(s, crate::netview::iphlp::SIO_ADDRESS_LIST_SORT, list.as_ptr() as *const c_void, 40, out.as_mut_ptr() as *mut c_void, 40, &mut got, core::ptr::null_mut(), core::ptr::null_mut());
+            assert_eq!(r, 0);
+            assert_eq!(got, 40);
+            assert_eq!(usize::from_le_bytes(out[8..16].try_into().unwrap()), lo6.as_ptr() as usize);
+            assert_eq!(usize::from_le_bytes(out[24..32].try_into().unwrap()), root4.as_ptr() as usize);
+            let r = h_wsaioctl(s, crate::netview::iphlp::SIO_ADDRESS_LIST_SORT, list.as_ptr() as *const c_void, 40, out.as_mut_ptr() as *mut c_void, 20, &mut got, core::ptr::null_mut(), core::ptr::null_mut());
+            assert_eq!(r, -1);
+            assert_eq!(GetLastError(), WSAEFAULT);
+            let ev = CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null());
+            let mut ov = [0usize; 4];
+            ov[3] = ev as usize;
+            let r = h_wsaioctl(s, crate::netview::iphlp::SIO_ADDRESS_LIST_SORT, list.as_ptr() as *const c_void, 40, list.as_mut_ptr() as *mut c_void, 40, &mut got, ov.as_mut_ptr() as *mut c_void, core::ptr::null_mut());
+            assert_eq!(r, 0);
+            assert_eq!(ov[1], 40);
+            assert_eq!(WaitForSingleObject(ev, 0), 0);
+            assert_eq!(usize::from_le_bytes(list[8..16].try_into().unwrap()), lo6.as_ptr() as usize);
+            assert_eq!(h_closesocket(s), 0);
+        }
     }
 }

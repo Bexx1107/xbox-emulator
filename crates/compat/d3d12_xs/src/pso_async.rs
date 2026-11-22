@@ -173,6 +173,36 @@ fn eligible(d: &[u8]) -> bool {
     no_tess_gs && no_so && (1..=3).contains(&topo) && rd64(d, 0x08) != 0 && rd64(d, 0x10) != 0 && rd64(d, 0) != 0
 }
 
+pub unsafe fn sync_reason(pdesc: *const u8, riid: *const Guid, compute: bool) -> &'static str {
+    if !enabled() {
+        return "TOMBOX_PSO_ASYNC=0";
+    }
+    if !HOOKED.load(Ordering::Acquire) {
+        return "async PSO hooks not installed yet";
+    }
+    if pdesc.is_null() || riid.is_null() || unsafe { *riid != IID_PSO } {
+        return "riid is not ID3D12PipelineState";
+    }
+    if compute {
+        let d = unsafe { core::slice::from_raw_parts(pdesc, CS_DESC_SIZE) };
+        return if rd64(d, 0) == 0 { "null root signature" } else if rd64(d, 8) == 0 || rd64(d, 16) == 0 { "no compute shader" } else { "shader over 4 MB" };
+    }
+    let d = unsafe { core::slice::from_raw_parts(pdesc, DESC_SIZE) };
+    if ![0x28usize, 0x38, 0x48].iter().all(|&o| rd64(d, o) == 0 || rd64(d, o + 8) == 0) {
+        "has a hull, domain or geometry shader"
+    } else if rd64(d, 0x58) != 0 && rd32(d, 0x60) != 0 {
+        "stream output"
+    } else if !(1..=3).contains(&rd32(d, 0x23c)) {
+        "topology type is not point, line or triangle"
+    } else if rd64(d, 0x08) == 0 || rd64(d, 0x10) == 0 {
+        "no vertex shader"
+    } else if rd64(d, 0) == 0 {
+        "null root signature"
+    } else {
+        "snapshot refused (shader over 4 MB or more than 64 input elements)"
+    }
+}
+
 unsafe fn snapshot(pdesc: *const u8, num_ext: u32, pext: *const u8) -> Option<Owned> {
     let mut desc = unsafe { core::slice::from_raw_parts(pdesc, DESC_SIZE) }.to_vec();
     let mut blobs = Vec::new();

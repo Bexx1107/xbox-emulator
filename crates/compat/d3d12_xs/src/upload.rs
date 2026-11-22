@@ -622,6 +622,9 @@ struct Staged {
 /// Check one tracked texture; stage an upload for every changed, readable subresource.
 /// `fresh_only`: look only at subresources that have never been uploaded.
 unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: bool) -> Option<Staged> {
+    if crate::dred::removed() {
+        return None;
+    }
     let device = up.device;
     let now = up.pumps;
     let t = &mut up.tracked[idx];

@@ -37,9 +37,14 @@ pub enum CbvRaw {
     Off,
     On,
     Forced,
+    Copy,
 }
 
 impl CbvRaw {
+    pub fn rewrites(self) -> bool {
+        matches!(self, CbvRaw::On | CbvRaw::Forced)
+    }
+
     pub fn of(rewrite: bool, xbox_one_title: bool) -> CbvRaw {
         match (rewrite, xbox_one_title) {
             (false, _) => CbvRaw::Off,
@@ -50,6 +55,7 @@ impl CbvRaw {
 
     pub fn decide(setting: Option<&str>, xbox_one_title: bool) -> CbvRaw {
         let rewrite = match setting.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("copy") => return CbvRaw::Copy,
             Some("1") | Some("on") => true,
             Some("0") | Some("off") => false,
             _ => xbox_one_title,
@@ -66,6 +72,7 @@ impl CbvRaw {
             CbvRaw::Off => "off",
             CbvRaw::On => "on",
             CbvRaw::Forced => "forced",
+            CbvRaw::Copy => "copy",
         }
     }
 
@@ -74,12 +81,17 @@ impl CbvRaw {
             "off" => Some(CbvRaw::Off),
             "on" => Some(CbvRaw::On),
             "forced" => Some(CbvRaw::Forced),
+            "copy" => Some(CbvRaw::Copy),
             _ => None,
         }
     }
 
     pub fn key_tag(self) -> &'static str {
-        if self == CbvRaw::Off { "cbraw=0" } else { "cbraw=1" }
+        match self {
+            CbvRaw::Off => "cbraw=0",
+            CbvRaw::Copy => "cbraw=copy",
+            CbvRaw::On | CbvRaw::Forced => "cbraw=1",
+        }
     }
 }
 
@@ -111,7 +123,7 @@ impl Mode {
 pub fn translate(ex: &ShaderExtract, link: Option<&InputInterp>, cbv: CbvRaw) -> Result<Translated, String> {
     let link = link.filter(|l| !l.0.is_empty());
     let mut t = hlsl::translate_linked(ex, link).map_err(|e| format!("translate: {e}"))?;
-    if cbv != CbvRaw::Off {
+    if cbv.rewrites() {
         if cbv == CbvRaw::On && !gcn::is_durango(&ex.fssm) {
             return Err("bind: Xbox One title shader is not a Durango program; its constant buffers cannot follow the raw-SRV binding".into());
         }
@@ -225,9 +237,12 @@ mod tests {
         assert_eq!(CbvRaw::decide(None, true), CbvRaw::On);
         assert_eq!(CbvRaw::decide(None, false), CbvRaw::Off);
         assert_eq!(CbvRaw::decide(Some("x"), false), CbvRaw::Off);
-        for c in [CbvRaw::Off, CbvRaw::On, CbvRaw::Forced] {
+        assert_eq!(CbvRaw::decide(Some("copy"), true), CbvRaw::Copy);
+        assert_eq!(CbvRaw::decide(Some(" COPY "), false), CbvRaw::Copy);
+        for c in [CbvRaw::Off, CbvRaw::On, CbvRaw::Forced, CbvRaw::Copy] {
             assert_eq!(CbvRaw::parse(c.name()), Some(c));
         }
+        assert!(!CbvRaw::Copy.rewrites() && !CbvRaw::Off.rewrites() && CbvRaw::On.rewrites() && CbvRaw::Forced.rewrites());
     }
 
     #[test]
@@ -239,6 +254,11 @@ mod tests {
         let src = "float4 main() : SV_Target { return 1; }";
         assert_ne!(key(src, "ps_6_0", &off, &[]), key(src, "ps_6_0", &on, &[]));
         assert_eq!(key(src, "ps_6_0", &on, &[]), key(src, "ps_6_0", &forced, &[]));
+        let copy = Mode { cbv_raw: CbvRaw::Copy, ..off };
+        assert_ne!(key(src, "ps_6_0", &copy, &[]), key(src, "ps_6_0", &off, &[]));
+        assert_ne!(key(src, "ps_6_0", &copy, &[]), key(src, "ps_6_0", &on, &[]));
+        assert_eq!(key(src, "ps_6_0", &copy, &[]), shader_cache::key(src, "ps_6_0", fma, "cbraw=copy"));
+        assert_eq!(key(src, "ps_6_0", &on, &[]), shader_cache::key(src, "ps_6_0", fma, "cbraw=1"));
         assert_eq!(key(src, "ps_6_0", &off, &[]), shader_cache::key(src, "ps_6_0", fma, "cbraw=0"));
         assert_eq!(key(src, "ps_6_0", &off, &["edited-plain-compile"]), shader_cache::key(src, "ps_6_0", fma, &["cbraw=0", "edited-plain-compile"].join(" ")));
     }
@@ -249,6 +269,8 @@ mod tests {
         let (t, back) = Mode::parse_line(&m.line()).unwrap();
         assert_eq!(t, TRANSLATOR_HASH);
         assert_eq!(back, m);
+        let c = Mode { cbv_raw: CbvRaw::Copy, ..m };
+        assert_eq!(Mode::parse_line(&c.line()).unwrap().1, c);
         assert!(Mode::parse_line("translator=x cbraw=maybe loop_grad=1 fma=0000").is_none());
     }
 

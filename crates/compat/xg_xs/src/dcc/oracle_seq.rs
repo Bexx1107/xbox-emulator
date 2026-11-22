@@ -745,7 +745,8 @@ fn dcc_watch_scratch() {
     let b = build_of(&o);
     let c = case(id);
     let dec = !c.enc;
-    let (site, chk) = if dec { ([b.dconv, b.drelays[0], b.drelays[1], b.drelays[2]][site_k], b.dec_chk) } else { ([b.relays[0], b.relays[1], b.relays[2], b.convs][site_k], b.enc_chk) };
+    let site0 = std::env::var("TOMBOX_DCC_SITE0").ok().and_then(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok()).unwrap_or(b.dconv);
+    let (site, chk) = if dec { ([site0, b.drelays[0], b.drelays[1], b.drelays[2]][site_k], b.dec_chk) } else { ([b.relays[0], b.relays[1], b.relays[2], b.convs][site_k], b.enc_chk) };
     let (cd, ce) = (o.f("XGDecodeDCC") as usize, o.f("XGEncodeDCC") as usize);
     let mut e = 0;
     let mut rs = 0;
@@ -825,7 +826,8 @@ fn dcc_needed_dec_bytes() {
     let b = build_of(&o);
     arm_veh(o.h);
     let (cd, ce) = (o.f("XGDecodeDCC") as usize, o.f("XGEncodeDCC") as usize);
-    let sites = [(b.dconv, b.conv), (b.drelays[0], b.relay), (b.drelays[1], b.relay), (b.drelays[2], b.relay)];
+    let site0 = std::env::var("TOMBOX_DCC_SITE0").ok().and_then(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok()).unwrap_or(b.dconv);
+    let sites = [(site0, b.conv), (b.drelays[0], b.relay), (b.drelays[1], b.relay), (b.drelays[2], b.relay)];
     let ss: Vec<super::oracle_cases::Snap> = sites.iter().map(|&(s, t)| unsafe { super::oracle_cases::Snap::new(o.h, s, o.h + t) }).collect();
     let pd = unsafe { RspProbe::new(o.h, b.dec_chk) };
     for &id in &ids {
@@ -938,7 +940,8 @@ fn dcc_dec_residue_find() {
     let b = build_of(&o);
     let (cd, ce) = (o.f("XGDecodeDCC") as usize, o.f("XGEncodeDCC") as usize);
     let c = case(id);
-    let sites = [(b.dconv, b.conv), (b.drelays[0], b.relay), (b.drelays[1], b.relay), (b.drelays[2], b.relay)];
+    let site0 = std::env::var("TOMBOX_DCC_SITE0").ok().and_then(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok()).unwrap_or(b.dconv);
+    let sites = [(site0, b.conv), (b.drelays[0], b.relay), (b.drelays[1], b.relay), (b.drelays[2], b.relay)];
     for &m in &c.meta {
         let sg = crate::dcc::bits::seg_info_checked(m as u32);
         println!("rfind {id} meta {m:#x} segs {sg:x?}");

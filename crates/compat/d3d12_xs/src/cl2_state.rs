@@ -443,9 +443,15 @@ macro_rules! fwd {
 }
 
 unsafe extern "system" fn w_topology(this: *mut c_void, t: u32) {
+    let was = is_rect(this);
     rec(this, |s| s.topology = Some(t));
     crate::present_probe::note_topology(t);
-    fwd!(X_TOPOLOGY, fn(u32), this, t)
+    fwd!(X_TOPOLOGY, fn(u32), this, crate::rectlist::forwarded(t));
+    if t == crate::rectlist::RECTLIST {
+        unsafe { apply_rect(this) };
+    } else if was {
+        unsafe { rebind_pso(this) };
+    }
 }
 
 unsafe extern "system" fn w_viewports(this: *mut c_void, n: u32, p: *const u8) {
@@ -779,9 +785,10 @@ pub struct VariantKey {
     pub clip: bool,
     pub dynamic: bool,
     pub bias: Option<(i32, u32, u32)>,
+    pub rect: bool,
 }
 
-pub fn variant_desc(d: &mut [u8], k: VariantKey) {
+pub fn variant_desc(d: &mut [u8], k: VariantKey) -> bool {
     d[DESC_DEPTH_CLIP..DESC_DEPTH_CLIP + 4].copy_from_slice(&(k.clip as u32).to_le_bytes());
     let f = u32::from_le_bytes(d[DESC_FLAGS..DESC_FLAGS + 4].try_into().unwrap());
     let f = if k.dynamic { f | PSO_FLAG_DYNAMIC_DEPTH_BIAS } else { f & !PSO_FLAG_DYNAMIC_DEPTH_BIAS };
@@ -791,11 +798,12 @@ pub fn variant_desc(d: &mut [u8], k: VariantKey) {
         d[DESC_DEPTH_BIAS + 4..DESC_DEPTH_BIAS + 8].copy_from_slice(&c.to_le_bytes());
         d[DESC_DEPTH_BIAS + 8..DESC_DEPTH_BIAS + 12].copy_from_slice(&s.to_le_bytes());
     }
+    !k.rect || crate::rectlist::expand(d)
 }
 
 pub fn static_key(x: DepthBiasX) -> VariantKey {
     let (_, c, s) = x.pc_values();
-    VariantKey { clip: x.clip, dynamic: false, bias: Some((x.bias, c.to_bits(), s.to_bits())) }
+    VariantKey { clip: x.clip, dynamic: false, bias: Some((x.bias, c.to_bits(), s.to_bits())), rect: false }
 }
 
 pub fn static_matches(pb: &PsoBias, x: DepthBiasX) -> bool {
@@ -804,9 +812,13 @@ pub fn static_matches(pb: &PsoBias, x: DepthBiasX) -> bool {
 }
 
 static VARIANTS: Mutex<Option<HashMap<(usize, VariantKey), Variant>>> = Mutex::new(None);
+static RECT_FAILED: Mutex<Option<HashMap<(usize, VariantKey), usize>>> = Mutex::new(None);
 
 unsafe fn pso_variant(pso: usize, k: VariantKey) -> usize {
     let id = crate::device_wrap::gfx_pso_identity(pso);
+    if k.rect && RECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(pso, k))) == Some(&id) {
+        return 0;
+    }
     let mut g = VARIANTS.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(HashMap::new);
     if let Some(v) = m.get(&(pso, k)) {
@@ -819,11 +831,19 @@ unsafe fn pso_variant(pso: usize, k: VariantKey) -> usize {
     if dev.is_null() || d.len() < DESC_FLAGS + 4 {
         return 0;
     }
-    variant_desc(&mut d, k);
+    let fail = |m: &mut HashMap<(usize, VariantKey), usize>| if k.rect { m.insert((pso, k), id); };
+    if !variant_desc(&mut d, k) {
+        fail(RECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new));
+        return 0;
+    }
     let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_GFX_PSO)) };
     let mut out: *mut c_void = core::ptr::null_mut();
     let hr = unsafe { f(dev, d.as_ptr(), &IID_PSO, &mut out) };
     if hr < 0 || out.is_null() {
+        fail(RECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new));
+        if k.rect {
+            crate::rectlist::refuse_desc(&d, &format!("the expanded pipeline of PSO {pso:#x} was refused by the driver (hr={hr:#010x})"));
+        }
         if once(16) {
             record("d3d12_xs", "cl2_state", &format!("PSO variant {k:?} of {pso:#x} FAILED hr={hr:#010x}"));
         }
@@ -847,7 +867,7 @@ unsafe fn apply_pso_bias(list: *mut c_void, pso: usize) {
         unsafe { pc_depth_bias(list, (b.bias as f32, b.clamp, b.slope)) };
         return;
     }
-    let v = unsafe { pso_variant(pso, VariantKey { clip: b.clip, dynamic: false, bias: None }) };
+    let v = unsafe { pso_variant(pso, VariantKey { clip: b.clip, dynamic: false, bias: None, rect: false }) };
     if v != 0 {
         unsafe { pc_set_pso(list, v) };
         with(list, |s| s.variant_bound = true);
@@ -865,6 +885,44 @@ unsafe extern "system" fn w_pso(this: *mut c_void, pso: *mut c_void) {
     });
     fwd!(X_PSO, fn(*mut c_void), this, pso);
     unsafe { apply_pso_bias(this, pso as usize) };
+    unsafe { apply_rect(this) };
+}
+
+fn is_rect(list: *mut c_void) -> bool {
+    with(list, |s| s.topology == Some(crate::rectlist::RECTLIST))
+}
+
+unsafe fn wanted_key(list: *mut c_void, pso: usize) -> Option<VariantKey> {
+    let pb = pso_bias(pso)?;
+    let x = with(list, |s| s.depth_bias_x);
+    let dynamic = pb.dynamic && unsafe { dynamic_usable(list) };
+    let plain = VariantKey { clip: pb.clip, dynamic: pb.dynamic, bias: None, rect: false };
+    let k = match x {
+        Some(x) if !dynamic => if static_matches(&pb, x) { plain } else { static_key(x) },
+        Some(x) => VariantKey { clip: x.clip, dynamic: true, bias: None, rect: false },
+        None if pb.dynamic && !dynamic => VariantKey { clip: pb.clip, dynamic: false, bias: None, rect: false },
+        None => plain,
+    };
+    Some(VariantKey { rect: is_rect(list), ..k })
+}
+
+unsafe fn apply_rect(list: *mut c_void) {
+    if !is_rect(list) {
+        return;
+    }
+    let pso = with(list, |s| s.pso).unwrap_or(0);
+    if pso == 0 {
+        return;
+    }
+    let Some(k) = (unsafe { wanted_key(list, pso) }) else {
+        crate::rectlist::refuse(0, pso as u64, &format!("PSO {pso:#x} has no recorded PC description (stream-built or unknown pipeline)"));
+        return;
+    };
+    let v = unsafe { pso_variant(pso, k) };
+    if v != 0 {
+        unsafe { pc_set_pso(list, v) };
+        with(list, |s| s.variant_bound = true);
+    }
 }
 
 unsafe fn apply_depth_bias_x(this: *mut c_void, x: DepthBiasX) {
@@ -892,7 +950,7 @@ unsafe fn apply_depth_bias_x(this: *mut c_void, x: DepthBiasX) {
         return;
     }
     if x.clip != pb.clip {
-        let v = unsafe { pso_variant(pso, VariantKey { clip: x.clip, dynamic: true, bias: None }) };
+        let v = unsafe { pso_variant(pso, VariantKey { clip: x.clip, dynamic: true, bias: None, rect: false }) };
         if v != 0 {
             unsafe { pc_set_pso(this, v) };
             with(this, |s| s.variant_bound = true);
@@ -908,6 +966,7 @@ unsafe extern "system" fn w_depth_bias_x(this: *mut c_void, bias: i32, clamp: f3
     let x = DepthBiasX { bias, clamp, slope, clip: clip != 0 };
     rec(this, |s| s.depth_bias_x = Some(x));
     unsafe { apply_depth_bias_x(this, x) };
+    unsafe { apply_rect(this) };
 }
 
 pub static QUERY_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/query_accum.dxil"));
@@ -1244,10 +1303,12 @@ pub(crate) unsafe fn bound_variant_key(list: *mut c_void) -> Option<VariantKey> 
     }
     let pb = pso_bias(pso)?;
     let dynamic = pb.dynamic && unsafe { dynamic_usable(list) };
+    let rect = is_rect(list);
     Some(match x {
-        Some(x) if !dynamic => static_key(x),
-        Some(x) => VariantKey { clip: x.clip, dynamic: true, bias: None },
-        None => VariantKey { clip: pb.clip, dynamic: false, bias: None },
+        Some(x) if !dynamic => VariantKey { rect, ..static_key(x) },
+        Some(x) => VariantKey { clip: x.clip, dynamic: true, bias: None, rect },
+        None if rect => return unsafe { wanted_key(list, pso) },
+        None => VariantKey { clip: pb.clip, dynamic: false, bias: None, rect },
     })
 }
 
@@ -1260,6 +1321,7 @@ pub(crate) unsafe fn rebind_pso(list: *mut c_void) {
     if let Some(x) = x {
         unsafe { apply_depth_bias_x(list, x) };
     }
+    unsafe { apply_rect(list) };
 }
 
 #[cfg(test)]
@@ -1425,10 +1487,16 @@ pub unsafe fn after_bundle(this: *mut c_void, bundle: *mut c_void) {
     }
     let bundle = crate::cmdlist_wrap::unwrap(bundle);
     let b = with(bundle, |s| s.clone());
+    let was = is_rect(this);
     rec(this, |s| s.merge_bundle(&b));
     if b.pso.is_none() {
         if let Some(x) = b.depth_bias_x {
             unsafe { apply_depth_bias_x(this, x) };
+        }
+        if is_rect(this) {
+            unsafe { apply_rect(this) };
+        } else if was {
+            unsafe { rebind_pso(this) };
         }
     }
 }
@@ -2179,14 +2247,14 @@ mod tests {
         d[DESC_DEPTH_CLIP..DESC_DEPTH_CLIP + 4].copy_from_slice(&1u32.to_le_bytes());
         let x = DepthBiasX { bias: -5, clamp: 1.0, slope: 0.25, clip: false };
         let k = static_key(x);
-        assert_eq!(k, VariantKey { clip: false, dynamic: false, bias: Some((-5, 0, 0.25f32.to_bits())) });
+        assert_eq!(k, VariantKey { clip: false, dynamic: false, bias: Some((-5, 0, 0.25f32.to_bits())), rect: false });
         variant_desc(&mut d, k);
         let pb = pso_bias_from_desc(&d).unwrap();
         assert_eq!(pb, PsoBias { dynamic: false, bias: -5, clamp: 0.0, slope: 0.25, clip: false });
         assert_eq!(u32::from_le_bytes(d[DESC_FLAGS..DESC_FLAGS + 4].try_into().unwrap()), 0x1);
         assert!(static_matches(&pb, x));
         assert!(!static_matches(&pb, DepthBiasX { clip: true, ..x }));
-        variant_desc(&mut d, VariantKey { clip: true, dynamic: true, bias: None });
+        variant_desc(&mut d, VariantKey { clip: true, dynamic: true, bias: None, rect: false });
         assert_eq!(pso_bias_from_desc(&d).unwrap(), PsoBias { dynamic: true, bias: -5, clamp: 0.0, slope: 0.25, clip: true });
         assert!(chunk_fits(120, 8, 128) && !chunk_fits(121, 8, 128) && !chunk_fits(u32::MAX, 8, 128));
     }

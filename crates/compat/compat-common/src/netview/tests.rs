@@ -349,3 +349,204 @@ fn wfp_store_adds_sublayers_callouts_contexts_and_filters_with_console_checks() 
         assert_eq!(wfp::object_count(k), 0);
     }
 }
+
+mod iphlp_model {
+    use super::super::iphlp::*;
+    use super::super::*;
+    use super::{rd32, rd64};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn nic() -> Adapter {
+        adapters().into_iter().find(|a| a.if_index == NIC_IF_INDEX).unwrap()
+    }
+
+    fn v6sock(ip: Ipv6Addr) -> [u8; 28] {
+        let mut b = [0u8; 28];
+        b[0] = 0x17;
+        b[8..24].copy_from_slice(&ip.octets());
+        b
+    }
+
+    #[test]
+    fn if_table2_rows_follow_mib_if_row2_layout() {
+        let t = if_table2();
+        assert_eq!(rd32(&t, 0), 2);
+        assert_eq!(t.len(), 8 + 2 * IF_ROW2_SIZE);
+        let r = &t[8..8 + IF_ROW2_SIZE];
+        let a = nic();
+        assert_eq!(rd64(r, 0), NIC_LUID);
+        assert_eq!(rd32(r, 8), NIC_IF_INDEX);
+        assert_eq!(&r[0xc..0x1c], &interface_guid(&a));
+        assert_eq!(interface_guid(&a), parse_guid("{5A6F8E2C-1B3D-4E59-9C70-546F6D426F78}").unwrap());
+        assert_eq!(&r[0xc..0x10], &[0x2c, 0x8e, 0x6f, 0x5a]);
+        let alias: Vec<u16> = r[0x1c..0x1c + 16].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(String::from_utf16_lossy(&alias), "Ethernet");
+        assert_eq!(rd32(r, 0x420), 6);
+        assert_eq!(&r[0x424..0x42a], &NIC_MAC);
+        assert_eq!(&r[0x444..0x44a], &NIC_MAC);
+        assert_eq!(rd32(r, 0x464), 1500);
+        assert_eq!(rd32(r, 0x468), IF_TYPE_ETHERNET_CSMACD);
+        assert_eq!(rd32(r, 0x474), 14);
+        assert_eq!(rd32(r, 0x478), 2);
+        assert_eq!(r[0x480], 5);
+        assert_eq!(rd32(r, 0x484), 1);
+        assert_eq!(rd32(r, 0x488), 1);
+        assert_eq!(rd32(r, 0x48c), 1);
+        assert_eq!(&r[0x490..0x4a0], &a.network_guid);
+        assert_eq!(rd64(r, 0x4a8), 1_000_000_000);
+        assert!(r[0x4b8..].iter().all(|b| *b == 0));
+        let l = &t[8 + IF_ROW2_SIZE..];
+        assert_eq!(rd64(l, 0), LOOPBACK_LUID);
+        assert_eq!(rd32(l, 0x478), 1);
+        assert_eq!(rd32(l, 0x420), 0);
+    }
+
+    #[test]
+    fn if_entry_lookups_use_luid_then_index_and_report_missing_rows() {
+        unsafe {
+            let mut row = vec![0u8; IF_ROW2_SIZE];
+            assert_eq!(get_if_entry2(row.as_mut_ptr()), ERROR_INVALID_PARAMETER);
+            row[8..12].copy_from_slice(&LOOPBACK_IF_INDEX.to_le_bytes());
+            assert_eq!(get_if_entry2(row.as_mut_ptr()), ERROR_SUCCESS);
+            assert_eq!(rd64(&row, 0), LOOPBACK_LUID);
+            let mut row = vec![0u8; IF_ROW2_SIZE];
+            row[0..8].copy_from_slice(&NIC_LUID.to_le_bytes());
+            row[8..12].copy_from_slice(&LOOPBACK_IF_INDEX.to_le_bytes());
+            assert_eq!(get_if_entry2_ex(MIB_IF_ENTRY_NORMAL_WITHOUT_STATISTICS, row.as_mut_ptr()), ERROR_SUCCESS);
+            assert_eq!(rd32(&row, 8), NIC_IF_INDEX);
+            assert_eq!(get_if_entry2_ex(1, row.as_mut_ptr()), ERROR_INVALID_PARAMETER);
+            row[0..8].copy_from_slice(&0x1234u64.to_le_bytes());
+            assert_eq!(get_if_entry2(row.as_mut_ptr()), ERROR_FILE_NOT_FOUND);
+            let mut old = vec![0u8; IF_ROW_SIZE];
+            old[0x200..0x204].copy_from_slice(&NIC_IF_INDEX.to_le_bytes());
+            assert_eq!(get_if_entry(old.as_mut_ptr()), ERROR_SUCCESS);
+            let name: Vec<u16> = old[0..0x200].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|c| *c != 0).collect();
+            assert_eq!(String::from_utf16_lossy(&name), "\\DEVICE\\TCPIP_{5A6F8E2C-1B3D-4E59-9C70-546F6D426F78}");
+            assert_eq!(rd32(&old, 0x210), 6);
+            assert_eq!(rd32(&old, 0x220), MIB_IF_OPER_STATUS_OPERATIONAL);
+            assert_eq!(&old[0x25c..0x25c + 6], b"TomBox");
+            old[0x200..0x204].copy_from_slice(&99u32.to_le_bytes());
+            assert_eq!(get_if_entry(old.as_mut_ptr()), ERROR_INVALID_PARAMETER);
+            let mut tp: *mut u8 = core::ptr::null_mut();
+            assert_eq!(get_if_table2(&mut tp), ERROR_SUCCESS);
+            let t = core::slice::from_raw_parts(tp, 8 + 2 * IF_ROW2_SIZE);
+            assert_eq!(t, &if_table2()[..]);
+            free_mib_table(tp as *mut core::ffi::c_void);
+            free_mib_table(core::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn guid_luid_index_conversions_and_best_interface() {
+        unsafe {
+            let g = interface_guid(&nic());
+            let mut luid = 0u64;
+            assert_eq!(convert_interface_guid_to_luid(&g, &mut luid), ERROR_SUCCESS);
+            assert_eq!(luid, NIC_LUID);
+            assert_eq!(convert_interface_guid_to_luid(&[9u8; 16], &mut luid), ERROR_NOT_FOUND);
+            let mut idx = 0u32;
+            assert_eq!(convert_interface_luid_to_index(&LOOPBACK_LUID, &mut idx), ERROR_SUCCESS);
+            assert_eq!(idx, LOOPBACK_IF_INDEX);
+            assert_eq!(convert_interface_luid_to_index(&7u64, &mut idx), ERROR_NOT_FOUND);
+            assert_eq!(convert_interface_luid_to_index(core::ptr::null(), &mut idx), ERROR_INVALID_PARAMETER);
+            let s = sockaddr_bytes(&IpAddr::V4(Ipv4Addr::new(169, 254, 3, 4)), 0, 0);
+            assert_eq!(get_best_interface_ex(s.as_ptr(), &mut idx), ERROR_SUCCESS);
+            assert_eq!(idx, NIC_IF_INDEX);
+            let s = sockaddr_bytes(&IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 0);
+            assert_eq!(get_best_interface_ex(s.as_ptr(), &mut idx), ERROR_SUCCESS);
+            assert_eq!(idx, LOOPBACK_IF_INDEX);
+            let s = sockaddr_bytes(&IpAddr::V4(Ipv4Addr::new(198, 41, 0, 4)), 0, 0);
+            assert_eq!(get_best_interface_ex(s.as_ptr(), &mut idx), ERROR_NETWORK_UNREACHABLE);
+            let s = v6sock(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 9));
+            assert_eq!(get_best_interface_ex(s.as_ptr(), &mut idx), ERROR_SUCCESS);
+            assert_eq!(idx, NIC_IF_INDEX);
+            let s = v6sock(Ipv4Addr::new(169, 254, 66, 1).to_ipv6_mapped());
+            assert_eq!(get_best_interface_ex(s.as_ptr(), &mut idx), ERROR_SUCCESS);
+            assert_eq!(idx, NIC_IF_INDEX);
+        }
+    }
+
+    #[test]
+    fn physical_interface_for_destination_is_unreachable_offline_and_names_on_link_interfaces() {
+        unsafe {
+            let mut out = [0u8; 16];
+            let mut h = 5usize;
+            let root4 = v6sock(Ipv4Addr::new(198, 41, 0, 4).to_ipv6_mapped());
+            assert_eq!(physical_interface_for_destination(root4.as_ptr(), &mut out, &mut h), ERROR_NETWORK_UNREACHABLE);
+            assert_eq!(h, 0);
+            let root6 = v6sock(Ipv6Addr::new(0x2001, 0x503, 0xba3e, 0, 0, 0, 2, 0x30));
+            assert_eq!(physical_interface_for_destination(root6.as_ptr(), &mut out, &mut h), ERROR_NETWORK_UNREACHABLE);
+            let link = sockaddr_bytes(&IpAddr::V4(Ipv4Addr::new(169, 254, 9, 9)), 0, 0);
+            assert_eq!(physical_interface_for_destination(link.as_ptr(), &mut out, &mut h), ERROR_SUCCESS);
+            assert_eq!(out, interface_guid(&nic()));
+            assert_eq!(close_physical_interface_for_destination(&mut h), ERROR_SUCCESS);
+            let mut bogus = 0x44usize;
+            assert_eq!(close_physical_interface_for_destination(&mut bogus), ERROR_INVALID_HANDLE);
+        }
+    }
+
+    fn sort_list(addrs: &[&[u8]]) -> Vec<u8> {
+        let mut list = vec![0u8; 8 + 16 * addrs.len()];
+        list[0..4].copy_from_slice(&(addrs.len() as i32).to_le_bytes());
+        for (i, a) in addrs.iter().enumerate() {
+            list[8 + 16 * i..16 + 16 * i].copy_from_slice(&(a.as_ptr() as usize).to_le_bytes());
+            list[16 + 16 * i..20 + 16 * i].copy_from_slice(&(a.len() as i32).to_le_bytes());
+        }
+        list
+    }
+
+    fn order(list: &[u8]) -> Vec<usize> {
+        let n = rd32(list, 0) as usize;
+        (0..n).map(|i| usize::from_le_bytes(list[8 + 16 * i..16 + 16 * i].try_into().unwrap())).collect()
+    }
+
+    #[test]
+    fn address_list_sort_follows_rfc6724_against_the_emulated_view() {
+        let root4 = v6sock(Ipv4Addr::new(198, 41, 0, 4).to_ipv6_mapped());
+        let link4 = v6sock(Ipv4Addr::new(169, 254, 7, 7).to_ipv6_mapped());
+        let ll6 = v6sock(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 7));
+        let lo6 = v6sock(Ipv6Addr::LOCALHOST);
+        let mut list = sort_list(&[&root4, &link4, &ll6, &lo6]);
+        let len = list.len() as u32;
+        assert_eq!(unsafe { address_list_sort(list.as_mut_ptr(), len) }, Ok(len));
+        assert_eq!(order(&list), vec![lo6.as_ptr() as usize, ll6.as_ptr() as usize, link4.as_ptr() as usize, root4.as_ptr() as usize]);
+        let root6 = v6sock(Ipv6Addr::new(0x2001, 0x503, 0xba3e, 0, 0, 0, 2, 0x30));
+        let mut both = sort_list(&[&root4, &root6]);
+        assert_eq!(unsafe { address_list_sort(both.as_mut_ptr(), both.len() as u32) }, Ok(both.len() as u32));
+        assert_eq!(order(&both), vec![root4.as_ptr() as usize, root6.as_ptr() as usize]);
+        assert_eq!(policy(&IpAddr::V6(Ipv6Addr::LOCALHOST)), Policy { precedence: 50, label: 0 });
+        assert_eq!(policy(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))), Policy { precedence: 35, label: 4 });
+        assert_eq!(scope(&IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))), 2);
+        assert_eq!(scope(&IpAddr::V6(Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 1))), 5);
+        let v4 = sockaddr_bytes(&IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 0);
+        list[8..16].copy_from_slice(&(v4.as_ptr() as usize).to_le_bytes());
+        assert_eq!(unsafe { address_list_sort(list.as_mut_ptr(), len) }, Err(ERROR_INVALID_PARAMETER));
+        assert_eq!(unsafe { address_list_sort(list.as_mut_ptr(), 20) }, Err(ERROR_INVALID_PARAMETER));
+    }
+
+    #[test]
+    fn nsi_interface_rw_writes_merge_unchanged_groups() {
+        nsi_reset();
+        let mut rw = vec![0xffu8; NL_INTERFACE_RW_SIZE];
+        rw[0x10..0x14].copy_from_slice(&1u32.to_le_bytes());
+        rw[0xc0..0xd0].copy_from_slice(&[7u8; 16]);
+        let key = NIC_LUID.to_le_bytes();
+        let n = NL_INTERFACE_RW_SIZE as u32;
+        unsafe {
+            assert_eq!(nsi_set_all_parameters(NSI_STORE_ACTIVE, NSI_SET_DEFAULT, NPI_MS_IPV4_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, key.as_ptr(), 8, rw.as_ptr(), n), ERROR_SUCCESS);
+            let mut rw2 = vec![0xffu8; NL_INTERFACE_RW_SIZE];
+            rw2[0x10..0x14].copy_from_slice(&2u32.to_le_bytes());
+            assert_eq!(nsi_set_all_parameters(NSI_STORE_ACTIVE, NSI_SET_DEFAULT, NPI_MS_IPV4_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, key.as_ptr(), 8, rw2.as_ptr(), n), ERROR_SUCCESS);
+            let bad = 5u64.to_le_bytes();
+            assert_eq!(nsi_set_all_parameters(NSI_STORE_ACTIVE, NSI_SET_DEFAULT, NPI_MS_IPV4_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, bad.as_ptr(), 8, rw.as_ptr(), n), ERROR_NOT_FOUND);
+            assert_eq!(nsi_set_all_parameters(NSI_STORE_ACTIVE, NSI_SET_DEFAULT, NPI_MS_TEREDO_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, key.as_ptr(), 8, rw.as_ptr(), n), ERROR_NOT_FOUND);
+            assert_eq!(nsi_set_all_parameters(NSI_STORE_ACTIVE, NSI_SET_DEFAULT, NPI_MS_IPV4_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, key.as_ptr(), 8, rw.as_ptr(), 0x10), ERROR_INVALID_PARAMETER);
+        }
+        let got = nsi_interface_rw(&NPI_MS_IPV4_MODULEID, NIC_LUID).unwrap();
+        assert_eq!(rd32(&got, 0x10), 2);
+        assert_eq!(&got[0xc0..0xd0], &[7u8; 16]);
+        assert!(got[0x20..0x30].iter().all(|b| *b == 0xff));
+        assert!(nsi_interface_rw(&NPI_MS_IPV6_MODULEID, NIC_LUID).is_none());
+        nsi_reset();
+    }
+}

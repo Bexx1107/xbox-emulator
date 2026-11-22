@@ -465,7 +465,7 @@ pub unsafe fn size_texture(real: *mut c_void, d: &mut [u8; 0x40]) -> Option<(u64
 }
 
 pub unsafe fn try_create(real: *mut c_void, heap: *const u32, heap_flags: u32, desc: *const u32, init_state: u32, clear: *const c_void, ppv: *mut *mut c_void) -> Option<i32> {
-    if heap.is_null() || desc.is_null() || ppv.is_null() || !enabled() {
+    if heap.is_null() || desc.is_null() || ppv.is_null() || !enabled() || crate::dred::removed() {
         return None;
     }
     let hkey: [u32; 5] = unsafe { core::ptr::read_unaligned(heap as *const [u32; 5]) };
@@ -795,5 +795,20 @@ mod tests {
                 rel(r);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod removed_gate {
+    #[test]
+    fn pool_declines_after_device_removal() {
+        let heap = [1u32, 0, 0, 1, 1];
+        let desc = [0u32; 16];
+        let mut out: *mut core::ffi::c_void = core::ptr::null_mut();
+        crate::dred::mark_removed();
+        let r = unsafe { super::try_create(core::ptr::null_mut(), heap.as_ptr(), 0, desc.as_ptr(), 0, core::ptr::null(), &mut out) };
+        crate::dred::clear_removed_for_test();
+        assert!(r.is_none());
+        assert!(out.is_null());
     }
 }

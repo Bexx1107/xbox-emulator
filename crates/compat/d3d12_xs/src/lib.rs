@@ -92,6 +92,7 @@ mod gpu_hw_config;
 mod kmd_slots;
 mod placed_offset;
 mod msaa_place;
+mod rectlist;
 mod gpu_wait;
 mod cl_ext;
 mod dbcount;

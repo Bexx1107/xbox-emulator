@@ -199,7 +199,7 @@ fn site(k: usize) {
 fn frame_written(at: usize, ever: &[bool; 64]) -> bool {
     let q = |m: u8| (0..64).all(|p| ever[p] || m >> (p / 8) & 1 != 0);
     match at {
-        0 => q(0x88),
+        0 => q(0x80),
         1 => q(0x88),
         2 => !RELAY2_HOLES.with(|c| c.get()),
         _ => false,
@@ -244,6 +244,14 @@ pub fn run_block(d: &mut Dcc) -> Result<bool, i32> {
         Ok(()) if m => Err(E_INVALIDARG),
         Ok(()) => Ok(false),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn tolerant<R>(f: impl FnOnce() -> R) -> R {
+    let old = TOLERATE.with(|c| c.replace(true));
+    let r = f();
+    TOLERATE.with(|c| c.set(old));
+    r
 }
 
 pub fn last_unmodeled() -> bool {

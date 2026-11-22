@@ -71,11 +71,12 @@ struct Ctx<'a> {
     hl: Vec<bool>,
     u: [[bool; 256]; 3],
     masked: u64,
+    force: bool,
 }
 
 impl<'a> Ctx<'a> {
     fn new(o: &'a Oracle, f: Con, hl: Vec<bool>) -> Ctx<'a> {
-        Ctx { o, f, hl, u: [[false; 256]; 3], masked: 0 }
+        Ctx { o, f, hl, u: [[false; 256]; 3], masked: 0, force: false }
     }
     fn cmp(&mut self, t: &mut Tally, name: &'static str, n: &Dcc, post: &Dcc, ctx: &str) {
         let mut c = copy(post);
@@ -167,7 +168,7 @@ impl<'a> Ctx<'a> {
         s.w32(0x58, meta as u32);
         let start = copy(s);
         let mut nat = copy(s);
-        if dec::run(&mut nat).is_err() {
+        if dec::run(&mut nat).is_err() && !self.force {
             let c = cause(s);
             t.err(c);
             if c == "color 0x24ec0" {
@@ -952,4 +953,33 @@ fn oracle_dcc_dec_color_fault_child() {
         faults += 1;
     }
     println!("dcc dec color #DE: {} predicted cases, console XGDecodeDCC raised STATUS_INTEGER_DIVIDE_BY_ZERO in {} child processes", cases.len(), faults);
+}
+
+#[test]
+#[ignore]
+fn dcc_stage_trace_case() {
+    let Ok(ids) = std::env::var("TOMBOX_DCC_TRACE_IDS") else { return };
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let o = oracle().expect("console xg_xs.dll");
+    let hl = holes(&o);
+    for id in ids.split(',').map(|x| x.parse::<u64>().unwrap()) {
+        let c = super::oracle_cases::case(id);
+        if c.enc {
+            continue;
+        }
+        let (Some(con), Some(fresh)) = (Con::new(&o, c.fmt, c.sw, c.dim, c.p[0], c.p[1]), Con::new(&o, c.fmt, c.sw, c.dim, c.p[0], c.p[1])) else { continue };
+        let mut cx = Ctx::new(&o, fresh, hl.clone());
+        cx.force = true;
+        let mut s = defined(con.pull());
+        let mut t = Tally::new();
+        dec::tolerant(|| {
+            for k in 0..c.n {
+                let mut b = [0u8; 256];
+                b.copy_from_slice(&c.src[k * 256..k * 256 + 256]);
+                let ctx = format!("case {id} blk {k} f={} sw={} dim={} p={:x?} meta={:#04x}", c.fmt, c.sw, c.dim, c.p, c.meta[k]);
+                cx.block(&mut t, &mut s, &b, c.meta[k], &ctx);
+            }
+        });
+        t.print(&format!("trace {id}"));
+    }
 }

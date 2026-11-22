@@ -1,5 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+pub mod iphlp;
 pub mod sockets;
 pub mod wfp;
 pub(crate) mod wfp_codec;

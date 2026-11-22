@@ -14,6 +14,7 @@ pub const MAX_RECORDS: usize = 4096;
 pub const MAX_BYTES: usize = 192 << 20;
 pub const IDLE_RELEASE_SECS: u64 = 180;
 pub const PROMOTE_AHEAD: usize = 4;
+const WAIT_MS: u64 = 2000;
 const PREWARM_PRIORITY: i32 = -1;
 const THREAD_SET_QUERY: u32 = 0x0020 | 0x0040;
 const GFX_SHADERS: [usize; 5] = [0x08, 0x18, 0x28, 0x38, 0x48];
@@ -840,8 +841,13 @@ pub unsafe fn claim(k: u128, riid: *const Guid, ppv: *mut *mut c_void) -> Option
             LATE.fetch_add(1, Relaxed);
             let _ev = crate::frame_ev::begin(crate::frame_ev::PREWARM_LATE);
             boost(pw, k);
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(WAIT_MS);
             while q.state(k) == Some(Slot::InFlight) {
-                q = pw.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                q = pw.cv.wait_timeout(q, left).unwrap_or_else(|e| e.into_inner()).0;
             }
             let c = q.claim(k);
             drop(q);
@@ -1150,7 +1156,7 @@ mod tests {
         const IID_LIBRARY1: Guid = Guid { d1: 0x80ea_bf42, d2: 0x2568, d3: 0x4e5e, d4: [0xbd, 0x82, 0xc3, 0x7f, 0x86, 0x96, 0x1d, 0xc3] };
         const IID_PSO: Guid = Guid { d1: 0x765a_30f3, d2: 0xf624, d3: 0x4c6f, d4: [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45] };
         unsafe {
-            let p = crate::host_proc(b"D3D12CreateDevice ");
+            let p = crate::host_proc(b"D3D12CreateDevice ");
             let create: extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(p);
             let mut dev: *mut c_void = core::ptr::null_mut();
             assert!(create(core::ptr::null_mut(), 0xb000, &IID_DEVICE, &mut dev) >= 0 && !dev.is_null());

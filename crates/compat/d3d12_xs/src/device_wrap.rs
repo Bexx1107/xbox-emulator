@@ -811,7 +811,25 @@ unsafe extern "system" fn create_gfx_pso_x(
         }
         return hr;
     }
-    unsafe { create_gfx_pso_sync(this, pdesc, num_ext, pext, riid, ppv) }
+    let t0 = std::time::Instant::now();
+    let _ = crate::pso_lib::take_lock_wait_us();
+    let hr = unsafe { create_gfx_pso_sync(this, pdesc, num_ext, pext, riid, ppv) };
+    note_sync_pso("graphics (CreateGraphicsPipelineState_X)", unsafe { crate::pso_async::sync_reason(pdesc, riid, false) }, t0, hr);
+    hr
+}
+
+fn note_sync_pso(kind: &str, why: &str, t0: std::time::Instant, hr: i32) {
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let lock_ms = crate::pso_lib::take_lock_wait_us() as f64 / 1000.0;
+    if ms < 50.0 {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 40 || n % 100 == 0 {
+        let name = std::thread::current().name().map(str::to_owned).unwrap_or_else(|| format!("{:?}", std::thread::current().id()));
+        record("d3d12_xs", "pso_sync", &format!("#{} {kind} took {ms:.1} ms on {name} (sync because: {why}; of that {lock_ms:.1} ms waiting for the pipeline library lock) hr={hr:#010x}", n + 1));
+    }
 }
 
 unsafe extern "system" fn create_gfx_pso_sync(
@@ -1396,6 +1414,17 @@ unsafe extern "system" fn create_derived_pso_x(
     riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
     let _ev = crate::frame_ev::begin(crate::frame_ev::PSO_SYNC);
+    let t0 = std::time::Instant::now();
+    let _ = crate::pso_lib::take_lock_wait_us();
+    let hr = unsafe { create_derived_pso_inner(this, base, num, patches, riid, ppv) };
+    note_sync_pso("derived graphics (CreateDerivedPipelineState_X)", "derived PSOs are always created on the calling thread", t0, hr);
+    hr
+}
+
+unsafe fn create_derived_pso_inner(
+    this: *mut DeviceWrapper, base: *mut c_void, num: u32, patches: *const u8,
+    riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
     const E_FAIL: i32 = 0x8000_4005u32 as i32;
     const STRIDE: usize = 0x14C;
     static OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -1628,7 +1657,11 @@ unsafe extern "system" fn create_compute_pso_x(
         }
         return hr;
     }
-    unsafe { create_compute_pso_sync(this, pdesc, num_ext, pext, riid, ppv) }
+    let t0 = std::time::Instant::now();
+    let _ = crate::pso_lib::take_lock_wait_us();
+    let hr = unsafe { create_compute_pso_sync(this, pdesc, num_ext, pext, riid, ppv) };
+    note_sync_pso("compute (CreateComputePipelineState_X)", unsafe { crate::pso_async::sync_reason(pdesc, riid, true) }, t0, hr);
+    hr
 }
 
 unsafe extern "system" fn create_compute_pso_sync(

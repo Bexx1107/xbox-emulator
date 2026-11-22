@@ -15,8 +15,15 @@ extern "system" {
 }
 
 pub const MIB_TCP_STATE_LISTEN: u32 = 2;
+pub const MIB_TCP_STATE_SYN_SENT: u32 = 3;
 pub const MIB_TCP_STATE_ESTAB: u32 = 5;
 pub const MIB_TCP_STATE_RESERVED: u32 = 100;
+pub const SIO_TCP_INFO: u32 = 0xD800_0027;
+pub const SO_CONNECT_TIME: i32 = 0x700C;
+pub const SO_ERROR: i32 = 0x1007;
+pub const TCPSTATE_CLOSED: u32 = 0;
+pub const TCPSTATE_SYN_SENT: u32 = 2;
+pub const TCPSTATE_SYN_RCVD: u32 = 3;
 
 pub const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
 pub const TCP_TABLE_OWNER_PID_CONNECTIONS: u32 = 4;
@@ -297,6 +304,7 @@ pub enum Event {
     Connected,
     Accepted,
     Sent,
+    Connecting,
 }
 
 pub unsafe fn report_event(s: usize, event: Event, remote: *const u8, remote_len: i32) -> bool {
@@ -322,6 +330,10 @@ pub unsafe fn report_event(s: usize, event: Event, remote: *const u8, remote_len
                 Some(r) => (Some(r), MIB_TCP_STATE_ESTAB),
                 None => return false,
             },
+            Event::Connecting => match parse_sockaddr(remote, remote_len) {
+                Some(r) => (Some(r), MIB_TCP_STATE_SYN_SENT),
+                None => return false,
+            },
             Event::Connected | Event::Sent => match parse_sockaddr(remote, remote_len).or_else(|| peer_name(s)) {
                 Some(r) => (Some(r), MIB_TCP_STATE_ESTAB),
                 None if accepting(s) => (None, MIB_TCP_STATE_LISTEN),
@@ -334,6 +346,87 @@ pub unsafe fn report_event(s: usize, event: Event, remote: *const u8, remote_len
     };
     let created = prior.map(|e| e.created).unwrap_or_else(now_filetime);
     report(Endpoint { socket: s as u64, pid, proto, local: console_local(local), remote, state, created })
+}
+
+pub unsafe fn report_accepted(s: usize, local: *const u8, local_len: i32, remote: *const u8, remote_len: i32) -> bool {
+    if socket_type(s) != Some(SOCK_STREAM) {
+        return false;
+    }
+    let (Some(l), Some(r)) = (parse_sockaddr(local, local_len), parse_sockaddr(remote, remote_len)) else {
+        return false;
+    };
+    let pid = GetCurrentProcessId();
+    let created = snapshot().into_iter().find(|e| e.socket == s as u64 && e.pid == pid).map(|e| e.created).unwrap_or_else(now_filetime);
+    report(Endpoint { socket: s as u64, pid, proto: Proto::Tcp, local: console_local(l), remote: Some(r), state: MIB_TCP_STATE_ESTAB, created })
+}
+
+type WsaIoctl = unsafe extern "system" fn(usize, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *mut c_void) -> i32;
+
+pub unsafe fn tcp_state(s: usize) -> Option<u32> {
+    let f = ws_fn(b"WSAIoctl\0");
+    if f == 0 {
+        return None;
+    }
+    let f: WsaIoctl = core::mem::transmute(f);
+    let version = 0u32;
+    let mut info = [0u8; 256];
+    let mut got = 0u32;
+    if f(s, SIO_TCP_INFO, &version as *const u32 as *const c_void, 4, info.as_mut_ptr() as *mut c_void, info.len() as u32, &mut got, core::ptr::null_mut(), core::ptr::null_mut()) != 0 || got < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([info[0], info[1], info[2], info[3]]))
+}
+
+unsafe fn sock_opt_u32(s: usize, name: i32) -> Option<u32> {
+    let f = ws_fn(b"getsockopt\0");
+    if f == 0 {
+        return None;
+    }
+    let f: GetSockOpt = core::mem::transmute(f);
+    let mut v = 0u32;
+    let mut n = 4i32;
+    if f(s, SOL_SOCKET, name, &mut v as *mut u32 as *mut u8, &mut n) != 0 {
+        return None;
+    }
+    Some(v)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pending {
+    Still,
+    Established,
+    Failed,
+}
+
+pub unsafe fn connect_progress(s: usize) -> Pending {
+    match tcp_state(s) {
+        Some(TCPSTATE_CLOSED) => Pending::Failed,
+        Some(TCPSTATE_SYN_SENT | TCPSTATE_SYN_RCVD) => Pending::Still,
+        Some(_) => Pending::Established,
+        None => match (sock_opt_u32(s, SO_CONNECT_TIME), sock_opt_u32(s, SO_ERROR)) {
+            (Some(t), _) if t != u32::MAX => Pending::Established,
+            (_, Some(e)) if e != 0 => Pending::Failed,
+            _ => Pending::Still,
+        },
+    }
+}
+
+fn settle(e: Endpoint) -> Option<Endpoint> {
+    if e.proto != Proto::Tcp || e.state != MIB_TCP_STATE_SYN_SENT {
+        return Some(e);
+    }
+    match unsafe { connect_progress(e.socket as usize) } {
+        Pending::Still => Some(e),
+        Pending::Failed => {
+            forget(e.socket);
+            None
+        }
+        Pending::Established => {
+            let up = Endpoint { state: MIB_TCP_STATE_ESTAB, ..e };
+            report(up);
+            Some(up)
+        }
+    }
 }
 
 pub unsafe fn report_socket(s: usize, remote: *const u8, remote_len: i32) -> bool {
@@ -365,6 +458,11 @@ pub fn endpoints() -> Vec<Endpoint> {
                 forget(e.socket);
                 continue;
             }
+            match settle(e) {
+                Some(e) => out.push(e),
+                None => continue,
+            }
+            continue;
         }
         out.push(e);
     }

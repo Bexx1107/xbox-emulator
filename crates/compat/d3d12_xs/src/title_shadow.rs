@@ -304,6 +304,9 @@ fn buf_desc(width: u64) -> [u8; 0x38] {
 }
 
 pub unsafe fn create_heap(real: *mut c_void, lo: u64, hi: u64) -> Option<usize> {
+    if crate::dred::removed() {
+        return None;
+    }
     let size = hi.checked_sub(lo).filter(|s| *s > 0)?;
     let mut hd = [0u8; 0x30];
     hd[0..8].copy_from_slice(&size.to_le_bytes());
@@ -594,6 +597,9 @@ fn drain_queues() {
 }
 
 pub unsafe fn migrate(real: *mut c_void, shadow_heap: usize, local_heap: usize) -> bool {
+    if crate::dred::removed() {
+        return false;
+    }
     drain_queues();
     sync_up();
     sync_down();
@@ -771,3 +777,16 @@ pub unsafe fn after_execute(queue: *mut c_void, signal: usize, wait: usize) -> O
 #[cfg(test)]
 #[path = "title_shadow_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod removed_gate {
+    #[test]
+    fn no_shadow_heap_or_migration_after_device_removal() {
+        crate::dred::mark_removed();
+        let h = unsafe { super::create_heap(core::ptr::null_mut(), 0x1000, 0x2000) };
+        let m = unsafe { super::migrate(core::ptr::null_mut(), 1, 2) };
+        crate::dred::clear_removed_for_test();
+        assert!(h.is_none());
+        assert!(!m);
+    }
+}

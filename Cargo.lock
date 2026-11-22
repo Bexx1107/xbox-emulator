@@ -858,6 +858,7 @@ dependencies = [
 name = "xbtp"
 version = "0.1.0"
 dependencies = [
+ "compat-common",
  "xone-exports",
 ]
 

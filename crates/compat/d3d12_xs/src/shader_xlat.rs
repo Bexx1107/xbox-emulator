@@ -176,7 +176,7 @@ pub(crate) fn runtime_mode() -> &'static tombox_xshader::pack_key::Mode {
     static M: OnceLock<tombox_xshader::pack_key::Mode> = OnceLock::new();
     M.get_or_init(|| {
         let xbox_one = crate::cbv_raw::xbox_one_title();
-        let cbv_raw = tombox_xshader::pack_key::CbvRaw::of(crate::cbv_raw::enabled(), xbox_one);
+        let cbv_raw = crate::cbv_raw::pack_mode(xbox_one);
         let m = tombox_xshader::pack_key::Mode { cbv_raw, loop_grad: loop_grad(), fma: fma_mode() };
         let line = format!("{} xbox_one={}\n", m.line(), xbox_one as u8);
         let p = tombox_xshader::shader_cache::runtime_mode_path(&title_name());
@@ -230,7 +230,7 @@ pub(crate) fn runtime_source(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Inp
         dump_failure(hash, blob, None, &e);
         e
     })?;
-    if mode.cbv_raw != tombox_xshader::pack_key::CbvRaw::Off {
+    if mode.cbv_raw.rewrites() {
         if let Some((slot, lim, _)) = crate::cbv_raw::clamp_knob().filter(|k| k.2.map_or(true, |h| h == hash)) {
             t.hlsl = crate::cbv_raw::clamp_reads(&t.hlsl, slot, lim);
         }
@@ -547,7 +547,7 @@ fn index_ctx() -> &'static str {
     static C: OnceLock<String> = OnceLock::new();
     C.get_or_init(|| {
         let f = fma_mode();
-        format!("dxc={} cbv_raw={} loop_grad={} fma={}{}{}{}", tombox_xshader::dxc::available(), crate::cbv_raw::enabled(), loop_grad(), f.preserve as u8, f.any as u8, f.hybrid as u8, f.f2h as u8)
+        format!("dxc={} cbv_raw={} loop_grad={} fma={}{}{}{}", tombox_xshader::dxc::available(), if crate::cbv_raw::copy_on() { "copy".to_string() } else { crate::cbv_raw::enabled().to_string() }, loop_grad(), f.preserve as u8, f.any as u8, f.hybrid as u8, f.f2h as u8)
     })
 }
 
@@ -853,7 +853,7 @@ mod tests {
         }
         let fma = tombox_xshader::shader_cache::Fma { preserve: true, any: false, hybrid: true, f2h: true };
         let mut compared = 0;
-        for cbv in [CbvRaw::Off, CbvRaw::Forced, CbvRaw::On] {
+        for cbv in [CbvRaw::Off, CbvRaw::Forced, CbvRaw::On, CbvRaw::Copy] {
             for loop_grad in [true, false] {
                 let mode = Mode { cbv_raw: cbv, loop_grad, fma };
                 for (name, blob) in &fx {
@@ -886,14 +886,16 @@ mod tests {
     #[test]
     fn runtime_cbv_mode_matches_the_prelaunch_decision() {
         use tombox_xshader::pack_key::CbvRaw;
-        for setting in [None, Some(""), Some("auto"), Some("1"), Some("on"), Some("0"), Some("off"), Some("junk")] {
+        for setting in [None, Some(""), Some("auto"), Some("1"), Some("on"), Some("0"), Some("off"), Some("junk"), Some("copy")] {
             for xbox_one in [false, true] {
-                let enabled = match crate::cbv_raw::parse_mode(setting).unwrap_or(crate::cbv_raw::Mode::Auto) {
+                let mode = crate::cbv_raw::parse_mode(setting).unwrap_or(crate::cbv_raw::Mode::Auto);
+                let enabled = match mode {
                     crate::cbv_raw::Mode::Auto => xbox_one,
                     crate::cbv_raw::Mode::On => true,
-                    crate::cbv_raw::Mode::Off => false,
+                    crate::cbv_raw::Mode::Off | crate::cbv_raw::Mode::Copy => false,
                 };
-                assert_eq!(CbvRaw::of(enabled, xbox_one), CbvRaw::decide(setting, xbox_one), "{setting:?} xbox_one {xbox_one}");
+                assert_eq!(crate::cbv_raw::pack_mode_of(mode, enabled, xbox_one), CbvRaw::decide(setting, xbox_one), "{setting:?} xbox_one {xbox_one}");
+                assert_eq!(mode == crate::cbv_raw::Mode::Copy, CbvRaw::decide(setting, xbox_one) == CbvRaw::Copy, "{setting:?}");
                 let refuses = crate::cbv_raw::shader_kind_refusal(xbox_one, false).is_some();
                 assert_eq!(enabled && refuses, CbvRaw::of(enabled, xbox_one) == CbvRaw::On, "{setting:?} xbox_one {xbox_one}");
             }
