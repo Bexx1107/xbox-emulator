@@ -21,6 +21,7 @@ mod ecl_probe;
 mod cbv_raw;
 mod hang_cap;
 mod hang_snap;
+mod rootlog;
 mod bl_alias;
 mod vs_snorm;
 mod pso_async;

@@ -10,6 +10,8 @@ use std::sync::atomic::Ordering;
 
 pub mod guids;
 pub mod wfp;
+pub mod wfp_format;
+pub mod wfp_tables;
 
 pub const REDACTED: u64 = 0x1111_1111_1111_1111;
 pub const ERROR_FLAG: u32 = 0x1000_0000;

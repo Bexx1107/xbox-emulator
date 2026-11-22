@@ -1,4 +1,3 @@
-use super::guids::guid_text;
 use super::*;
 use crate::trace::WFP_GUID;
 use compat_common::netview::wfp as store;
@@ -46,6 +45,7 @@ struct Enumerator {
     idx: u32,
     num: u32,
     entries: Vec<store::Object>,
+    filter_layer: Option<[u8; 16]>,
 }
 
 impl Enumerator {
@@ -162,7 +162,8 @@ unsafe fn create(e: &mut Enumerator, s: &Session, tmpl: usize, spec: &Spec) -> u
     close(e, s, spec);
     st(&G_ENUM, 0x2d, &[p(a)]);
     tr(&G_SESSION, spec.create[0], &[p(o), p(tmpl), p(&e.handle as *const u64 as usize)]);
-    let hr = match store::create_enum_handle(s.engine, spec.kind) {
+    let made = if spec.kind == store::Kind::Filter { store::create_filter_enum_handle(s.engine, e.filter_layer) } else { store::create_enum_handle(s.engine, spec.kind) };
+    let hr = match made {
         Ok(h) => {
             e.handle = h;
             0
@@ -231,55 +232,7 @@ unsafe fn next(e: &mut Enumerator, s: &Session, spec: &Spec, out: usize) -> (u32
     (hr, item)
 }
 
-fn flags_text(f: u32) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if f & store::FWPM_PROVIDER_FLAG_PERSISTENT != 0 {
-        parts.push("PERSISTENT".to_string());
-    }
-    if f & 0x10 != 0 {
-        parts.push("DISABLED".to_string());
-    }
-    let rest = f & !0x11;
-    if rest != 0 {
-        parts.push(format!("unrecognized_0x{:08x}", rest));
-    }
-    format!("0x{:08x} ({})", f, parts.join(" "))
-}
-
-pub unsafe fn format_provider(v: &store::Provider) {
-    let f = |id: u16, a: &[Arg]| st(&G_FORMAT, id, a);
-    let key = ws(&guid_text(Some(&v.key)));
-    f(0x1a, &[Z, w(&key)]);
-    f(0x1b, &[Z, Arg::U64(REDACTED)]);
-    match &v.name {
-        Some(n) => f(0xb, &[Z, w(n)]),
-        None => f(0xc, &[Z]),
-    }
-    match &v.description {
-        Some(n) => f(0xd, &[Z, w(n)]),
-        None => f(0xe, &[Z]),
-    }
-    let flags = ws(&flags_text(v.flags));
-    f(0x1c, &[Z, w(&flags)]);
-    f(0x1d, &[Z, Arg::U64(REDACTED)]);
-    let pre = ws("    ");
-    f(0x17, &[Z, w(&pre), u(v.data.len() as u32)]);
-    if v.data.is_empty() {
-        f(0x19, &[Z, w(&pre)]);
-    } else {
-        f(0x18, &[Z, w(&pre), Arg::U64(REDACTED)]);
-    }
-    match &v.service_name {
-        Some(n) => f(0x1e, &[Z, w(n)]),
-        None => f(0x1f, &[Z]),
-    }
-}
-
-unsafe fn format_object(o: &store::Object) {
-    match o {
-        store::Object::Provider(v) => format_provider(v),
-    }
-}
+pub use super::wfp_format::{format_object, format_provider};
 
 unsafe fn run_simple(s: &Session, sec: Section, spec: Spec, tmpl: usize) -> u32 {
     let mut e = Enumerator::default();
@@ -405,6 +358,7 @@ unsafe fn run_filters(s: &Session) -> u32 {
         let c = match layer {
             None => {
                 st(&G_ENUM, 0x35, &[p(a), p(o)]);
+                e.filter_layer = None;
                 let h = create(&mut e, s, 0, &FILTERS);
                 st(&G_ENUM, 0x36, &[p(a), u(h)]);
                 h
@@ -414,6 +368,7 @@ unsafe fn run_filters(s: &Session) -> u32 {
                 st(&G_ENUM, 0x3a, &[p(a), p(o), p(g as *const GUID as usize), Arg::U64(0), u(0), Arg::U64(0), u(0)]);
                 let tmpl = FilterTemplate { provider_key: 0, layer_key: key, enum_type: 1, flags: 2, provider_context: 0, condition_count: 0, conditions: 0, action_mask: 0xffff_ffff, callout_key: 0 };
                 e.layer = [0; 16];
+                e.filter_layer = Some(key);
                 let mut head = vec![p(a), u(0)];
                 head.extend((0..10).map(|_| u(0)));
                 st(&G_ENUM, 0x3b, &args(&head, guid_fields(&key), &[u(0), u(0)]));

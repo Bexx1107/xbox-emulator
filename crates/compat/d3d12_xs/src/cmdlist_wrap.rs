@@ -45,10 +45,14 @@ pub(crate) unsafe fn real_method(slot: usize) -> usize {
     unsafe { *REAL_VT_PTR.add(slot) }
 }
 
+#[track_caller]
 pub(crate) unsafe fn pc_method(list: *mut c_void, slot: usize) -> usize {
     let vt = unsafe { *(list as *const *const usize) };
     let xbox = XBOX_VT.as_ptr() as *const usize;
     if vt == xbox && !unsafe { REAL_VT_PTR }.is_null() {
+        if let Some(t) = crate::rootlog::route(slot, core::panic::Location::caller().file()) {
+            return t;
+        }
         unsafe { *REAL_VT_PTR.add(slot) }
     } else {
         unsafe { *vt.add(slot) }

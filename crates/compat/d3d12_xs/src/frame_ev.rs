@@ -50,8 +50,18 @@ extern "system" {
     fn GetModuleHandleW(name: *const u16) -> *mut u8;
 }
 
+#[cfg(test)]
+thread_local! {
+    static T_ON: Cell<bool> = const { Cell::new(false) };
+    static T_ACC: core::cell::RefCell<Snap> = core::cell::RefCell::new(Snap::default());
+}
+
 #[inline]
 pub fn active() -> bool {
+    #[cfg(test)]
+    if T_ON.with(|c| c.get()) {
+        return true;
+    }
     ACTIVE.load(Relaxed)
 }
 
@@ -80,6 +90,20 @@ pub fn counts_on_title_frame(k: usize) -> bool {
 fn add(k: usize, ticks: i64, bg: bool) {
     let t = ticks.max(0) as u64;
     let bg = bg && !counts_on_title_frame(k);
+    #[cfg(test)]
+    if T_ON.with(|c| c.get()) {
+        T_ACC.with(|a| {
+            let mut a = a.borrow_mut();
+            if bg {
+                a.bg_n[k] += 1;
+                a.bg_ticks[k] += t;
+            } else {
+                a.n[k] += 1;
+                a.ticks[k] += t;
+            }
+        });
+        return;
+    }
     if bg {
         BG[k].fetch_add(1, Relaxed);
         BG_TICKS[k].fetch_add(t, Relaxed);
@@ -304,53 +328,75 @@ fn install_title_hooks() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn pipeline_library_events_from_pso_workers_land_in_the_frame_columns() {
-        let before = take();
-        add(PSO_LIB_HIT, 10, true);
-        add(PSO_LIB_MISS, 20, true);
-        add(PSO_SYNC, 30, true);
-        let s = take();
-        assert!(s.n[PSO_LIB_HIT] >= 1 && s.n[PSO_LIB_MISS] >= 1);
-        assert!(s.ticks[PSO_LIB_HIT] >= 10 && s.ticks[PSO_LIB_MISS] >= 20);
-        assert_eq!(s.bg_n[PSO_LIB_HIT] + s.bg_n[PSO_LIB_MISS], 0);
-        assert!(s.bg_n[PSO_SYNC] >= 1);
-        let r = row(&s, None);
-        let cols: Vec<&str> = r.split(',').collect();
-        assert_ne!(cols[1 + 2 * PSO_LIB_HIT], "0");
-        assert_ne!(cols[1 + 2 * PSO_LIB_MISS], "0");
-        let _ = before;
+    fn local(on: bool) -> Snap {
+        T_ON.with(|c| c.set(on));
+        T_ACC.with(|a| core::mem::take(&mut *a.borrow_mut()))
     }
 
     #[test]
-    fn scopes_record_exclusive_time_and_reset_per_take() {
-        ACTIVE.store(true, Relaxed);
-        KIND.with(|k| k.set(1));
-        let _ = take();
+    fn pipeline_library_events_from_pso_workers_land_in_the_frame_columns() {
+        let _ = local(true);
+        add(PSO_LIB_HIT, 10, true);
+        add(PSO_LIB_MISS, 20, true);
+        add(PSO_SYNC, 30, true);
+        let s = local(false);
+        assert_eq!((s.n[PSO_LIB_HIT], s.ticks[PSO_LIB_HIT]), (1, 10));
+        assert_eq!((s.n[PSO_LIB_MISS], s.ticks[PSO_LIB_MISS]), (1, 20));
+        assert_eq!(s.bg_n[PSO_LIB_HIT] + s.bg_n[PSO_LIB_MISS], 0);
+        assert_eq!((s.n[PSO_SYNC], s.bg_n[PSO_SYNC], s.bg_ticks[PSO_SYNC]), (0, 1, 30));
+        let r = row(&s, None);
+        let cols: Vec<&str> = r.split(',').collect();
+        assert_eq!(cols[1 + 2 * PSO_LIB_HIT], "1");
+        assert_eq!(cols[1 + 2 * PSO_LIB_MISS], "1");
+    }
+
+    #[test]
+    fn scopes_attribute_counts_and_exclusive_time_to_the_right_class() {
+        let _ = local(true);
         {
             let _outer = begin(XLAT);
             note_nested(DXC, 1000);
             let mut inner = begin(PSO_SYNC).unwrap();
             inner.set_kind(PSO_INLINE);
+            mark_async();
         }
-        let s = take();
+        let s = local(false);
         assert_eq!(s.n[XLAT], 1);
-        assert_eq!(s.n[DXC], 1);
-        assert_eq!(s.ticks[DXC], 1000);
+        assert_eq!((s.n[DXC], s.ticks[DXC]), (1, 1000));
         assert_eq!(s.n[PSO_INLINE], 1);
         assert_eq!(s.n[PSO_SYNC], 0);
-        let s2 = take();
-        assert_eq!(s2.n, [0; N]);
+        assert_eq!(s.n.iter().sum::<u64>(), 3);
+        assert_eq!(s.bg_n, [0; N]);
+        assert_eq!(local(false).n, [0; N]);
         let m = Mutex::new(5);
         assert_eq!(*lock(&m), 5);
-        mark_async();
         assert!(take_async_mark());
         assert!(!take_async_mark());
-        ACTIVE.store(false, Relaxed);
-        assert!(begin(XLAT).is_none());
         let row = row(&s, Some(1.5));
         assert_eq!(row.split(',').count(), header().split(',').count());
         assert!(row.ends_with("1.500"));
+    }
+
+    #[test]
+    fn nested_time_is_never_charged_to_the_outer_scope() {
+        let _ = local(true);
+        {
+            let _outer = begin(XLAT);
+            note_nested(DXC, i64::MAX / 4);
+        }
+        let s = local(false);
+        assert_eq!(s.n[XLAT], 1);
+        assert_eq!(s.ticks[XLAT], 0);
+        assert_eq!(s.ticks[DXC], (i64::MAX / 4) as u64);
+    }
+
+    #[test]
+    fn inactive_threads_record_nothing_locally() {
+        let _ = local(false);
+        if !ACTIVE.load(Relaxed) {
+            assert!(begin(XLAT).is_none());
+        }
+        T_ACC.with(|a| assert_eq!(a.borrow().n, [0; N]));
     }
 
     #[test]

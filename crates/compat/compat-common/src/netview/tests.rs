@@ -253,3 +253,99 @@ fn wfp_store_lives_in_the_process_wide_mapping() {
     assert_eq!(wfp::provider_get_by_key(e2, &key), Err(wfp::FWP_E_PROVIDER_NOT_FOUND));
     assert_eq!(wfp::engine_close(e2), 0);
 }
+
+fn named(n: &str) -> [u8; 16] {
+    super::wfp_names::NAMES.iter().find(|(_, x)| *x == n).map(|(k, _)| *k).unwrap()
+}
+
+fn wide(s: &str) -> Option<Vec<u16>> {
+    Some(s.encode_utf16().collect())
+}
+
+fn test_filter(key: u8, layer: [u8; 16], sublayer: [u8; 16], weight: wfp::Value) -> wfp::Filter {
+    wfp::Filter {
+        key: [key; 16],
+        name: wide("f"),
+        description: None,
+        flags: 0,
+        provider_key: None,
+        data: Vec::new(),
+        layer,
+        sublayer,
+        weight,
+        conditions: vec![wfp::Condition { field: named("FWPM_CONDITION_IP_REMOTE_ADDRESS"), match_type: 0, value: wfp::Value::U32(0x0a00_0001) }],
+        action_type: 0x1001,
+        action_key: [0; 16],
+        context: [0; 16],
+        reserved: None,
+        id: 0,
+        effective_weight: wfp::Value::Empty,
+    }
+}
+
+#[test]
+fn wfp_store_adds_sublayers_callouts_contexts_and_filters_with_console_checks() {
+    let _g = wfp::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let e = wfp::engine_open(wfp::FWPM_SESSION_FLAG_DYNAMIC).unwrap();
+    let connect = named("FWPM_LAYER_ALE_AUTH_CONNECT_V4");
+    let transport = named("FWPM_LAYER_INBOUND_TRANSPORT_V4");
+    let pkey = [0x71u8; 16];
+    let sl = wfp::SubLayer { key: [0x72; 16], name: wide("s"), description: None, flags: 0, provider_key: Some(pkey), data: vec![1, 2, 3], weight: 0x10 };
+    assert_eq!(wfp::sublayer_add(e, sl.clone()), wfp::FWP_E_PROVIDER_NOT_FOUND);
+    assert_eq!(wfp::provider_add(e, wfp::Provider { key: pkey, name: wide("p"), description: None, flags: 0, data: Vec::new(), service_name: None }), 0);
+    assert_eq!(wfp::sublayer_add(e, wfp::SubLayer { name: None, ..sl.clone() }), wfp::ERROR_INVALID_PARAMETER);
+    assert_eq!(wfp::sublayer_add(e, wfp::SubLayer { key: named("FWPM_SUBLAYER_UNIVERSAL"), ..sl.clone() }), wfp::FWP_E_ALREADY_EXISTS);
+    assert_eq!(wfp::sublayer_add(e, wfp::SubLayer { flags: wfp::FWPM_SUBLAYER_FLAG_PERSISTENT, ..sl.clone() }), wfp::FWP_E_DYNAMIC_SESSION_IN_PROGRESS);
+    assert_eq!(wfp::sublayer_add(e, sl.clone()), 0);
+    assert_eq!(wfp::sublayer_get_by_key(e, &sl.key), Ok(sl.clone()));
+    let co = wfp::Callout { key: [0x73; 16], name: wide("c"), description: None, flags: 0, provider_key: None, data: Vec::new(), layer: [0x99; 16], id: 0 };
+    assert_eq!(wfp::callout_add(e, co.clone()), Err(wfp::FWP_E_LAYER_NOT_FOUND));
+    let id1 = wfp::callout_add(e, wfp::Callout { layer: connect, ..co.clone() }).unwrap();
+    assert_eq!(wfp::callout_get_by_key(e, &co.key).unwrap().id, id1);
+    let ctx = wfp::ProviderContext { key: [0x74; 16], name: wide("x"), description: None, flags: 0, provider_key: None, data: Vec::new(), kind: wfp::FWPM_GENERAL_CONTEXT, body: wfp::ContextBody::General(vec![9]), id: 0 };
+    assert_eq!(wfp::provider_context_add(e, wfp::ProviderContext { body: wfp::ContextBody::Null, ..ctx.clone() }), Err(wfp::ERROR_INVALID_PARAMETER));
+    assert_eq!(wfp::provider_context_add(e, wfp::ProviderContext { kind: 13, ..ctx.clone() }), Err(wfp::ERROR_INVALID_PARAMETER));
+    let cid = wfp::provider_context_add(e, ctx.clone()).unwrap();
+    assert_eq!(wfp::provider_context_get_by_key(e, &ctx.key).unwrap().id, cid);
+    assert_eq!(wfp::filter_add(e, test_filter(1, [0x99; 16], [0; 16], wfp::Value::Empty)), Err(wfp::FWP_E_LAYER_NOT_FOUND));
+    assert_eq!(wfp::filter_add(e, test_filter(1, connect, [0x98; 16], wfp::Value::Empty)), Err(wfp::FWP_E_SUBLAYER_NOT_FOUND));
+    assert_eq!(wfp::filter_add(e, test_filter(1, connect, [0; 16], wfp::Value::U32(1))), Err(wfp::ERROR_INVALID_PARAMETER));
+    assert_eq!(wfp::filter_add(e, wfp::Filter { action_type: 0x5003, action_key: [0x97; 16], ..test_filter(1, connect, [0; 16], wfp::Value::Empty) }), Err(wfp::FWP_E_CALLOUT_NOT_FOUND));
+    assert_eq!(wfp::filter_add(e, wfp::Filter { flags: wfp::FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT, context: [0x96; 16], ..test_filter(1, connect, [0; 16], wfp::Value::Empty) }), Err(wfp::FWP_E_PROVIDER_CONTEXT_NOT_FOUND));
+    let a = wfp::filter_add(e, wfp::Filter { action_type: 0x5003, action_key: co.key, ..test_filter(1, connect, sl.key, wfp::Value::U64(7)) }).unwrap();
+    let b = wfp::filter_add(e, wfp::Filter { flags: wfp::FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT, context: ctx.key, ..test_filter(2, transport, named("FWPM_SUBLAYER_UNIVERSAL"), wfp::Value::U8(3)) }).unwrap();
+    let c = wfp::filter_add(e, test_filter(3, transport, [0; 16], wfp::Value::Empty)).unwrap();
+    assert_eq!((b, c), (a + 1, a + 2));
+    assert_eq!(wfp::filter_get_by_key(e, &[1; 16]).unwrap().effective_weight, wfp::Value::U64(7));
+    match wfp::filter_get_by_key(e, &[2; 16]).unwrap().effective_weight {
+        wfp::Value::U64(w) => assert_eq!(w >> 60, 3),
+        other => panic!("{:?}", other),
+    }
+    assert!(matches!(wfp::filter_get_by_key(e, &[3; 16]).unwrap().effective_weight, wfp::Value::U64(_)));
+    assert_eq!(wfp::filter_add(e, test_filter(3, transport, [0; 16], wfp::Value::Empty)), Err(wfp::FWP_E_ALREADY_EXISTS));
+    let by_layer = |l: Option<[u8; 16]>| {
+        let h = wfp::create_filter_enum_handle(e, l).unwrap();
+        let v: Vec<u64> = wfp::enum_next(e, h, 0x40).unwrap().iter().map(|o| match o { wfp::Object::Filter(f) => f.id, _ => panic!() }).collect();
+        assert_eq!(wfp::destroy_enum_handle(e, h), 0);
+        v
+    };
+    assert_eq!(by_layer(Some(connect)), vec![a]);
+    assert_eq!(by_layer(Some(transport)), vec![b, c]);
+    assert_eq!(by_layer(None), vec![a, b, c]);
+    assert_eq!(wfp::create_filter_enum_handle(e, Some([0x99; 16])), Err(wfp::FWP_E_LAYER_NOT_FOUND));
+    assert_eq!(wfp::sublayer_delete_by_key(e, &sl.key), wfp::FWP_E_IN_USE);
+    assert_eq!(wfp::callout_delete_by_key(e, &co.key), wfp::FWP_E_IN_USE);
+    assert_eq!(wfp::provider_context_delete_by_key(e, &ctx.key), wfp::FWP_E_IN_USE);
+    assert_eq!(wfp::provider_delete_by_key(e, &pkey), wfp::FWP_E_IN_USE);
+    assert_eq!(wfp::filter_delete_by_key(e, &[1; 16]), 0);
+    assert_eq!(wfp::filter_delete_by_id(e, b), 0);
+    assert_eq!(wfp::filter_delete_by_id(e, b), wfp::FWP_E_FILTER_NOT_FOUND);
+    assert_eq!(wfp::sublayer_delete_by_key(e, &sl.key), 0);
+    assert_eq!(wfp::callout_delete_by_key(e, &co.key), 0);
+    assert_eq!(wfp::provider_context_delete_by_key(e, &ctx.key), 0);
+    assert_eq!(wfp::object_count(wfp::Kind::Filter), 1);
+    assert_eq!(wfp::engine_close(e), 0);
+    for k in [wfp::Kind::Provider, wfp::Kind::SubLayer, wfp::Kind::Callout, wfp::Kind::Filter, wfp::Kind::ProviderContext] {
+        assert_eq!(wfp::object_count(k), 0);
+    }
+}

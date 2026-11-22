@@ -2,6 +2,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub mod sockets;
 pub mod wfp;
+pub(crate) mod wfp_codec;
+pub mod wfp_names;
 
 #[cfg(test)]
 mod tests;

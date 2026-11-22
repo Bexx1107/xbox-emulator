@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::gcdcom::Guid;
 use crate::wasapi;
@@ -99,6 +99,10 @@ pub const METHOD_DEFAULT_ENDPOINT_19041: u32 = 0x22;
 pub const METHOD_ENDPOINT_19041: u32 = 0x25;
 pub const METHOD_DEFAULT_ENDPOINT: u32 = 0x80;
 pub const METHOD_ENDPOINT: u32 = 0x81;
+pub const METHOD_SESSION_ENUMERATOR: u32 = 0x77;
+pub const METHOD_ENUMERATED_SESSION: u32 = 0x78;
+pub const METHOD_ARGS: usize = 0x14;
+pub const METHOD_REPLY_COUNT: usize = 0x14;
 pub const BLOB_ID: usize = 0x1c;
 pub const BLOB_ID_CHARS: usize = 0x37;
 
@@ -251,19 +255,19 @@ struct Object {
     parent: u32,
     device: Option<String>,
     stream: Option<Stream>,
-    gain: f32,
-    mute: bool,
     volumes: Option<Vec<f32>>,
     properties: Option<[u32; 4]>,
     notify: bool,
     notify_id: u32,
     watch: Option<String>,
     list_cursor: usize,
+    pc_sessions: Vec<Arc<wasapi::PcSession>>,
+    pc_session: Option<Arc<wasapi::PcSession>>,
 }
 
 impl Object {
     fn new(kind: u32, parent: u32, device: Option<String>) -> Self {
-        Object { kind, parent, device, stream: None, gain: 1.0, mute: false, volumes: None, properties: None, notify: false, notify_id: 0, watch: None, list_cursor: 0 }
+        Object { kind, parent, device, stream: None, volumes: None, properties: None, notify: false, notify_id: 0, watch: None, list_cursor: 0, pc_sessions: Vec::new(), pc_session: None }
     }
 }
 
@@ -281,6 +285,7 @@ struct State {
     next_event: u32,
     session: Option<Guid>,
     session_channels: Option<Vec<f32>>,
+    session_simple: Option<(f32, bool)>,
 }
 
 fn state() -> MutexGuard<'static, State> {
@@ -421,8 +426,26 @@ fn device_for(object: u32) -> Option<String> {
     device_of(&state(), object)
 }
 
-fn session_guid() -> Guid {
-    state().session.unwrap_or(GUID_NULL)
+fn pc_session_of(s: &State, mut object: u32) -> Option<Arc<wasapi::PcSession>> {
+    for _ in 0..16 {
+        let o = s.objects.get(&object)?;
+        if let Some(p) = &o.pc_session {
+            return Some(p.clone());
+        }
+        if o.parent == 0 || o.parent == object {
+            return None;
+        }
+        object = o.parent;
+    }
+    None
+}
+
+fn session_ref(object: u32) -> wasapi::SessionRef {
+    let s = state();
+    match pc_session_of(&s, object) {
+        Some(p) => wasapi::SessionRef::Pc(p),
+        None => wasapi::SessionRef::Title(device_of(&s, object), s.session.unwrap_or(GUID_NULL)),
+    }
 }
 
 fn endpoint_key(dev: &Option<String>) -> String {
@@ -451,7 +474,8 @@ fn apply_all(s: &mut State) {
         let (es, em, ech) = s.endpoints.get(&key).map(|e| (e.scalar, e.mute, e.channels.clone())).unwrap_or((1.0, false, Vec::new()));
         let o = s.objects.get(&k).unwrap();
         let st = o.stream.as_ref().unwrap();
-        let gain = if o.mute || em { 0.0 } else { o.gain * es };
+        let (sg, sm) = s.session_simple.unwrap_or((1.0, false));
+        let gain = if sm || em { 0.0 } else { sg * es };
         *st.renderer.shared.gain.lock().unwrap() = Some(gain.clamp(0.0, 1.0));
         let n = wasapi::channels(&st.format) as usize;
         let mut v = o.volumes.clone().unwrap_or_else(|| vec![1.0; n]);
@@ -577,15 +601,42 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
             Err(hr) => hr,
         },
         STREAM_GET_CHANNEL_COUNT | STREAM_SET_CHANNEL_VOLUME | STREAM_GET_CHANNEL_VOLUME | STREAM_SET_ALL_VOLUMES | STREAM_GET_ALL_VOLUMES => stream_volume(id, object, a),
+        SET_SIMPLE_VOLUME | SET_SIMPLE_MUTE | GET_SIMPLE_VOLUME | GET_SIMPLE_MUTE if matches!(session_ref(object), wasapi::SessionRef::Pc(_)) => {
+            let r = session_ref(object);
+            match id {
+                SET_SIMPLE_VOLUME => {
+                    let v: f32 = rd(a, 0);
+                    if !(0.0..=1.0).contains(&v) {
+                        return E_INVALIDARG;
+                    }
+                    wasapi::session_simple_set(&r, Some(v), None, &guid_from(&ctx_at(a, 4)))
+                }
+                SET_SIMPLE_MUTE => {
+                    let m: u8 = rd(a, 0);
+                    wasapi::session_simple_set(&r, None, Some(m != 0), &guid_from(&ctx_at(a, 1)))
+                }
+                _ => match wasapi::session_simple_get(&r) {
+                    Ok((g, m)) => {
+                        if id == GET_SIMPLE_VOLUME {
+                            wr(a, 0, g);
+                        } else {
+                            wr(a, 0, m as u8);
+                        }
+                        S_OK
+                    }
+                    Err(hr) => hr,
+                },
+            }
+        }
         SET_SIMPLE_VOLUME => {
             let v: f32 = rd(a, 0);
             if !(0.0..=1.0).contains(&v) {
                 return E_INVALIDARG;
             }
             let ctx = ctx_at(a, 4);
-            match simple(object, |o| {
-                o.gain = v;
-                (o.gain, o.mute)
+            match simple(object, |g, m| {
+                *g = v;
+                (*g, *m)
             }) {
                 Some((g, m)) => {
                     session_changed(|sid| session_simple_record(sid, &ctx, g, m));
@@ -597,9 +648,9 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
         SET_SIMPLE_MUTE => {
             let m: u8 = rd(a, 0);
             let ctx = ctx_at(a, 1);
-            match simple(object, |o| {
-                o.mute = m != 0;
-                (o.gain, o.mute)
+            match simple(object, |g, mu| {
+                *mu = m != 0;
+                (*g, *mu)
             }) {
                 Some((g, m)) => {
                     session_changed(|sid| session_simple_record(sid, &ctx, g, m));
@@ -608,21 +659,21 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
                 None => E_INVALIDARG,
             }
         }
-        GET_SIMPLE_VOLUME => match simple(object, |o| o.gain) {
+        GET_SIMPLE_VOLUME => match simple(object, |g, _| *g) {
             Some(g) => {
                 wr(a, 0, g);
                 S_OK
             }
             None => E_INVALIDARG,
         },
-        GET_SIMPLE_MUTE => match simple(object, |o| o.mute) {
+        GET_SIMPLE_MUTE => match simple(object, |_, m| *m) {
             Some(m) => {
                 wr(a, 0, m as u8);
                 S_OK
             }
             None => E_INVALIDARG,
         },
-        SESSION_GET_STATE => match wasapi::session_state(device_for(object).as_deref(), &session_guid()) {
+        SESSION_GET_STATE => match wasapi::session_state(&session_ref(object)) {
             Ok(st) => {
                 wr(a, 0, st);
                 S_OK
@@ -635,7 +686,7 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
                 SESSION_GET_IDENTIFIER => (12, SESSION_STRING_CHARS),
                 _ => (13, SESSION_STRING_CHARS),
             };
-            match wasapi::session_string(device_for(object).as_deref(), &session_guid(), slot) {
+            match wasapi::session_string(&session_ref(object), slot) {
                 Ok(t) => {
                     if put_wide(a, &t, chars) { S_OK } else { E_OUTOFMEMORY }
                 }
@@ -646,9 +697,9 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
             let Some(name) = wide_at(a, DISPLAY_NAME_CHARS) else { return E_INVALIDARG };
             let ctx = guid_from(core::slice::from_raw_parts(a.add(DISPLAY_NAME_CHARS * 2), 16));
             let w: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-            wasapi::session_set_display_name(device_for(object).as_deref(), &session_guid(), &w, &ctx)
+            wasapi::session_set_display_name(&session_ref(object), &w, &ctx)
         }
-        SESSION_GET_GROUPING => match wasapi::session_grouping(device_for(object).as_deref(), &session_guid()) {
+        SESSION_GET_GROUPING => match wasapi::session_grouping(&session_ref(object)) {
             Ok(g) => {
                 core::ptr::copy_nonoverlapping(guid_bytes(&g).as_ptr(), a, 16);
                 S_OK
@@ -658,10 +709,10 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
         SESSION_SET_GROUPING => {
             let g = guid_from(core::slice::from_raw_parts(a, 16));
             let ctx = guid_from(core::slice::from_raw_parts(a.add(16), 16));
-            wasapi::session_set_grouping(device_for(object).as_deref(), &session_guid(), &g, &ctx)
+            wasapi::session_set_grouping(&session_ref(object), &g, &ctx)
         }
         SESSION_IS_SYSTEM_SOUNDS => {
-            let hr = wasapi::session_is_system_sounds(device_for(object).as_deref(), &session_guid());
+            let hr = wasapi::session_is_system_sounds(&session_ref(object));
             if hr < 0 {
                 return hr;
             }
@@ -670,7 +721,7 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
         }
         SESSION_SET_DUCKING => {
             let b: u32 = rd(a, 0);
-            wasapi::session_set_ducking(device_for(object).as_deref(), &session_guid(), b != 0)
+            wasapi::session_set_ducking(&session_ref(object), b != 0)
         }
         SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER | ENDPOINT_REGISTER | ENUMERATOR_SUBSCRIBE => subscribe(object, id, true),
         SESSION_MANAGER_UNREGISTER | ENDPOINT_UNREGISTER | ENUMERATOR_UNSUBSCRIBE => subscribe(object, id, false),
@@ -806,11 +857,44 @@ unsafe fn create_object(a: *mut u8, room: usize) -> i32 {
         },
         _ => None,
     };
+    let mut sessions = Vec::new();
+    let mut session = None;
+    let mut session_parent = None;
+    match method {
+        METHOD_SESSION_ENUMERATOR => {
+            sessions = match wasapi::session_enumerate(device_for(parent).as_deref()) {
+                Ok(l) => l,
+                Err(hr) => return hr,
+            };
+            wr(a, METHOD_REPLY_COUNT, sessions.len() as u32);
+        }
+        METHOD_ENUMERATED_SESSION => {
+            let index: u32 = rd(a, METHOD_ARGS);
+            let s = state();
+            let Some(e) = s.objects.get(&parent) else { return E_INVALIDARG };
+            let Some(p) = e.pc_sessions.get(index as usize).cloned() else { return E_INVALIDARG };
+            let title = wasapi::SessionRef::Title(device_of(&s, parent), s.session.unwrap_or(GUID_NULL));
+            drop(s);
+            let same = match (wasapi::session_instance(&wasapi::SessionRef::Pc(p.clone())), wasapi::session_instance(&title)) {
+                (Ok(a), Ok(b)) => a.eq_ignore_ascii_case(&b),
+                (Err(hr), _) => return hr,
+                _ => false,
+            };
+            if !same {
+                session = Some(p);
+            }
+            session_parent = Some(parent);
+        }
+        _ => {}
+    }
     let mut s = state();
     let n = s.next;
     s.next += 1;
-    compat_common::record_raw("crossvm-audio", "CreateObject", &format!("type {kind:#x} flag {flag} parent {parent:#x} method {method:#x} device {device:?} -> object {n:#x}"));
-    s.objects.insert(n, Object::new(kind, if flag == 1 { 0 } else { parent }, device));
+    compat_common::record_raw("crossvm-audio", "CreateObject", &format!("type {kind:#x} flag {flag} parent {parent:#x} method {method:#x} device {device:?} sessions {} -> object {n:#x}", sessions.len()));
+    let mut o = Object::new(kind, session_parent.unwrap_or(if flag == 1 { 0 } else { parent }), device);
+    o.pc_sessions = sessions;
+    o.pc_session = session;
+    s.objects.insert(n, o);
     wr(a, 0xc, n);
     S_OK
 }
@@ -869,10 +953,14 @@ unsafe fn transport(id: u32, object: u32) -> i32 {
     }
 }
 
-fn simple<R>(object: u32, f: impl FnOnce(&mut Object) -> R) -> Option<R> {
+fn simple<R>(object: u32, f: impl FnOnce(&mut f32, &mut bool) -> R) -> Option<R> {
     let mut s = state();
-    let k = stream_owner(&s, object).unwrap_or(object);
-    let r = f(s.objects.get_mut(&k)?);
+    if !s.objects.contains_key(&object) {
+        return None;
+    }
+    let (mut g, mut m) = s.session_simple.unwrap_or((1.0, false));
+    let r = f(&mut g, &mut m);
+    s.session_simple = Some((g, m));
     apply_all(&mut s);
     Some(r)
 }
@@ -943,6 +1031,18 @@ unsafe fn channel_op(op: u32, v: &mut Vec<f32>, a: *mut u8) -> i32 {
 }
 
 unsafe fn session_volume(id: u32, object: u32, a: *mut u8) -> i32 {
+    if let r @ wasapi::SessionRef::Pc(_) = session_ref(object) {
+        let mut v = match wasapi::session_channels_get(&r) {
+            Ok(v) => v,
+            Err(hr) => return hr,
+        };
+        let hr = channel_op(id - SESSION_CHANNEL_COUNT, &mut v, a);
+        return match id {
+            SESSION_SET_CHANNEL_VOLUME if hr >= 0 => wasapi::session_channels_set(&r, &v, &guid_from(&ctx_at(a, 8))),
+            SESSION_SET_ALL_VOLUMES if hr >= 0 => wasapi::session_channels_set(&r, &v, &guid_from(&ctx_at(a, SESSION_ALL_VOLUMES_CTX))),
+            _ => hr,
+        };
+    }
     let dev = device_for(object);
     let n = wasapi::device_info_for(dev.as_deref()).map(|d| wasapi::channels(&d.mix) as usize).unwrap_or(2);
     let mut s = state();
@@ -970,7 +1070,7 @@ fn subscribe(object: u32, id: u32, on: bool) -> i32 {
                 watch = Some(endpoint_key(&device_for(object)));
                 S_OK
             }
-            SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER => match wasapi::watch_session(device_for(object).as_deref(), &session_guid()) {
+            SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER => match wasapi::watch_session(&session_ref(object)) {
                 Ok(sid) => {
                     watch = Some(sid);
                     S_OK
@@ -1064,14 +1164,32 @@ pub fn sent_notifications() -> Vec<(i32, Vec<u8>)> {
     sent().clone()
 }
 
+fn repeated(e: &wasapi::PcEvent) -> bool {
+    static LAST: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
+    let wasapi::PcEvent::Session { sid, kind, ctx, text, guid, value, volume, volumes } = e else { return false };
+    let key = format!("{sid}|{kind}|{ctx:?}|{text}|{guid:?}|{value}|{}|{:?}", volume.to_bits(), volumes.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    let mut l = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    let now = std::time::Instant::now();
+    let dup = matches!(&*l, Some((k, t)) if *k == key && now.duration_since(*t) < std::time::Duration::from_millis(PC_REPEAT_MS));
+    *l = Some((key, now));
+    dup
+}
+
+pub const PC_REPEAT_MS: u64 = 100;
+
 fn pc_event(e: wasapi::PcEvent) {
+    if repeated(&e) {
+        return;
+    }
     let mut frames = Vec::new();
     {
         let s = state();
         for (&k, o) in s.objects.iter().filter(|(_, o)| o.notify) {
             let rec = match (&e, o.notify_id) {
                 (wasapi::PcEvent::Device { kind, id, a, b, key }, ENUMERATOR_SUBSCRIBE) => device_record(*kind, id, *a, *b, key.as_ref()),
-                (wasapi::PcEvent::Session { sid, kind, ctx, text, guid, value }, SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER) if o.watch.as_deref() == Some(sid.as_str()) => match *kind {
+                (wasapi::PcEvent::Session { sid, kind, ctx, text, guid, value, volume, volumes }, SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER) if o.watch.as_deref() == Some(sid.as_str()) => match *kind {
+                    1 if pc_session_of(&s, k).is_some() => session_simple_record(sid, ctx, *volume, *value != 0),
+                    2 if pc_session_of(&s, k).is_some() => session_channel_record(sid, ctx, *value, volumes),
                     0x10 | 0x100 => session_text_record(*kind, sid, ctx, text),
                     4 => session_record(4, sid, ctx, guid, &[]),
                     8 | 0x20 => session_value_record(*kind, sid, *value),
@@ -1175,6 +1293,9 @@ fn session_changed(build: impl Fn(&str) -> Option<Vec<u8>>) {
     {
         let s = state();
         for (&k, o) in s.objects.iter().filter(|(_, o)| o.notify && matches!(o.notify_id, SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER)) {
+            if pc_session_of(&s, k).is_some() {
+                continue;
+            }
             if let Some(r) = o.watch.as_deref().and_then(&build) {
                 frames.push(notify_frame(k, &r));
             }

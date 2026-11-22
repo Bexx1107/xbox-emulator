@@ -465,7 +465,138 @@ pub fn property_value(id: Option<&str>, key: &PropertyKey) -> Result<Option<Prop
     }
 }
 
-unsafe fn session_control(id: Option<&str>, session: &Guid) -> Result<Com, i32> {
+const IID_IAUDIO_SESSION_MANAGER2: Guid = Guid { data1: 0x77AA99A0, data2: 0x1BD6, data3: 0x484F, data4: [0x8B, 0xC7, 0x2C, 0x65, 0x4C, 0x9A, 0x9B, 0x6F] };
+const IID_ICHANNEL_AUDIO_VOLUME: Guid = Guid { data1: 0x1C158861, data2: 0xB533, data3: 0x4B30, data4: [0xB1, 0xCF, 0xE8, 0x53, 0xE5, 0x1C, 0x59, 0xB8] };
+
+pub struct PcSession(usize);
+
+unsafe impl Send for PcSession {}
+unsafe impl Sync for PcSession {}
+
+impl Drop for PcSession {
+    fn drop(&mut self) {
+        unsafe { release(self.0 as *mut c_void) }
+    }
+}
+
+#[derive(Clone)]
+pub enum SessionRef {
+    Title(Option<String>, Guid),
+    Pc(Arc<PcSession>),
+}
+
+pub fn session_instance(r: &SessionRef) -> Result<String, i32> {
+    session_string(r, 13)
+}
+
+pub fn session_enumerate(id: Option<&str>) -> Result<Vec<Arc<PcSession>>, i32> {
+    unsafe {
+        let dev = device(id)?;
+        let mgr = activate(&dev, &IID_IAUDIO_SESSION_MANAGER2)?;
+        let mut en = core::ptr::null_mut();
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32>(mgr.0, 5)(mgr.0, &mut en);
+        if hr < 0 {
+            return Err(hr);
+        }
+        let en = Com(en);
+        let mut n = 0i32;
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut i32) -> i32>(en.0, 3)(en.0, &mut n);
+        if hr < 0 {
+            return Err(hr);
+        }
+        let mut out = Vec::new();
+        for i in 0..n.max(0) {
+            let mut c = core::ptr::null_mut();
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, i32, *mut *mut c_void) -> i32>(en.0, 4)(en.0, i, &mut c);
+            if hr < 0 {
+                return Err(hr);
+            }
+            let c = Com(c);
+            let mut c2 = core::ptr::null_mut();
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(c.0, 0)(c.0, &IID_IAUDIO_SESSION_CONTROL2, &mut c2);
+            if hr < 0 {
+                return Err(hr);
+            }
+            let c2 = PcSession(c2 as usize);
+            let mut pid = 0u32;
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(c2.0 as *mut c_void, 14)(c2.0 as *mut c_void, &mut pid);
+            if hr >= 0 && pid == std::process::id() {
+                out.push(Arc::new(c2));
+            }
+        }
+        Ok(out)
+    }
+}
+
+unsafe fn session_iface(r: &SessionRef, iid: &Guid) -> Result<Com, i32> {
+    let c = session_control(r)?;
+    let mut v = core::ptr::null_mut();
+    let hr = slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(c.0, 0)(c.0, iid, &mut v);
+    if hr < 0 { Err(hr) } else { Ok(Com(v)) }
+}
+
+pub fn session_simple_get(r: &SessionRef) -> Result<(f32, bool), i32> {
+    unsafe {
+        let v = session_iface(r, &IID_ISIMPLE_AUDIO_VOLUME)?;
+        let mut g = 0f32;
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut f32) -> i32>(v.0, 4)(v.0, &mut g);
+        if hr < 0 {
+            return Err(hr);
+        }
+        let mut m = 0i32;
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut i32) -> i32>(v.0, 6)(v.0, &mut m);
+        if hr < 0 { Err(hr) } else { Ok((g, m != 0)) }
+    }
+}
+
+pub fn session_simple_set(r: &SessionRef, volume: Option<f32>, mute: Option<bool>, ctx: &Guid) -> i32 {
+    unsafe {
+        let v = match session_iface(r, &IID_ISIMPLE_AUDIO_VOLUME) {
+            Ok(v) => v,
+            Err(hr) => return hr,
+        };
+        let mut hr = 0;
+        if let Some(x) = volume {
+            hr = slot::<unsafe extern "system" fn(*mut c_void, f32, *const Guid) -> i32>(v.0, 3)(v.0, x, ctx);
+        }
+        if let (Some(m), true) = (mute, hr >= 0) {
+            hr = slot::<unsafe extern "system" fn(*mut c_void, i32, *const Guid) -> i32>(v.0, 5)(v.0, m as i32, ctx);
+        }
+        hr
+    }
+}
+
+pub fn session_channels_get(r: &SessionRef) -> Result<Vec<f32>, i32> {
+    unsafe {
+        let v = session_iface(r, &IID_ICHANNEL_AUDIO_VOLUME)?;
+        let mut n = 0u32;
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(v.0, 3)(v.0, &mut n);
+        if hr < 0 {
+            return Err(hr);
+        }
+        let mut out = vec![0f32; n as usize];
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, *mut f32) -> i32>(v.0, 7)(v.0, n, out.as_mut_ptr());
+        if hr < 0 { Err(hr) } else { Ok(out) }
+    }
+}
+
+pub fn session_channels_set(r: &SessionRef, volumes: &[f32], ctx: &Guid) -> i32 {
+    unsafe {
+        match session_iface(r, &IID_ICHANNEL_AUDIO_VOLUME) {
+            Ok(v) => slot::<unsafe extern "system" fn(*mut c_void, u32, *const f32, *const Guid) -> i32>(v.0, 6)(v.0, volumes.len() as u32, volumes.as_ptr(), ctx),
+            Err(hr) => hr,
+        }
+    }
+}
+
+unsafe fn session_control(r: &SessionRef) -> Result<Com, i32> {
+    let (id, session) = match r {
+        SessionRef::Title(id, g) => (id.as_deref(), g),
+        SessionRef::Pc(p) => {
+            slot::<unsafe extern "system" fn(*mut c_void) -> u32>(p.0 as *mut c_void, 1)(p.0 as *mut c_void);
+            return Ok(Com(p.0 as *mut c_void));
+        }
+    };
     let dev = device(id)?;
     let mgr = activate(&dev, &IID_IAUDIO_SESSION_MANAGER)?;
     let mut ctl = core::ptr::null_mut();
@@ -479,18 +610,18 @@ unsafe fn session_control(id: Option<&str>, session: &Guid) -> Result<Com, i32> 
     if hr < 0 { Err(hr) } else { Ok(Com(c2)) }
 }
 
-pub fn session_state(id: Option<&str>, session: &Guid) -> Result<u32, i32> {
+pub fn session_state(r: &SessionRef) -> Result<u32, i32> {
     unsafe {
-        let c = session_control(id, session)?;
+        let c = session_control(r)?;
         let mut st = 0u32;
         let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(c.0, 3)(c.0, &mut st);
         if hr < 0 { Err(hr) } else { Ok(st) }
     }
 }
 
-pub fn session_string(id: Option<&str>, session: &Guid, n: usize) -> Result<String, i32> {
+pub fn session_string(r: &SessionRef, n: usize) -> Result<String, i32> {
     unsafe {
-        let c = session_control(id, session)?;
+        let c = session_control(r)?;
         let mut p: *mut u16 = core::ptr::null_mut();
         let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> i32>(c.0, n)(c.0, &mut p);
         if hr < 0 {
@@ -500,45 +631,45 @@ pub fn session_string(id: Option<&str>, session: &Guid, n: usize) -> Result<Stri
     }
 }
 
-pub fn session_set_display_name(id: Option<&str>, session: &Guid, name: &[u16], ctx: &Guid) -> i32 {
+pub fn session_set_display_name(r: &SessionRef, name: &[u16], ctx: &Guid) -> i32 {
     unsafe {
-        match session_control(id, session) {
+        match session_control(r) {
             Ok(c) => slot::<unsafe extern "system" fn(*mut c_void, *const u16, *const Guid) -> i32>(c.0, 5)(c.0, name.as_ptr(), ctx),
             Err(hr) => hr,
         }
     }
 }
 
-pub fn session_grouping(id: Option<&str>, session: &Guid) -> Result<Guid, i32> {
+pub fn session_grouping(r: &SessionRef) -> Result<Guid, i32> {
     unsafe {
-        let c = session_control(id, session)?;
+        let c = session_control(r)?;
         let mut g = Guid { data1: 0, data2: 0, data3: 0, data4: [0; 8] };
         let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut Guid) -> i32>(c.0, 8)(c.0, &mut g);
         if hr < 0 { Err(hr) } else { Ok(g) }
     }
 }
 
-pub fn session_set_grouping(id: Option<&str>, session: &Guid, g: &Guid, ctx: &Guid) -> i32 {
+pub fn session_set_grouping(r: &SessionRef, g: &Guid, ctx: &Guid) -> i32 {
     unsafe {
-        match session_control(id, session) {
+        match session_control(r) {
             Ok(c) => slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *const Guid) -> i32>(c.0, 9)(c.0, g, ctx),
             Err(hr) => hr,
         }
     }
 }
 
-pub fn session_is_system_sounds(id: Option<&str>, session: &Guid) -> i32 {
+pub fn session_is_system_sounds(r: &SessionRef) -> i32 {
     unsafe {
-        match session_control(id, session) {
+        match session_control(r) {
             Ok(c) => slot::<unsafe extern "system" fn(*mut c_void) -> i32>(c.0, 15)(c.0),
             Err(hr) => hr,
         }
     }
 }
 
-pub fn session_set_ducking(id: Option<&str>, session: &Guid, opt_out: bool) -> i32 {
+pub fn session_set_ducking(r: &SessionRef, opt_out: bool) -> i32 {
     unsafe {
-        match session_control(id, session) {
+        match session_control(r) {
             Ok(c) => slot::<unsafe extern "system" fn(*mut c_void, i32) -> i32>(c.0, 16)(c.0, opt_out as i32),
             Err(hr) => hr,
         }
@@ -1261,7 +1392,7 @@ const IID_IMM_NOTIFICATION_CLIENT: Guid = Guid { data1: 0x7991EEC9, data2: 0x7E8
 
 pub enum PcEvent {
     Device { kind: u32, id: String, a: u32, b: u32, key: Option<PropertyKey> },
-    Session { sid: String, kind: u32, ctx: [u8; 16], text: String, guid: [u8; 16], value: u32 },
+    Session { sid: String, kind: u32, ctx: [u8; 16], text: String, guid: [u8; 16], value: u32, volume: f32, volumes: Vec<f32> },
 }
 
 static EVENT_SINK: std::sync::OnceLock<fn(PcEvent)> = std::sync::OnceLock::new();
@@ -1347,7 +1478,7 @@ unsafe fn guid16(p: *const Guid) -> [u8; 16] {
 }
 
 unsafe fn session_emit(this: *mut Callback, kind: u32, ctx: *const Guid, text: String, guid: [u8; 16], value: u32) -> i32 {
-    emit(PcEvent::Session { sid: (*this).sid.clone(), kind, ctx: guid16(ctx), text, guid, value });
+    emit(PcEvent::Session { sid: (*this).sid.clone(), kind, ctx: guid16(ctx), text, guid, value, volume: 0.0, volumes: Vec::new() });
     0
 }
 
@@ -1359,11 +1490,14 @@ unsafe extern "system" fn sess_icon(this: *mut Callback, path: *const u16, ctx: 
     session_emit(this, 0x100, ctx, wide_str(path), [0; 16], 0)
 }
 
-unsafe extern "system" fn sess_simple(_this: *mut Callback, _v: f32, _m: i32, _ctx: *const Guid) -> i32 {
+unsafe extern "system" fn sess_simple(this: *mut Callback, v: f32, m: i32, ctx: *const Guid) -> i32 {
+    emit(PcEvent::Session { sid: (*this).sid.clone(), kind: 1, ctx: guid16(ctx), text: String::new(), guid: [0; 16], value: (m != 0) as u32, volume: v, volumes: Vec::new() });
     0
 }
 
-unsafe extern "system" fn sess_channel(_this: *mut Callback, _n: u32, _v: *const f32, _c: u32, _ctx: *const Guid) -> i32 {
+unsafe extern "system" fn sess_channel(this: *mut Callback, n: u32, v: *const f32, changed: u32, ctx: *const Guid) -> i32 {
+    let volumes = if v.is_null() { Vec::new() } else { core::slice::from_raw_parts(v, n as usize).to_vec() };
+    emit(PcEvent::Session { sid: (*this).sid.clone(), kind: 2, ctx: guid16(ctx), text: String::new(), guid: [0; 16], value: changed, volume: 0.0, volumes });
     0
 }
 
@@ -1419,19 +1553,19 @@ pub fn watch_devices() -> i32 {
     })
 }
 
-pub fn watch_session(id: Option<&str>, session: &Guid) -> Result<String, i32> {
-    static DONE: std::sync::OnceLock<Mutex<std::collections::HashMap<(String, [u8; 16]), Result<String, i32>>>> = std::sync::OnceLock::new();
+pub fn watch_session(r: &SessionRef) -> Result<String, i32> {
+    static DONE: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Result<String, i32>>>> = std::sync::OnceLock::new();
     let map = DONE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let key = (id.unwrap_or_default().to_string(), unsafe { guid16(session) });
-    if let Some(r) = map.lock().unwrap().get(&key) {
-        return r.clone();
+    let sid = session_string(r, 13)?;
+    let key = sid.to_lowercase();
+    if let Some(res) = map.lock().unwrap().get(&key) {
+        return res.clone();
     }
-    let r = session_string(id, session, 13).and_then(|sid| {
-        let dev = id.map(|s| s.to_string());
-        let g = Guid { data1: session.data1, data2: session.data2, data3: session.data3, data4: session.data4 };
+    let res = Ok(sid).and_then(|sid: String| {
+        let r2 = r.clone();
         let reg_sid = sid.clone();
         let hr = watch(move || unsafe {
-            let c = session_control(dev.as_deref(), &g)?;
+            let c = session_control(&r2)?;
             let cb = Box::leak(Box::new(Callback { vtbl: SESSION_VTBL.0.as_ptr(), iid: IID_IAUDIO_SESSION_EVENTS, sid: reg_sid }));
             let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut Callback) -> i32>(c.0, 10)(c.0, cb);
             if hr < 0 {
@@ -1442,6 +1576,6 @@ pub fn watch_session(id: Option<&str>, session: &Guid) -> Result<String, i32> {
         });
         if hr < 0 { Err(hr) } else { Ok(sid) }
     });
-    map.lock().unwrap().insert(key, r.clone());
-    r
+    map.lock().unwrap().insert(key, res.clone());
+    res
 }

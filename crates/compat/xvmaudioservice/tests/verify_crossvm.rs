@@ -1349,6 +1349,70 @@ fn notify() {
     assert_eq!(&r[at..at + len], &label[..]);
     assert_eq!(&r[0x1c..0x2c], &[0x63u8; 16][..], "the PC event carries the guest's context GUID through");
     println!("session display name: PC event -> frame to {sess:#x}, name at +{at:#x}, {len} bytes");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(crossvm::sent_notifications().iter().skip(before).filter(|(_, f)| u32_at(f, 4) == sess && u32_at(f, 0x10) == 0x10).count(), 1, "the PC fires OnDisplayNameChanged more than once per change; the guest gets it once");
+
+    let sess_live = sess;
+    crossvm::set_hello(2);
+    let (hr, e) = create(0x18, 1, 0, crossvm::METHOD_SESSION_ENUMERATOR, &[]);
+    assert_eq!(hr, 0, "0x77 enumerates the PC IAudioSessionManager2 sessions");
+    let en = u32_at(&e, 0x1c);
+    let count = u32_at(&e, 0x10 + crossvm::METHOD_REPLY_COUNT);
+    assert_eq!(u32_at(&e, 0x20), crossvm::METHOD_SESSION_ENUMERATOR, "the reply validator a6b78 needs the method echoed at R+0x10");
+    assert!(count >= 1);
+    let mut own = None;
+    let mut ids = Vec::new();
+    for i in 0..count {
+        let (hr, e) = create(0xa, 1, en, crossvm::METHOD_ENUMERATED_SESSION, &i.to_le_bytes());
+        assert_eq!(hr, 0);
+        let o = u32_at(&e, 0x1c);
+        let mut e = envelope(crossvm::SESSION_GET_INSTANCE_IDENTIFIER, o);
+        assert_eq!(send(&mut e), 0);
+        let id = wide_at(&e, 0x10, crossvm::SESSION_STRING_CHARS);
+        let mut e = envelope(crossvm::SESSION_GET_STATE, o);
+        assert_eq!(send(&mut e), 0);
+        assert!(u32_at(&e, 0x10) <= 2);
+        if id == sid {
+            own = Some(o);
+        }
+        ids.push(id);
+    }
+    let (hr, _) = create(0xa, 1, en, crossvm::METHOD_ENUMERATED_SESSION, &count.to_le_bytes());
+    assert_eq!(hr, -2147024809, "index >= count is E_INVALIDARG (AudioSes a7070)");
+    let mut uniq = ids.clone();
+    uniq.sort();
+    uniq.dedup();
+    assert_eq!(uniq.len(), ids.len());
+    println!("0x77: {count} PC sessions; 0x78 index {count} -> E_INVALIDARG");
+    let own = own.expect("the title's own PC session is among the enumerated sessions");
+    let mut e = envelope(crossvm::SESSION_REGISTER_NOTIFICATION, own);
+    assert_eq!(send(&mut e), 0);
+    let before = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::SET_SIMPLE_VOLUME, own);
+    e[0x10..0x14].copy_from_slice(&0.3f32.to_le_bytes());
+    e[0x14..0x24].copy_from_slice(&[0x64; 16]);
+    assert_eq!(send(&mut e), 0);
+    let mut e = envelope(crossvm::GET_SIMPLE_VOLUME, sess_live);
+    assert_eq!(send(&mut e), 0);
+    assert_eq!(f32_at(&e, 0x10), 0.3, "the enumerated title session and the title session object share one volume");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let got: Vec<u32> = crossvm::sent_notifications().iter().skip(before).map(|(_, f)| u32_at(f, 4)).collect();
+    assert_eq!((got.iter().filter(|&&l| l == own).count(), got.iter().filter(|&&l| l == sess_live).count()), (1, 1), "one kind 1 frame per listener");
+    let before = crossvm::sent_notifications().len();
+    let mut e = envelope(crossvm::SESSION_SET_DISPLAY_NAME, own);
+    let label: Vec<u8> = "TomBox enum".encode_utf16().chain(Some(0)).flat_map(|c| c.to_le_bytes()).collect();
+    e[0x10..0x10 + label.len()].copy_from_slice(&label);
+    assert_eq!(send(&mut e), 0);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let all: Vec<(u32, u32, String)> = crossvm::sent_notifications().iter().skip(before).map(|(_, f)| (u32_at(f, 4), u32_at(f, 0x10), wide_at(f, 0xc + u32_at(f, 0x40) as usize, 32))).collect();
+    println!("frames after the enumerated SetDisplayName: {all:?}");
+    let got: Vec<u32> = all.iter().filter(|(_, k, _)| *k == 0x10).map(|(l, _, _)| *l).collect();
+    assert_eq!((got.iter().filter(|&&l| l == own).count(), got.iter().filter(|&&l| l == sess_live).count()), (1, 1), "one PC IAudioSessionEvents per session instance id: each listener gets the display name change once");
+    let mut e = envelope(crossvm::SET_SIMPLE_VOLUME, sess_live);
+    e[0x10..0x14].copy_from_slice(&1.0f32.to_le_bytes());
+    assert_eq!(send(&mut e), 0);
+    println!("enumerated own session {own:#x}: one volume with title object {sess_live:#x}, one frame per listener for host and PC events");
+    crossvm::set_hello(1);
     let mut e = envelope(crossvm::RELEASE_OBJECT, sess);
     assert_eq!(send(&mut e), 0);
 }

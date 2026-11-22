@@ -262,6 +262,7 @@ unsafe extern "system" fn set_compute_root_cbv_x(this: *mut c_void, i: u32, va: 
     if crate::rtcap::enabled() {
         crate::bindtrace::set_root_cbv(this as usize, true, i, va);
     }
+    crate::rootlog::note(this as usize, "cbv_raw:title", 39, i as u64, va, 0, 0);
     let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(REAL_ROOT_SRV[0].load(Ordering::Relaxed)) };
     unsafe { f(this, i, va) }
 }
@@ -283,6 +284,7 @@ unsafe extern "system" fn set_graphics_root_cbv_x(this: *mut c_void, i: u32, va:
             d.last.entry(this as usize).or_default().insert(i, va);
         });
     }
+    crate::rootlog::note(this as usize, "cbv_raw:title", 40, i as u64, va, 0, 0);
     let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(REAL_ROOT_SRV[1].load(Ordering::Relaxed)) };
     unsafe { f(this, i, va) }
 }
@@ -533,6 +535,7 @@ fn check_draw(list: usize, text: &dyn Fn() -> String) {
     if !plan.is_empty() {
         let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(REAL_ROOT_SRV[1].load(Ordering::Relaxed)) };
         for (i, va) in &plan {
+            crate::rootlog::note(list, "cbv_raw:inherit", 40, *i as u64, *va, 0, 0);
             unsafe { f(list as *mut c_void, *i, *va) };
         }
         let n = INHERITED.fetch_add(plan.len(), Ordering::Relaxed);

@@ -98,7 +98,7 @@ pub fn ps_from(v: Option<&str>) -> u64 {
     v.and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0xf861c56a34758d84)
 }
 
-fn snap_ps() -> u64 {
+pub(crate) fn snap_ps() -> u64 {
     static P: OnceLock<u64> = OnceLock::new();
     *P.get_or_init(|| ps_from(std::env::var("TOMBOX_HANGCAP_SNAP_PS").ok().as_deref()))
 }
