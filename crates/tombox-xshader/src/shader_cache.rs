@@ -422,6 +422,13 @@ pub struct Compiled {
 }
 
 pub fn compile_cached(final_hlsl: &str, profile: &str, fma: Fma, extra: &[&str]) -> Result<Compiled, String> {
+    compile_cached_with(final_hlsl, profile, fma, extra, || crate::dxc::compile_fma(final_hlsl, profile, fma, extra))
+}
+
+pub fn compile_cached_with(
+    final_hlsl: &str, profile: &str, fma: Fma, extra: &[&str],
+    compile: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<Compiled, String> {
     let t0 = std::time::Instant::now();
     let k = key(final_hlsl, profile, fma, &extra.join(" "));
     if let Some(code) = get(k) {
@@ -429,7 +436,7 @@ pub fn compile_cached(final_hlsl: &str, profile: &str, fma: Fma, extra: &[&str])
     }
     let lookup_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let t1 = std::time::Instant::now();
-    let code = crate::dxc::compile_fma(final_hlsl, profile, fma, extra)?;
+    let code = compile()?;
     let dxc_ms = t1.elapsed().as_secs_f64() * 1000.0;
     let _ = put(k, &code);
     Ok(Compiled { code, source: Source::Compiled, dxc_ms, lookup_ms })
