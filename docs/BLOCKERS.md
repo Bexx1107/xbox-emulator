@@ -1097,3 +1097,11 @@ Headless runs straight into each title's test scene, on the staged release of 11
   - an emulated WFP/IPsec object store (providers, sublayers, filters, SAs).
   - Today the only network model is the address classifier in xbtp/src/offline.rs (loopback real, remote literal unreachable, remote name not found). Host tables must not be read (offline rule), so until that view exists the sections send only their begin/end WPP records (ids 0x92/0x97, 0x12/0x16, 0x1e, 0x3b/0x3e/0x40/0x42/0x3c, 0xa6).
 - ETW elevation: xtfeventserver #4 and xtfdiaginfo #10 TraceStart call the real StartTraceW, which returns 0x80070005 for a non-elevated token. One elevated `cargo test -p xtfeventserver -p xtfdiaginfo` run would verify both. If it returns 0x80070057 instead, the Xbox EVENT_TRACE_FLAG_EXTENSION block in the trace properties (0x19220) is what the PC kernel rejects.
+
+## RTS0 root-constant user SGPRs on the static Scarlett path (tombox-xshader, all titles) - 2026-11-22, steward from #158
+
+### 🟨 User SGPRs mapped to an RTS0 root Constants parameter are never initialised
+- **Seen:** reported with a repro in PR #158. On the static Scarlett path (not Durango, not root-memory), a pixel shader whose RTS0 has `[Constants num32=4]` and reads s8 is translated to `uint s8 = 0u;`. The SGPR is declared but never loaded from the root constants.
+- **Cause (per the report, not yet traced in code):** the static user-SGPR setup has no load for a root Constants parameter, so those SGPRs keep the zero they were declared with.
+- **Done:** gap recorded and passed to the GPU owner. An offline check of the Trackmania hang shaders (PS f861c56a34758d84, VS 5cba0860bcfa69b1) found that neither reads a zero-initialised root-constant SGPR, because their root constants come through the tb_rcN cbuffers. So this gap is not the cause of that hang.
+- **Missing:** map each root Constants parameter's 32-bit values onto its user SGPRs (bind the parameter as a cbuffer/root constants in the translated root signature and load s<n> from it). Add a synthetic test that reads s8 under `[Constants num32=4]` and expects the bound value instead of 0.

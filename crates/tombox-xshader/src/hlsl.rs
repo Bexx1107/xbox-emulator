@@ -34,6 +34,7 @@ mod durango;
 mod mixed;
 mod mimg_d16;
 mod atomic;
+mod user_data;
 use mimg_d16::{mimg_data_regs, Lane};
 
 pub struct Translated {
@@ -45,6 +46,7 @@ pub struct Translated {
     pub mip_srvs: Vec<u32>,
     pub needs_gmem: bool,
     pub needs_global: bool,
+    pub user_data_base: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -463,6 +465,7 @@ struct Emitter<'a> {
     uses_global: bool,
     mode_use: mode::ModeUse,
     out_interp: InputInterp,
+    user_data: bool,
 }
 
 /// SGPR spills through vector lanes.
@@ -997,17 +1000,29 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
 }
 
 pub fn translate_linked(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>) -> Result<Translated, String> {
+    translate_linked_with(ex, feeds_ps, false)
+}
+
+pub fn translate_user_data(ex: &ShaderExtract) -> Result<Translated, String> {
+    translate_linked_with(ex, None, true)
+}
+
+pub fn translate_linked_user_data(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>) -> Result<Translated, String> {
+    translate_linked_with(ex, feeds_ps, true)
+}
+
+fn translate_linked_with(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, user_data: bool) -> Result<Translated, String> {
     let out_interp = match ex.stage {
         Stage::Vertex | Stage::Geometry | Stage::Mesh => feeds_ps.cloned().unwrap_or_default(),
         _ => InputInterp::default(),
     };
-    match translate_with(ex, &out_interp, None, BTreeSet::new()) {
-        Err(e) if disassemble(&ex.isa).iter().take(16).any(|i| i.mnemonic == "s_swappc_b64") => translate_with(ex, &out_interp, Some(8), BTreeSet::new()).map_err(|e2| if e2.contains("not a buffer descriptor") || e2.contains("not a root table") { e } else { e2 }),
+    match translate_with(ex, &out_interp, None, BTreeSet::new(), user_data) {
+        Err(e) if disassemble(&ex.isa).iter().take(16).any(|i| i.mnemonic == "s_swappc_b64") => translate_with(ex, &out_interp, Some(8), BTreeSet::new(), user_data).map_err(|e2| if e2.contains("not a buffer descriptor") || e2.contains("not a root table") { e } else { e2 }),
         r => r,
     }
 }
 
-fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_override: Option<usize>, uav_force: BTreeSet<u32>) -> Result<Translated, String> {
+fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_override: Option<usize>, uav_force: BTreeSet<u32>, user_data: bool) -> Result<Translated, String> {
     let (profile, is_ps) = match ex.stage {
         Stage::Vertex => ("vs_5_0", false),
         Stage::Pixel => ("ps_5_0", true),
@@ -1099,6 +1114,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         uses_global: false,
         mode_use: mode::ModeUse::default(),
         out_interp: out_interp.clone(),
+        user_data,
     };
     em.vreg_array = em.insns.iter().any(|i| i.mnemonic.starts_with("v_movrel"));
     em.mode_use = mode::analyze(&em.insns);
@@ -1120,7 +1136,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
     if !clash.is_empty() {
         let mut force = em.uav_force.clone();
         force.extend(clash);
-        return translate_with(ex, out_interp, user_base_override, force);
+        return translate_with(ex, out_interp, user_base_override, force, user_data);
     }
     if is_ps {
         em.find_export_epilogs();
@@ -1162,7 +1178,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         (_, Some("ms")) => "ms_6_8",
         _ => profile,
     };
-    Ok(Translated { hlsl, entry: "main", profile, mip_uavs: em.uav_mips.iter().copied().collect(), mip_srvs: em.tex_mips.iter().copied().collect(), needs_gmem: em.uses_bvh, needs_global: em.uses_global })
+    Ok(Translated { hlsl, entry: "main", profile, mip_uavs: em.uav_mips.iter().copied().collect(), mip_srvs: em.tex_mips.iter().copied().collect(), needs_gmem: em.uses_bvh, needs_global: em.uses_global, user_data_base: em.ud_active().then(|| em.user_base()) })
 }
 
 impl<'a> Emitter<'a> {
@@ -1590,6 +1606,25 @@ impl<'a> Emitter<'a> {
         fn follows(mn: &str) -> bool {
             ["v_mov_b32", "v_and_b32", "v_or_b32", "v_xor_b32", "v_cndmask_b32", "v_not_b32"].iter().any(|p| mn.starts_with(p))
         }
+        fn half_move(u: &Insn) -> bool {
+            let m = u.mnemonic.strip_suffix("_e64").unwrap_or(&u.mnemonic);
+            match m {
+                "v_mov_b32" | "v_cndmask_b32" | "v_or3_b32" | "v_and_or_b32" | "v_perm_b32"
+                | "v_alignbit_b32" | "v_alignbyte_b32" | "v_bfi_b32" => true,
+                "v_lshl_or_b32" => matches!(u.src.get(1), Some(Opnd::ConstInt(16))),
+                "v_or_b32" => u.src.iter().all(|o| matches!(o, Opnd::Vgpr(_))),
+                "v_and_b32" => u.src.iter().any(|o| matches!(o, Opnd::Literal(0xffff | 0xffff_0000))),
+                "v_lshrrev_b32" | "v_lshlrev_b32" => matches!(u.src.first(), Some(Opnd::ConstInt(16))),
+                _ => false,
+            }
+        }
+        fn result_class(mn: &str, d16: bool) -> Option<u8> {
+            match mn.strip_prefix("v_cvt_") {
+                Some(rest) if d16 && (rest.starts_with("pkrtz_") || rest.starts_with("pknorm_")) => Some(0),
+                Some(rest) => Some(if rest.starts_with('f') { 0 } else if rest.contains("i32") || rest.contains("i16") { 2 } else { 1 }),
+                None => class(mn),
+            }
+        }
         // Keys are (is image, is_uav, slot): typed buffers and textures are told apart.
         let mut votes: BTreeMap<(bool, bool, u32), [u32; 3]> = BTreeMap::new();
         // (stored-to resource, loaded-from resource): a store of registers loaded from another
@@ -1637,6 +1672,7 @@ impl<'a> Emitter<'a> {
             }
             let Some((key, regs, is_load, is_store)) = typed(self, i) else { continue };
             let v = votes.entry(key).or_insert([0; 3]);
+            let d16 = mimg_d16::mimg_d16(&self.insns[i]) || self.insns[i].mnemonic.contains("_d16_");
             if is_load {
                 // Forward: how are the loaded registers (and plain copies / masks of them) used?
                 let mut live = regs;
@@ -1657,6 +1693,7 @@ impl<'a> Emitter<'a> {
                         v[0] += 1;
                     } else if mem_index && !(u.mnemonic.contains("store") && matches!(u.enc, Enc::Mubuf)) {
                         v[1] += 1;
+                    } else if uses && d16 && half_move(u) {
                     } else if uses && !self.epilog_pack.contains_key(&j) {
                         // (The export tail packs whatever type the output has: no evidence.)
                         if let Some(c) = class(&u.mnemonic) {
@@ -1665,7 +1702,7 @@ impl<'a> Emitter<'a> {
                             v[1] += 1;
                         }
                     }
-                    let carry = uses && follows(&u.mnemonic);
+                    let carry = uses && (follows(&u.mnemonic) || (d16 && half_move(u)));
                     for d in &u.dst {
                         if let Opnd::Vgpr(r) = d {
                             if carry {
@@ -1677,21 +1714,26 @@ impl<'a> Emitter<'a> {
                     }
                 }
             } else if is_store {
-                // Backward: what produced each stored register?
-                for r in regs {
-                    for j in (0..i).rev() {
+                let mut work: Vec<(u8, usize, u32)> = regs.into_iter().map(|r| (r, i, 0)).collect();
+                while let Some((r, before, depth)) = work.pop() {
+                    for j in (0..before).rev() {
                         let d = &self.insns[j];
                         if d.dst.iter().any(|o| matches!(o, Opnd::Vgpr(x) if *x == r)) {
                             if let Some((k2, _, true, _)) = typed(self, j) {
                                 links.push((key, k2));
                                 break;
                             }
-                            // A conversion's result type is its first type token.
-                            let c = match d.mnemonic.strip_prefix("v_cvt_") {
-                                Some(rest) => Some(if rest.starts_with('f') { 0 } else if rest.contains("i32") || rest.contains("i16") { 2 } else { 1 }),
-                                None => class(&d.mnemonic),
-                            };
-                            if let Some(c) = c {
+                            if d16 && half_move(d) {
+                                if depth < 4 {
+                                    for o in &d.src {
+                                        if let Opnd::Vgpr(x) = o {
+                                            work.push((*x, j, depth + 1));
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            if let Some(c) = result_class(&d.mnemonic, d16) {
                                 v[c as usize] += 1;
                             }
                             break;
@@ -2319,6 +2361,16 @@ impl<'a> Emitter<'a> {
                         live.insert((if matches!(o, Opnd::Vgpr(_)) { 1 } else { 0 }, *n as u32));
                     }
                 }
+            }
+            if ins.mnemonic.starts_with("image_store") {
+                if let Some(Opnd::Vgpr(base)) = ins.dst.first() {
+                    for reg in u32::from(*base)..u32::from(*base) + mimg_data_regs(ins) {
+                        if !written.contains(&format!("v{reg}")) {
+                            live.insert((1, reg));
+                        }
+                    }
+                }
+                continue;
             }
             // Multi-register destinations: SMEM loads, MIMG results, 64-bit scalar ops.
             let extra = match ins.enc {
@@ -3803,23 +3855,23 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            Enc::Ds if self.is_cs && matches!(m, "ds_write_b16" | "ds_write_b8" | "ds_read_u16" | "ds_read_i16" | "ds_read_u8" | "ds_read_i8") => {
+            Enc::Ds if self.is_cs && matches!(m, "ds_write_b16" | "ds_write_b16_d16_hi" | "ds_write_b8" | "ds_read_u16" | "ds_read_i16" | "ds_read_u8" | "ds_read_i8") => {
                 // Sub-word accesses to group-shared memory: tb_lds is addressed in dwords, so
                 // read-modify-write the containing dword.
                 self.uses_lds = true;
                 let rd = m.starts_with("ds_read");
                 self.lds_order(!rd, rd);
                 let off = ins.aux.imm as u32 & 0xffff;
-                let bits =if m.ends_with("16") { 16u32 } else { 8 };
+                let bits = if m.contains("16") { 16u32 } else { 8 };
                 let mask = (1u32 << bits) - 1;
                 let t = self.tmp;
                 self.tmp += 1;
                 self.line(&format!("uint t{t}a = ({}) + {off:#x}u; uint t{t}s = (t{t}a & 3u) * 8u;", r(&s[0])?));
                 let word = format!("tb_lds[(t{t}a >> 2) & 8191u]");
                 if m.starts_with("ds_write") {
+                    let data = if m == "ds_write_b16_d16_hi" { format!("(({}) >> 16u)", r(&s[1])?) } else { r(&s[1])? };
                     self.line(&format!(
-                        "if (exec_lo & 1u) {{ uint t{t}o = {word}; [allow_uav_condition] for (uint t{t}i = 0u; t{t}i < 4096u; t{t}i++) {{ uint t{t}p; InterlockedCompareExchange({word}, t{t}o, (t{t}o & ~({mask:#x}u << t{t}s)) | ((({}) & {mask:#x}u) << t{t}s), t{t}p); if (t{t}p == t{t}o) break; t{t}o = t{t}p; }} }}",
-                        r(&s[1])?
+                        "if (exec_lo & 1u) {{ uint t{t}o = {word}; [allow_uav_condition] for (uint t{t}i = 0u; t{t}i < 4096u; t{t}i++) {{ uint t{t}p; InterlockedCompareExchange({word}, t{t}o, (t{t}o & ~({mask:#x}u << t{t}s)) | (({data} & {mask:#x}u) << t{t}s), t{t}p); if (t{t}p == t{t}o) break; t{t}o = t{t}p; }} }}"
                     ));
                     return Ok(());
                 }
@@ -5060,6 +5112,12 @@ impl<'a> Emitter<'a> {
     /// immediate the byte offset inside the element. Dynamic offsets (OFFEN / SOFFSET
     /// register) are not handled yet and fail explicitly.
     fn emit_mubuf(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
+        if (ins.raw.first().copied().unwrap_or(0) >> 16) & 1 != 0 {
+            return Err("MUBUF LDS (load to LDS) unsupported".into());
+        }
+        if (ins.raw.get(1).copied().unwrap_or(0) >> 23) & 1 != 0 {
+            return Err("MUBUF TFE status return unsupported".into());
+        }
         if let Some(Res::CbDyn(slot)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
             let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
             if (idxen && offen) || !matches!(ins.src[2], Opnd::ConstInt(0)) || !ins.mnemonic.starts_with("buffer_load_dword") {
@@ -5553,6 +5611,9 @@ impl<'a> Emitter<'a> {
             return self.emit_bvh(ins);
         }
         let w0 = ins.raw.first().copied().unwrap_or(0);
+        let w1 = ins.raw.get(1).copied().unwrap_or(0);
+        let unorm = (w0 >> 12) & 1 != 0;
+        let a16 = (w1 >> 30) & 1 != 0;
         for (bit, name) in [(15, "R128"), (16, "TFE"), (17, "LWE")] {
             if (w0 >> bit) & 1 != 0 {
                 return Err(format!("{} with {name} set at {:#x} is not translated", ins.mnemonic, ins.offset));
@@ -5567,7 +5628,7 @@ impl<'a> Emitter<'a> {
             };
             let mip = ins.src[0];
             self.touch(&mip);
-            let mip = r(&mip)?;
+            let mip = if a16 { format!("({} & 0xffffu)", r(&mip)?) } else { r(&mip)? };
             let obj = if is_uav { format!("uav{slot}") } else { format!("tex{slot}") };
             let t = self.tmp;
             self.tmp += 1;
@@ -5621,11 +5682,21 @@ impl<'a> Emitter<'a> {
                 Opnd::Vgpr(n) => n,
                 _ => return Err("bad vaddr".into()),
             };
+            let addr_reg = |i: usize| -> Opnd { if nsa > 0 { ins.src[i] } else { Opnd::Vgpr(first + i as u8) } };
+            let addr_i = |em: &mut Self, i: usize| -> Result<String, String> {
+                if a16 {
+                    let o = addr_reg(i / 2);
+                    em.touch(&o);
+                    Ok(format!("(({} >> {}u) & 0xffffu)", r(&o)?, 16 * (i % 2)))
+                } else {
+                    let o = addr_reg(i);
+                    em.touch(&o);
+                    r(&o)
+                }
+            };
             let mut c = vec![];
             for i in 0..ncoord {
-                let o = if nsa > 0 { ins.src[i] } else { Opnd::Vgpr(first + i as u8) };
-                self.touch(&o);
-                c.push(r(&o)?);
+                c.push(addr_i(self, i)?);
             }
             let vd = match ins.dst[0] {
                 Opnd::Vgpr(n) => n,
@@ -5633,16 +5704,23 @@ impl<'a> Emitter<'a> {
             };
             let as_uint = is_uav && self.uav_uint.contains(&slot);
             let uobj = if is_uav && with_mip {
-                let o = if nsa > 0 { ins.src[ncoord] } else { Opnd::Vgpr(first + ncoord as u8) };
                 if slot & BINDLESS != 0 {
                     return Err(format!("{} on a bindless UAV: per-mip views need a heap-mirrored descriptor range", ins.mnemonic));
                 }
-                self.touch(&o);
+                let mip_u = addr_i(self, ncoord)?;
                 self.uav_mips.insert(slot);
-                format!("uav{slot}_m[NonUniformResourceIndex(min({}, 15u))]", r(&o)?)
+                format!("uav{slot}_m[NonUniformResourceIndex(min({mip_u}, 15u))]")
             } else {
                 format!("uav{slot}")
             };
+            let d16_bit = ins.raw.get(1).is_some_and(|w| (w >> 31) & 1 != 0);
+            if d16_bit && ins.mnemonic.starts_with("image_atomic_") {
+                return Err("D16 image atomic unsupported (16-bit atomic data is not specified)".into());
+            }
+            let uint_zero = store && as_uint && ins.aux.mask == 1 && self.const_vgpr(idx, vd) == Some(0);
+            if d16_bit && !uint_zero && as_uint {
+                return Err("D16 access to an image also used with image atomics unsupported (texel signedness unknown)".into());
+            }
             if let Some(op) = ins.mnemonic.strip_prefix("image_atomic_") {
                 if !as_uint {
                     return Err("image atomic on a non-UAV table".into());
@@ -5694,9 +5772,7 @@ impl<'a> Emitter<'a> {
                 self.tmp += 1;
                 // image_load_mip carries the mip level as one more address component.
                 let mip = if with_mip {
-                    let o = if nsa > 0 { ins.src[ncoord] } else { Opnd::Vgpr(first + ncoord as u8) };
-                    self.touch(&o);
-                    format!("(int){}", r(&o)?)
+                    format!("(int){}", addr_i(self, ncoord)?)
                 } else {
                     "0".to_string()
                 };
@@ -5704,9 +5780,8 @@ impl<'a> Emitter<'a> {
                     if is_uav {
                         return Err("multisampled UAV load unsupported".into());
                     }
-                    let o = if nsa > 0 { ins.src[ncoord] } else { Opnd::Vgpr(first + ncoord as u8) };
-                    self.touch(&o);
-                    format!("tex{slot}.Load(int2({}), (int){})", c.iter().map(|x| format!("(int){x}")).collect::<Vec<_>>().join(", "), r(&o)?)
+                    let sample = addr_i(self, ncoord)?;
+                    format!("tex{slot}.Load(int2({}), (int){sample})", c.iter().map(|x| format!("(int){x}")).collect::<Vec<_>>().join(", "))
                 } else if is_uav {
                     format!("{uobj}[uint{ncoord}({})]", c.join(", "))
                 } else {
@@ -5764,9 +5839,30 @@ impl<'a> Emitter<'a> {
             };
             let mut c = vec![];
             for i in 0..nc {
-                let o = if nsa > 0 { ins.src[i] } else { Opnd::Vgpr(first + i as u8) };
+                let o = if nsa > 0 {
+                    ins.src[if a16 { i / 2 } else { i }]
+                } else {
+                    Opnd::Vgpr(first + (if a16 { i / 2 } else { i }) as u8)
+                };
                 self.touch(&o);
-                c.push(f(&o)?);
+                c.push(if a16 { format!("f16tof32({} >> {}u)", r(&o)?, 16 * (i % 2)) } else { f(&o)? });
+            }
+            if unorm {
+                let (outs, n) = match dim {
+                    0 => ("w, l", 1),
+                    4 => ("w, e, l", 1),
+                    1 => ("w, h, l", 2),
+                    5 => ("w, h, e, l", 2),
+                    2 => ("w, h, d, l", 3),
+                    _ => return Err("unnormalised coordinates on a cube image unsupported".into()),
+                };
+                let td = self.tmp;
+                self.tmp += 1;
+                let decl: Vec<String> = outs.split(", ").map(|v| format!("{v}{td}")).collect();
+                self.line(&format!("uint {}; tex{tslot}.GetDimensions(0u, {});", decl.join(", "), decl.join(", ")));
+                for (k, sz) in ["w", "h", "d"].iter().take(n).enumerate() {
+                    c[k] = format!("({} / (float){sz}{td})", c[k]);
+                }
             }
             let cv = if dim == 3 { format!("tb_cube_dir({})", c.join(", ")) } else if nc == 1 { c[0].clone() } else { format!("float{nc}({})", c.join(", ")) };
             let vd = match ins.dst[0] {
@@ -5841,9 +5937,14 @@ impl<'a> Emitter<'a> {
         } else {
             None
         };
-        let bias = if matches!(modi, 5 | 6) { Some(f(&take(self))?) } else { None };
+        let bias = if matches!(modi, 5 | 6) {
+            let o = take(self);
+            Some(if a16 { format!("f16tof32({})", r(&o)?) } else { f(&o)? })
+        } else {
+            None
+        };
         let zref = if cmp { Some(f(&take(self))?) } else { None };
-        let grads = if matches!(modi, 2 | 3) {
+        let mut grads = if matches!(modi, 2 | 3) {
             let mut dx = vec![];
             for _ in 0..nder {
                 dx.push(f(&take(self))?);
@@ -5852,17 +5953,58 @@ impl<'a> Emitter<'a> {
             for _ in 0..nder {
                 dy.push(f(&take(self))?);
             }
-            let v = |c: &Vec<String>| if c.len() == 1 { c[0].clone() } else { format!("float{}({})", c.len(), c.join(", ")) };
-            Some((v(&dx), v(&dy)))
+            Some((dx, dy))
         } else {
             None
         };
+        let base = next;
+        let mut half = 0usize;
+        let mut takef = |em: &mut Self| -> Result<String, String> {
+            let k = half;
+            half += 1;
+            if a16 {
+                let o = addr(base + k / 2);
+                em.touch(&o);
+                Ok(format!("f16tof32({} >> {}u)", r(&o)?, 16 * (k % 2)))
+            } else {
+                let o = addr(base + k);
+                em.touch(&o);
+                f(&o)
+            }
+        };
         let mut coords = vec![];
         for _ in 0..ncoord {
-            coords.push(f(&take(self))?);
+            coords.push(takef(self)?);
         }
-        let lod = if modi == 4 { Some(f(&take(self))?) } else { None };
-        let clamp = if matches!(modi, 1 | 3 | 6) { Some(f(&take(self))?) } else { None };
+        let lod = if modi == 4 { Some(takef(self)?) } else { None };
+        let clamp = if matches!(modi, 1 | 3 | 6) { Some(takef(self)?) } else { None };
+        if unorm {
+            let (outs, n) = match dim {
+                0 => ("w, l", 1),
+                4 => ("w, e, l", 1),
+                1 => ("w, h, l", 2),
+                5 => ("w, h, e, l", 2),
+                2 => ("w, h, d, l", 3),
+                _ => return Err("unnormalised coordinates on a cube image unsupported".into()),
+            };
+            let td = self.tmp;
+            self.tmp += 1;
+            let decl: Vec<String> = outs.split(", ").map(|v| format!("{v}{td}")).collect();
+            self.line(&format!("uint {}; tex{tslot}.GetDimensions(0u, {});", decl.join(", "), decl.join(", ")));
+            for (k, sz) in ["w", "h", "d"].iter().take(n).enumerate() {
+                coords[k] = format!("({} / (float){sz}{td})", coords[k]);
+                if let Some((dx, dy)) = &mut grads {
+                    if k < dx.len() {
+                        dx[k] = format!("({} / (float){sz}{td})", dx[k]);
+                        dy[k] = format!("({} / (float){sz}{td})", dy[k]);
+                    }
+                }
+            }
+        }
+        let grads = grads.map(|(dx, dy)| {
+            let v = |c: &Vec<String>| if c.len() == 1 { c[0].clone() } else { format!("float{}({})", c.len(), c.join(", ")) };
+            (v(&dx), v(&dy))
+        });
         // Cube images are addressed by hardware (s, t, face) coordinates (see tb_cube_dir).
         let cvec = if dim == 3 {
             format!("tb_cube_dir({})", coords.join(", "))
@@ -6394,6 +6536,9 @@ impl<'a> Emitter<'a> {
         if let Some(x) = self.rm_header() {
             let _ = write!(h, "{x}");
         }
+        if let Some(x) = self.ud_header() {
+            h.push_str(&x);
+        }
         if let Some(x) = centroid::header(ex) {
             h.push_str(&x);
         }
@@ -6425,6 +6570,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                 self.regs.insert(format!("s{}", g + k));
             }
             let _ = writeln!(h, "{}", self.reg_decls());
+            h.push_str(&self.ud_init());
             let _ = writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;");
             let _ = writeln!(h, "    s{} = gid.x; s{} = gid.y; s{} = gid.z;", g, g + 1, g + 2);
             h.push_str(&dg_init);
@@ -6495,7 +6641,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         // elements is read (read mask 0 in the input signature) gets no group: in the skinned
         // depth-only shader d15c18830a4616f9 ATTRIBUTE1/2 (tangents) are unread and the bone
         // indices of ATTRIBUTE3 arrive in v8..v11, not v16..v19.
-        let mut init = String::new();
+        let mut init = self.ud_init();
         if self.is_gs {
             // GS entry ABI (from WriteToSliceMainGS): s3 carries the wave's primitive count in
             // bits [15:8]; v0/v1 hold the vertex offsets (v0 = offset0 | offset1 << 16, v1 =

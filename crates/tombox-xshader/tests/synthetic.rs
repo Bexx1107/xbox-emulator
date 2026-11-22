@@ -588,3 +588,100 @@ fn one_wave_compute_separates_consecutive_lds_writes() {
     let unknown = compute_with(&consecutive_lds(), [0; 4]);
     assert_eq!(barriers_between_first_lds(&unknown), 0, "{unknown}");
 }
+
+#[test]
+fn d16_texel_type_looks_through_half_packing() {
+    let root = || Some(RootSig {
+        version: 2,
+        flags: 1,
+        params: vec![table(0, 64, 5), table(1, 8, 5)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    });
+    let cs = |words: &[u32]| {
+        let mut ex = shader(Stage::Compute, words, vec![], vec![], root());
+        ex.isa_preamble = [0, 64, 1, 1];
+        (ex.has_input_sig, ex.has_output_sig) = (false, false);
+        ex
+    };
+    let root2 = || Some(RootSig {
+        version: 2,
+        flags: 1,
+        params: vec![table(0, 64, 5), table(3, 16, 5), table(1, 8, 5)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    });
+    let cs2 = |words: &[u32]| {
+        let mut ex = shader(Stage::Compute, words, vec![], vec![], root2());
+        ex.isa_preamble = [0, 64, 1, 1];
+        (ex.has_input_sig, ex.has_output_sig) = (false, false);
+        ex
+    };
+    let _ = cs;
+    const S_WAITCNT_0: u32 = 0xbf8c_0000;
+    let uav = [0xf40c_0503, 0xfa00_0000, S_WAITCNT_0];
+    let srv = [0xf40c_0202, 0xfa00_0000, S_WAITCNT_0];
+    let store = [0xf020_1f08, 0x8005_0800];
+    let load = [0xf000_1f08, 0x8002_0400];
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0x7e14_1508,
+        0x7e16_1509,
+        0x3614_14ff, 0x0000_ffff,
+        0xd76f_0008, 0x0429_210b,
+        0x7e12_0308,
+    ]);
+    w.extend(store);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("f16 packed store").hlsl;
+    assert!(h.contains("RWTexture2D<float4> uav0"), "{h}");
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0x2814_1508,
+        0x3614_14ff, 0x0000_ffff,
+        0xd76f_0008, 0x0429_2109,
+        0x7e12_0308,
+    ]);
+    w.extend(store);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("uint packed store").hlsl;
+    assert!(h.contains("RWTexture2D<uint4> uav0"), "{h}");
+    assert!(h.contains("& 0xffffu)") && h.contains(">> 16u)"), "{h}");
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0x2414_1508,
+        0x3614_14ff, 0x0000_ffff,
+        0xd76f_0008, 0x0429_2109,
+        0x7e12_0308,
+    ]);
+    w.extend(store);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("sint packed store").hlsl;
+    assert!(h.contains("RWTexture2D<int4> uav0"), "{h}");
+    assert!(h.contains("asint(v8 << 16u) >> 16") && h.contains("asint(v8) >> 16"), "{h}");
+
+    let mut w = srv.to_vec();
+    w.extend(load);
+    w.extend([
+        0x2c10_0890,
+        0x7e10_1708,
+    ]);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("f16 packed load").hlsl;
+    assert!(h.contains("Texture2D<float4> tex0"), "{h}");
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0xf044_1108, 0x0005_0400,
+        0xf000_1108, 0x8005_0400,
+        S_ENDPGM,
+    ]);
+    let err = match translate(&cs2(&w)) {
+        Ok(t) => panic!("expected refusal, got:\n{}", t.hlsl),
+        Err(e) => e,
+    };
+    assert!(err.contains("atomic"), "{err}");
+}
