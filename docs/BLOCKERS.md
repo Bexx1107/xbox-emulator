@@ -1238,3 +1238,7 @@ Headless runs straight into each title's test scene, on the staged release of 11
 - OPEN: no controller connect or disconnect reaches XUserDeviceAssociationChanged yet. The event fires only through the runtime's own call, because the gamepad layer does not report pad-to-user association. XUserFindControllerForUserWithUiAsync returns an all-zero device id for the same reason.
 - OPEN: a signed-out user still gets tokens. XUserGetTokenAndSignatureAsync does not fail for a user in the SignedOut state, and it ignores the extra headers and the force-refresh option.
 - OPEN, low: XGameSaveInitializeProvider ignores syncOnDemand (no cloud sync offline). XPackageCloseMountHandle does nothing. The XPackage monitor and progress calls ignore their queue argument. XUserCheckPrivilege ignores its options.
+
+## rectlist expansion for stream-built PSOs (d3d12_xs) - 2026-11-23, steward from #280
+- OPEN: draws with IA topology RECTLIST (17) on a PSO built from a pipeline state stream are not expanded. rectlist.rs finds no recorded PC description for those PSOs and refuses them, so each rect draws only its first triangle. #280 fixes the PSO side (console topology type 0x13 becomes TRIANGLE in non-mesh streams). The draw side still needs a PC description recorded for stream-built PSOs so the existing expansion can run.
+- Done when: a WARP test draws a rect list through a stream-built PSO and checks that every pixel of the full rect is covered.
