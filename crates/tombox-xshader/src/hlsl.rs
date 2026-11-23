@@ -6039,6 +6039,11 @@ impl<'a> Emitter<'a> {
                 _ => return Err(format!("image dim {dim} unsupported for get_resinfo")),
             };
             self.line(&call);
+            if !is_uav && dim != 6 {
+                let q = call.replace(&format!("t{t}"), &format!("t{t}q")).replacen(&format!("({mip}, "), "(0u, ", 1);
+                self.line(&format!("uint t{t}qx = 0u, t{t}qy = 0u, t{t}qz = 0u, t{t}qw = 1u; {q}"));
+                self.line(&format!("if ({mip} >= t{t}qw) {{ t{t}x = 0u; t{t}y = 0u; t{t}z = 0u; t{t}w = t{t}qw; }}"));
+            }
             let vd = match ins.dst[0] {
                 Opnd::Vgpr(n) => n,
                 _ => return Err("bad vdata".into()),

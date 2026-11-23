@@ -328,6 +328,12 @@ fn image_mimg_query() {
         pre.vv(1, mip);
         cs.push(case("image_get_resinfo", op, build(&pre, &op, 4, 4, false), Env { tex: Some(&IMG_C), ..Default::default() }, vec![8 >> mip, 8 >> mip, 3, 2]));
     }
+    for &(img, dim, mip, levels) in &[(&IMG_B, 1u32, 3u32, 3u32), (&IMG_B, 1, 9, 3), (&IMG_C, 5, 2, 2), (&IMG_C, 5, 0x7fff_ffff, 2)] {
+        let op = mimg(0x0e, 0xf, dim, 1, 4, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(1, mip);
+        cs.push(case("image_get_resinfo", op, build(&pre, &op, 4, 4, false), Env { tex: Some(img), ..Default::default() }, vec![0, 0, 0, levels]));
+    }
     for &(k, lod) in &[(0.125f32, 0.0f32), (0.25, 1.0), (0.5, 2.0), (0.0625, -1.0), (2.0, 4.0)] {
         for &dmask in &[0x3u32, 0x2] {
             let op = mimg(0x60, dmask, 1, 6, 4, 0, 12);
