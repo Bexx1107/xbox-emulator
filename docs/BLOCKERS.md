@@ -338,6 +338,10 @@ elease`, the log shows one install and every interface is emulated.
   - Big Trackmania PS (4-8k HLSL lines) still take 1.6-3 s in DXC and 0.4-1.9 s in the driver; the pack removes only the DXC part on later runs.
   - Driver PSO compile is not cached by us (no ID3D12PipelineLibrary).
 
+- OPEN 2026-11-23 Trackmania black in-race video boards (gfx-debug): the board video IS decoded and converted. In r32f_10 (t:70, POLL=1), exec 1 pass 1 runs PS a946cde5f859340b, the YCbCr-to-RGB pass: three planar samples, a 3x3 matrix plus offset, alpha 1. It writes real content into RT 0x1ebaf96c0 2048x512 BGRA with 12 mips (mips built by 5 dispatches). Pass 2 (PS 1e470526c9dee708) writes a real chevron sign into RT 0x125da87d0 1024x256 R8 with 11 mips. The boards are therefore black downstream of the conversion. Still unknown: whether the board draws (candidates 452ecf78, 1b79e3f6, 3f252393, 377098fd, c3935380, d97e962c) sample these RTs. r32g_13_board_bind resolves their table slots.
+- FIXED 2026-11-23 passcap/bindtrace: table slots showed "0 of 0 recorded descriptors" because the real-device descriptor hooks (vtable slots 17-24) were installed only under rtcap. They are now also installed when TOMBOX_PASSCAP and TOMBOX_PASSCAP_PS are set. Slot 16 (CreateRootSignature) stays rtcap-only.
+- OPEN 2026-11-23 Trackmania spring01 garbage loop count: ba37366c's b1 (cb1[21].w) is still unread. It did not draw in the t=60 frames of r32f_7 (WW on) or r32f_12 (WW=0). r32g captures it on a burst frame with tools\dev\passcap_on_burst.ps1. Every root CBV probed so far is backed by the title's own PC upload heap. The cbv_raw ring copy matches the CPU bytes at ExecuteCommandLists dword for dword, so no CB mirror is stale. upload.rs mirrors only Texture2D; a buffer placed as a committed stand-in would never be refreshed (passcap prints the backing class).
+
 ## XDefiant rendering and startup (parked 2026-11-21)
 - **Current state:** runs about 140 s at 60 fps. All graphics PSOs build, and command lists close cleanly after the aliasing-barrier fixes (`xone_barrier.rs`, `placed::is_committed_placement`). The presented frame is still all black. Captures at frames 1800 and 6900 show only compute dispatches and one ExecuteIndirect draw into a 960x540 target, and every target reads zero.
 - **Aliased-VA render targets:**
@@ -1457,7 +1461,7 @@ Headless runs straight into each title's test scene, on the staged release of 11
   - The translator has the TbGlobal window ABI (global_abi.rs), but d3d12_xs has no GPU-VA-to-resource map to fill it (global_bind.rs refuses at bind).
 - OPEN, Durango GS ring tables (361d3c31 af7bff52 b206955f): the GS reads its ring descriptors from the internal table at s[0:1] (+0xb0/+0xc0), not from root memory. Not modelled. Also 4 hull + 4 domain shaders (stage not supported), and 82347f98 (GS mubuf in a table of kind None).
 - OPEN, smaller: 15ae33bc 18f7efba (ds_permute in a CS whose LDS already fills the 32 KiB mirror), 5fd233cf (PS attr2 has no signature register), aaa2b3dc (sample_c_cl: SM5 has no depth-compare sample with LOD clamp), f904e69c e20ebc3c (root-memory over-read into SGPRs that are later read).
-- OPEN, verify: the D3D12 debug layer has never enabled in a run. System32 has no d3d12SDKLayers.dll; the Agility 1.620 copy under third_party\agility-sdk\build\native\bin\x64 should load via TOMBOX_AGILITY_PATH + TOMBOX_AGILITY_VERSION=620 + TOMBOX_D3D12_DEBUG=1 (agility.rs SDKConfiguration / CreateDeviceFactory). Probe run pending.
+- OPEN, verify: the D3D12 debug layer has never enabled in a run. System32 has no d3d12SDKLayers.dll; the Agility 1.620 copy under third_party\agility-sdk\build\native\bin\x64 should load via TOMBOX_AGILITY_PATH + TOMBOX_AGILITY_VERSION=620 + TOMBOX_D3D12_DEBUG=1 (agility.rs SDKConfiguration / CreateDeviceFactory). Probe run r32f_9 (2026-11-23): env reached the emulator; SetSDKVersion(620) hr=0x887a0001, CreateDeviceFactory(620) hr=0x00000000, D3D12GetDebugInterface hr=0x887a002d, factory GetConfigurationInterface(D3D12Debug) hr=0x887a002d, device created with debugLayer=false. d3d12SDKLayers.dll is present in that Agility dir, so this matches the Developer Mode / Graphics Tools gap above; enabling needs a user system-settings change.
 
 ## Async PSO failure after S_OK (d3d12_xs pso_async) - 2026-11-22
 
@@ -1471,3 +1475,25 @@ Headless runs straight into each title's test scene, on the staged release of 11
 
 ## Flaky test: d3d12_xs alias::tests::title_heap_does_not_block_unmap_or_free - 2026-11-23
 - OPEN, FLAKY: fails about 1 run in 4 (seen 1 of 4 on a2a4751). The failure is in the VirtualFree that follows the flush: the free sometimes runs before the flush has released the title-heap view. No active owner: the test arrived with the 2026-11-21 source move (410e01f), and no PR introduced it. The fix should wait for the flush to complete instead of relying on timing. It must not be skipped or retried.
+
+## CPU writes into title GPU memory: write-watch limits (d3d12_xs upload.rs / cpu_watch.rs, xmem) - 2026-11-22
+
+- On Xbox the CPU and GPU share memory, so a CPU write into a placed texture is visible to the GPU straight away. On PC each placed texture is a committed copy that upload.rs refills. Event mode (the default) only re-uploaded after a TomboxNoteTitleMemory note. In Trackmania the note link from xmem was dead: the 65536-miss cap latched "absent" before d3d12_xs.dll loaded. The libvpx video planes (memtype 3, fmt 61, layout 264) therefore stayed zero: notes=0, still-zero=198 subresources (24 MB), zero->data=0.
+- What the emulator now does:
+  - xmem reserves its own GPU-visible memory with MEM_WRITE_WATCH: XMemAllocDefault, pool granules and XMemVirtualAlloc reservations. The patch was handed to the xmem owner. It also exports TomboxWriteWatchOwner.
+  - At each PresentX pump, upload.rs calls GetWriteWatch with WRITE_WATCH_FLAG_RESET on the emulator-owned ranges, and re-uploads only the dirty subresources. For linear and tiled layouts alike, an upload covers only the rows whose element offsets touch a dirty page.
+  - Every resource that keeps the hash path is logged once with the reason. Any CPU write that cannot be uploaded is counted (lost) and logged once per resource. TOMBOX_WRITE_WATCH=0 restores the old behaviour.
+- OPEN, cannot be watched:
+  - Memory the title reserved with MEM_WRITE_WATCH itself is title-owned. A RESET there would corrupt the title's XMemGetWriteWatch results, so such resources keep the hash or notes path.
+  - Physical-page or file-mapped views (xmem phys.rs MapViewOfFile3 placeholders) cannot carry write watch on Windows. Resources on them keep the hash/poll path (TOMBOX_UPLOAD_POLL=1).
+- DEFERRED: a guard-page (PAGE_GUARD / VEH) tracker for those views. It would fault on each first write per page per frame, and it conflicts with the title's own VEH and with the xmem range hooks. Not started.
+- OPEN, stage B: the dirty check runs only at PresentX. A CPU write followed by ExecuteCommandLists in the same frame is still seen one present late. The hook in present.rs exec_lists_x needs a re-entry guard (the pump's own ExecuteCommandLists goes through it), a cross-queue fence Wait and a list ring. Not done yet.
+
+## Title memory accounting gaps (xmem title_acct + d3d12_xs title_gpu) - 2026-11-22
+
+- XMemGetWorkingSetStatistics title_used is now virt + xmem + pool + phys + title heaps + title GPU, capped at the 13.5 GB title budget. The title's process-heap figure (XMemGetWin32HeapStatistics allocated + overhead, which Trackmania's 2304 MB map-load check reads) is counted from title allocations only. GPU memory is charged the way the console charges it: xgs12_10.dll takes committed resources and heaps through XMemVirtualAlloc at 64 KB granularity, so the title's CreateCommittedResource and CreateHeap are rounded to 64 KB and released through an ID3DDestructionNotifier callback. Switches: TOMBOX_XMEM_TITLE_ACCT=0 (off), TOMBOX_XMEM_TITLE_USED_OLD=1, TOMBOX_XMEM_ACCT_LOG=1. Not yet confirmed in a Trackmania run.
+- OPEN, not counted, so title_used reads low by these amounts:
+  - CreateCommittedResource1, CreateCommittedResource2 and CreateHeap1 are not wrapped by the title GPU charge. Only CreateCommittedResource (slot 27) and CreateHeap (slot 28) are.
+  - Pooled res_pool resources: a committed resource served from the emulator's resource pool is not charged to the title, although on console it would be a title allocation.
+  - Driver-internal allocations: the console driver's own XMemAlloc calls and GPU page tables count against the title on Xbox. On PC they live in the Windows driver and are not visible to xmem.
+- OPEN, smaller: patch_module still reads private images directly. That is the same free-while-reading race that iat::image_size had, which is fixed through ReadProcessMemory. A title VirtualFree that bypasses the xmem hook leaves a stale phys region.
