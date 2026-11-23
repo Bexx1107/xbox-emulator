@@ -2307,6 +2307,35 @@ fn scalar_mode_effects() {
     assert_eq!(run(&p.words()).unwrap()[0], 0x3c01);
 }
 
+#[test]
+fn f16_omod_follows_mode() {
+    let mut c = Cases::new();
+    let hw = |id: u32, off: u32, size: u32| (id | (off << 6) | ((size - 1) << 11)) as u16;
+    let flush16 = [sopk(0x15, 0, hw(1, 6, 2)), 0];
+    let om = |op: u32, a: u32, b: u32, omod: u32, clamp: bool| {
+        let mut w = vop3m(op, 12, [v(a), v(b), 0], 0, 0, 0, clamp);
+        w[1] |= omod << 27;
+        w
+    };
+    let ins = [(1, 0x3a00), (2, 0), (3, 0x8000), (4, 0x3e00), (5, 0x3c00)];
+    let cases: [(u32, u32, u32, u32, bool, u32, u32); 6] = [
+        (0x132, 1, 2, 2, false, 0x3a00, 0x4200),
+        (0x132, 1, 2, 3, false, 0x3a00, 0x3600),
+        (0x132, 3, 3, 1, false, 0x8000, 0x0000),
+        (0x132, 1, 2, 1, true, 0x3a00, 0x3c00),
+        (0x135, 4, 5, 1, false, 0x3e00, 0x4200),
+        (0x135, 4, 5, 3, true, 0x3c00, 0x3a00),
+    ];
+    for (op, a, b, omod, clamp, keep, flushed) in cases {
+        let w = om(op, a, b, omod, clamp);
+        vc(&mut c, if op == 0x132 { "v_add_f16" } else { "v_mul_f16" }, &ins, &w, &[12], &[keep]);
+        let mut p = flush16.to_vec();
+        p.extend_from_slice(&w);
+        vc(&mut c, "s_setreg_imm32_b32", &ins, &p, &[12], &[flushed]);
+    }
+    c.run_both("f16_omod_follows_mode");
+}
+
 #[path = "exec_mem/mod.rs"]
 mod exec_mem;
 
