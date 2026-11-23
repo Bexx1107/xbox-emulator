@@ -2336,6 +2336,49 @@ fn f16_omod_follows_mode() {
     c.run_both("f16_omod_follows_mode");
 }
 
+#[test]
+fn pk_int16_constants_and_clamp() {
+    let mut c = Cases::new();
+    let pk = |lo: u32, hi: u32| (lo & 0xffff) | (hi << 16);
+    let ins = [(1, pk(0x0100, 0x0200))];
+    let consts: [(u32, Option<u32>, u32, u32); 9] = [
+        (133, None, 0x0105, 0x0200),
+        (192, None, 0x0140, 0x0200),
+        (193, None, 0x00ff, 0x01ff),
+        (208, None, 0x00f0, 0x01ff),
+        (240, None, 0x0100, 0x4100),
+        (242, None, 0x0100, 0x4180),
+        (245, None, 0x0100, 0xc200),
+        (246, None, 0x0100, 0x4280),
+        (255, Some(0x8001_7fff), 0x80ff, 0x8201),
+    ];
+    for (src, lit, lo, hi) in consts {
+        let mut p = vop3p(0x0a, 10, [v(1), src, 0], 0, 0b011, 0, 0).to_vec();
+        if let Some(l) = lit {
+            p.push(l);
+        }
+        vc(&mut c, "v_pk_add_u16", &ins, &p, &[10], &[pk(lo, hi)]);
+    }
+    let mut p = vop3p(0x0a, 10, [v(1), 255, 0], 0b010, 0b011, 0, 0).to_vec();
+    p.push(0x1234_5678);
+    vc(&mut c, "v_pk_add_u16", &ins, &p, &[10], &[pk(0x1334, 0x1434)]);
+    let clamped: [(&str, u32, u32, u32, u32, u32); 6] = [
+        ("v_pk_add_u16", 0x0a, pk(0xfff0, 0x0001), pk(0x0020, 0x0002), 0, pk(0xffff, 0x0003)),
+        ("v_pk_sub_u16", 0x0b, pk(0x0010, 0x0005), pk(0x0020, 0x0003), 0, pk(0x0000, 0x0002)),
+        ("v_pk_add_i16", 0x02, pk(0x7ff0, 0x8010), pk(0x0020, 0xffe0), 0, pk(0x7fff, 0x8000)),
+        ("v_pk_sub_i16", 0x03, pk(0x8000, 0x7fff), pk(0x0001, 0xffff), 0, pk(0x8000, 0x7fff)),
+        ("v_pk_mad_u16", 0x09, pk(0x0100, 0x0002), pk(0x0100, 0x0003), pk(0x0000, 0x0001), pk(0xffff, 0x0007)),
+        ("v_pk_mad_i16", 0x00, pk(0x0100, 0xff00), pk(0x0100, 0x0100), 0, pk(0x7fff, 0x8000)),
+    ];
+    for (m, op, a, b, d, want) in clamped {
+        let mad = m.contains("mad");
+        let mut w = vop3p(op, 10, [v(1), v(2), if mad { v(3) } else { 0 }], 0, if mad { 0b111 } else { 0b011 }, 0, 0);
+        w[0] |= 1 << 15;
+        vc(&mut c, m, &[(1, a), (2, b), (3, d)], &w, &[10], &[want]);
+    }
+    c.run_both("pk_int16_constants_and_clamp");
+}
+
 #[path = "exec_mem/mod.rs"]
 mod exec_mem;
 
