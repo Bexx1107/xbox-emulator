@@ -446,3 +446,7 @@ mod tests {
         assert!(check_gs(&gs2, &wrong, &[]).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "rectlist_hw.rs"]
+mod hw;

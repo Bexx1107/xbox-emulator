@@ -144,7 +144,7 @@ fn ufloat(bits: u32, mant_bits: u32) -> f32 {
 }
 
 /// Decode one pixel to up to four floats. Returns (channels, is_float_or_depth, bytes/pixel).
-fn layout(fmt: u32) -> Option<(usize, bool, usize, &'static str)> {
+pub(crate) fn layout(fmt: u32) -> Option<(usize, bool, usize, &'static str)> {
     Some(match fmt {
         1..=2 => (4, true, 16, "rgba32f"),
         9..=10 => (4, true, 8, "rgba16f"),
@@ -168,7 +168,7 @@ fn layout(fmt: u32) -> Option<(usize, bool, usize, &'static str)> {
     })
 }
 
-fn decode(kind: &str, p: &[u8]) -> [f32; 4] {
+pub(crate) fn decode(kind: &str, p: &[u8]) -> [f32; 4] {
     let u16at = |o: usize| u16::from_le_bytes([p[o], p[o + 1]]);
     let u32at = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
     let f32at = |o: usize| f32::from_bits(u32at(o));
@@ -601,6 +601,12 @@ pub fn note_view(handle: usize, res: usize, rtv_increment: usize) {
             t.rtv_increment = rtv_increment;
         }
     });
+}
+pub fn view_of(handle: usize) -> Option<usize> {
+    with_trace(|t| t.views.get(&handle).copied())
+}
+pub fn rtv_increment() -> usize {
+    with_trace(|t| t.rtv_increment)
 }
 pub fn note_compute_pso(pso: usize, code: usize) {
     with_trace(|t| {

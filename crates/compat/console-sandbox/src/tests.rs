@@ -769,6 +769,11 @@ fn host_serves_audio_cursor_and_hdr_classes() {
         assert_ne!(created, 0, "the new object id sits at env+0x1c");
         let mut env = vec![0u8; AUDIO_ENVELOPE as usize];
         env[8..12].copy_from_slice(&0x64u32.to_le_bytes());
+        env[0xc..0x10].copy_from_slice(&created.to_le_bytes());
+        assert_eq!(call(a, AUDIO_ENVELOPE, env.as_mut_ptr()), S_OK);
+        assert_eq!(i32::from_le_bytes(env[4..8].try_into().unwrap()), E_INVALIDARG, "0x64 on an object that is not a 0x61 MediaManager is refused");
+        let mut env = vec![0u8; AUDIO_ENVELOPE as usize];
+        env[8..12].copy_from_slice(&0xfffu32.to_le_bytes());
         assert_eq!(call(a, AUDIO_ENVELOPE, env.as_mut_ptr()), S_OK);
         assert_eq!(i32::from_le_bytes(env[4..8].try_into().unwrap()), E_NOTIMPL, "ids with no decoded layout report E_NOTIMPL in the envelope");
         let mut env = vec![0u8; AUDIO_ENVELOPE as usize];

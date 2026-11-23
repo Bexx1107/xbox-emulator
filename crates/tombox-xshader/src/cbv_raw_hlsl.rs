@@ -36,6 +36,28 @@ fn ident(c: u8) -> bool {
 }
 
 fn parse_decl(line: &str) -> Option<(String, u32, u32)> {
+    decl_parts(line).map(|(n, r, sp, _)| (n, r, sp))
+}
+
+pub fn declared_sizes(h: &str) -> Vec<(u32, u32, u64)> {
+    h.lines().filter_map(decl_parts).map(|(_, r, sp, k)| (r, sp, k as u64 * 16)).collect()
+}
+
+#[cfg(test)]
+mod size_tests {
+    #[test]
+    fn declared_cbuffer_sizes_follow_the_register_and_space() {
+        let h = "cbuffer CB0 : register(b0) { uint4 cb0[4]; };
+cbuffer CB65537 : register(b1, space1) { uint4 cb65537[21]; };
+cbuffer TbGmem : register(b0, space4000001) { uint4 tb_gmem_base; };
+void f() {}
+";
+        assert_eq!(super::declared_sizes(h), vec![(0, 0, 64), (1, 1, 336)]);
+        assert!(super::declared_sizes("void f() {}").is_empty());
+    }
+}
+
+fn decl_parts(line: &str) -> Option<(String, u32, u32, u32)> {
     let t = line.trim();
     let rest = t.strip_prefix("cbuffer CB")?;
     let (n, rest) = rest.split_once(" : register(b")?;
@@ -47,10 +69,11 @@ fn parse_decl(line: &str) -> Option<(String, u32, u32)> {
     let inner = rest.trim().strip_prefix('{')?.trim().strip_prefix("uint4 cb")?;
     let (n2, tail) = inner.split_once('[')?;
     let (k, tail) = tail.split_once(']')?;
-    if n != n2 || n.parse::<u32>().is_err() || k.parse::<u32>().is_err() || tail.trim() != "; };" {
+    if n != n2 || n.parse::<u32>().is_err() || tail.trim() != "; };" {
         return None;
     }
-    Some((format!("cb{n}"), r, space))
+    let k = k.parse::<u32>().ok()?;
+    Some((format!("cb{n}"), r, space, k))
 }
 
 fn close_bracket(b: &[u8], open: usize) -> Option<usize> {
@@ -112,6 +135,9 @@ pub fn rewrite_hlsl(h: &str) -> Result<String, String> {
         if let Some((name, r, space)) = parse_decl(line) {
             body.push_str(&format!("ByteAddressBuffer tb_cbr{} : register(t{r}, space{});\n", &name[2..], map_space(space)?));
             names.push(name);
+        } else if line.trim_end() == crate::hlsl::CBFIT_CBUFFER {
+            body.push_str(crate::hlsl::CBFIT_RAW);
+            body.push('\n');
         } else if line.trim_start().starts_with("cbuffer CB") {
             return Err(format!("unrecognised constant buffer declaration: {}", line.trim()));
         } else {

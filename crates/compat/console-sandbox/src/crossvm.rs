@@ -101,6 +101,14 @@ pub const METHOD_DEFAULT_ENDPOINT: u32 = 0x80;
 pub const METHOD_ENDPOINT: u32 = 0x81;
 pub const METHOD_SESSION_ENUMERATOR: u32 = 0x77;
 pub const METHOD_ENUMERATED_SESSION: u32 = 0x78;
+pub const METHOD_MEDIA_MANAGER: u32 = 0x61;
+pub const METHOD_EXISTING_SESSION: u32 = 0x7b;
+pub const MEDIA_MANAGER_TYPE: u32 = 0x13;
+pub const EXISTING_SESSION_TYPE: u32 = 0x19;
+pub const EXISTING_SESSION_CHARS: usize = 0x200;
+pub const MEDIA_PLAY_TO_STREAM_STATE: u32 = 0x64;
+pub const MEDIA_CASTING_APP_STATE: u32 = 0x65;
+pub const MEDIA_VOIP_CALL_STATE: u32 = 0x66;
 pub const METHOD_ARGS: usize = 0x14;
 pub const METHOD_REPLY_COUNT: usize = 0x14;
 pub const BLOB_ID: usize = 0x1c;
@@ -263,11 +271,12 @@ struct Object {
     list_cursor: usize,
     pc_sessions: Vec<Arc<wasapi::PcSession>>,
     pc_session: Option<Arc<wasapi::PcSession>>,
+    media: Option<(wasapi::MediaManager, i64)>,
 }
 
 impl Object {
     fn new(kind: u32, parent: u32, device: Option<String>) -> Self {
-        Object { kind, parent, device, stream: None, volumes: None, properties: None, notify: false, notify_id: 0, watch: None, list_cursor: 0, pc_sessions: Vec::new(), pc_session: None }
+        Object { kind, parent, device, stream: None, volumes: None, properties: None, notify: false, notify_id: 0, watch: None, list_cursor: 0, pc_sessions: Vec::new(), pc_session: None, media: None }
     }
 }
 
@@ -507,11 +516,28 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
         CREATE_OBJECT => create_object(a, room),
         RELEASE_OBJECT => {
             let o = state().objects.remove(&object);
+            if let Some(Object { media: Some((m, token)), .. }) = &o {
+                let hr = m.remove_handler(*token);
+                compat_common::record_raw("crossvm-audio", "media-manager", &format!("object {object:#x} released, PC MediaManager handler {token:#x} removed -> {:#010x}", hr as u32));
+            }
             if let Some(Object { stream: Some(st), .. }) = o {
                 drop(st.renderer);
                 crate::logan::pool_release(st.pool_index as usize);
             }
             S_OK
+        }
+        MEDIA_PLAY_TO_STREAM_STATE | MEDIA_CASTING_APP_STATE | MEDIA_VOIP_CALL_STATE => {
+            let value: u32 = rd(a, 0);
+            let method = match id {
+                MEDIA_PLAY_TO_STREAM_STATE => wasapi::MEDIA_PLAY_TO_STREAM_STATE,
+                MEDIA_CASTING_APP_STATE => wasapi::MEDIA_CASTING_APP_STATE,
+                _ => wasapi::MEDIA_VOIP_CALL_STATE,
+            };
+            let s = state();
+            match s.objects.get(&object).and_then(|o| o.media.as_ref()) {
+                Some((m, _)) => m.state_changed(method, value),
+                None => E_INVALIDARG,
+            }
         }
         GET_MIX_FORMAT => match wasapi::device_info_for(device_for(object).as_deref()) {
             Ok(d) => {
@@ -796,7 +822,7 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
                 Err(hr) => hr,
             }
         }
-        PROPERTY_GET_VALUE => property_value(object, a),
+        PROPERTY_GET_VALUE => property_value(object, a, room),
         SPATIAL_STATIC_POSITION | SPATIAL_NATIVE_MASK | SPATIAL_MAX_DYNAMIC | SPATIAL_MAX_FRAMES | SPATIAL_FORMAT_SUPPORTED | SPATIAL_STREAM_AVAILABLE | SPATIAL_OFFLOAD_CAPABLE | SPATIAL_MAX_FRAMES_FOR_CATEGORY | FORMAT_ENUM_COUNT | FORMAT_ENUM_GET => spatial(id, object, a),
         ENDPOINT_CHANNEL_COUNT => {
             wr(a, 0, endpoint_channels(&device_for(object)));
@@ -827,6 +853,10 @@ unsafe fn create_object(a: *mut u8, room: usize) -> i32 {
     let parent: u32 = rd(a, 8);
     let method: u32 = rd(a, 0x10);
     if kind >= max_object_type() || flag > 1 {
+        return E_INVALIDARG;
+    }
+    if (kind == MEDIA_MANAGER_TYPE) != (method == METHOD_MEDIA_MANAGER) || (kind == EXISTING_SESSION_TYPE) != (method == METHOD_EXISTING_SESSION) {
+        compat_common::record_raw("crossvm-audio", "CreateObject", &format!("type {kind:#x} with method {method:#x}: the host creator for this type checks its method; E_INVALIDARG"));
         return E_INVALIDARG;
     }
     let device = match method {
@@ -860,7 +890,45 @@ unsafe fn create_object(a: *mut u8, room: usize) -> i32 {
     let mut sessions = Vec::new();
     let mut session = None;
     let mut session_parent = None;
+    let mut media = None;
     match method {
+        METHOD_MEDIA_MANAGER => {
+            let m = match wasapi::media_manager() {
+                Ok(m) => m,
+                Err(hr) => return hr,
+            };
+            let token = match m.add_handler() {
+                Ok(t) => t,
+                Err(hr) => return hr,
+            };
+            media = Some((m, token));
+        }
+        METHOD_EXISTING_SESSION => {
+            if room < METHOD_ARGS + EXISTING_SESSION_CHARS * 2 {
+                return E_INVALIDARG;
+            }
+            let chars = core::slice::from_raw_parts(a.add(METHOD_ARGS) as *const u16, EXISTING_SESSION_CHARS);
+            if chars[EXISTING_SESSION_CHARS - 1] != 0 {
+                return E_INVALIDARG;
+            }
+            let Some(key) = wide_at(a.add(METHOD_ARGS), EXISTING_SESSION_CHARS) else { return E_INVALIDARG };
+            let p = match wasapi::session_existing(device_for(parent).as_deref(), &key) {
+                Ok(p) => p,
+                Err(hr) => {
+                    compat_common::record_raw("crossvm-audio", "CreateObject", &format!("existing session {key:?} -> {:#010x}", hr as u32));
+                    return hr;
+                }
+            };
+            let title = {
+                let s = state();
+                wasapi::SessionRef::Title(device_of(&s, parent), s.session.unwrap_or(GUID_NULL))
+            };
+            let same = wasapi::session_instance(&title).map(|t| t.eq_ignore_ascii_case(&key)).unwrap_or(false);
+            if !same {
+                session = Some(p);
+            }
+            session_parent = Some(parent);
+        }
         METHOD_SESSION_ENUMERATOR => {
             sessions = match wasapi::session_enumerate(device_for(parent).as_deref()) {
                 Ok(l) => l,
@@ -894,6 +962,7 @@ unsafe fn create_object(a: *mut u8, room: usize) -> i32 {
     let mut o = Object::new(kind, session_parent.unwrap_or(if flag == 1 { 0 } else { parent }), device);
     o.pc_sessions = sessions;
     o.pc_session = session;
+    o.media = media;
     s.objects.insert(n, o);
     wr(a, 0xc, n);
     S_OK
@@ -1336,7 +1405,11 @@ pub fn serialized_prop(vt: u16, count: Option<u32>, bytes: &[u8]) -> Vec<u8> {
     d
 }
 
-unsafe fn property_value(object: u32, a: *mut u8) -> i32 {
+pub const PROP_TAG: usize = 0x14;
+pub const PROP_BYTES: usize = 0x18;
+pub const PROP_LEN: usize = PROP_BYTES + PROP_DATA;
+
+unsafe fn property_value(object: u32, a: *mut u8, room: usize) -> i32 {
     let mut key = wasapi::PropertyKey::default();
     core::ptr::copy_nonoverlapping(a, key.fmtid.as_mut_ptr(), 16);
     key.pid = rd(a, 0x10);
@@ -1356,12 +1429,17 @@ unsafe fn property_value(object: u32, a: *mut u8) -> i32 {
             return E_NOTIMPL;
         }
     };
-    if data.len() > PROP_DATA {
+    put_property(a, room, tag, &data)
+}
+
+pub unsafe fn put_property(a: *mut u8, room: usize, tag: u32, data: &[u8]) -> i32 {
+    if PROP_BYTES + data.len() > room {
+        compat_common::record_raw("crossvm-audio", "property", &format!("serialised value of {} bytes passes the {room:#x}-byte envelope payload; the console memcpy would write past its 0x810 allocation, host answers E_OUTOFMEMORY", data.len()));
         return E_OUTOFMEMORY;
     }
-    wr(a, 0x14, tag);
-    core::ptr::copy_nonoverlapping(data.as_ptr(), a.add(0x18), data.len());
-    wr(a, 0x18 + PROP_DATA, data.len() as u64);
+    core::ptr::copy_nonoverlapping(data.as_ptr(), a.add(PROP_BYTES), data.len());
+    wr(a, PROP_TAG, tag);
+    wr(a, PROP_LEN, data.len() as u64);
     S_OK
 }
 

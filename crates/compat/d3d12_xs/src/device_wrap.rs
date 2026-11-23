@@ -692,6 +692,8 @@ unsafe fn bisect_gfx_pso(real: *mut c_void, desc: &[u8], riid: *const Guid) -> S
         ("default_blend", Box::new(|d: &mut Vec<u8>| { d[0x78..0x1c0].fill(0); for i in 0..8 { let o = 0x80 + i * 40; d[o + 8..o + 12].copy_from_slice(&2u32.to_le_bytes()); d[o + 12..o + 16].copy_from_slice(&1u32.to_le_bytes()); d[o + 16..o + 20].copy_from_slice(&1u32.to_le_bytes()); d[o + 20..o + 24].copy_from_slice(&2u32.to_le_bytes()); d[o + 24..o + 28].copy_from_slice(&1u32.to_le_bytes()); d[o + 28..o + 32].copy_from_slice(&1u32.to_le_bytes()); d[o + 32..o + 36].copy_from_slice(&4u32.to_le_bytes()); d[o + 36] = 15; } })),
         ("no_flags", Box::new(move |d: &mut Vec<u8>| put(d, 0x288, 0))),
         ("no_stream_out", Box::new(|d: &mut Vec<u8>| d[0x58..0x78].fill(0))),
+        ("rtv_fill", Box::new(move |d: &mut Vec<u8>| { let rt0 = u32::from_le_bytes(d[0x244..0x248].try_into().unwrap()); let num = u32::from_le_bytes(d[0x240..0x244].try_into().unwrap()).min(8) as usize; for i in 0..num { let o = 0x244 + 4 * i; if d[o..o + 4] == [0u8; 4] { put(d, o, rt0); } } })),
+        ("single_sample", Box::new(move |d: &mut Vec<u8>| { put(d, 0x268, 1); put(d, 0x26c, 0); })),
     ];
     let mut out = String::new();
     for (name, m) in variants {
@@ -806,18 +808,33 @@ unsafe extern "system" fn create_gfx_pso_x(
     this: *mut DeviceWrapper, pdesc: *const u8, num_ext: u32, pext: *const u8,
     riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
+    unsafe { crate::pso_xrec::note(crate::pso_xrec::GFX, pdesc, num_ext) };
     let mut ev = crate::frame_ev::begin(crate::frame_ev::PSO_SYNC);
     if let Some(hr) = unsafe { crate::pso_async::create_gfx(this, (*this).real, pdesc, num_ext, pext, riid, ppv, create_gfx_pso_sync) } {
         if let Some(s) = ev.as_mut() {
             s.set_kind(if crate::frame_ev::take_async_mark() { crate::frame_ev::PSO_ASYNC } else { crate::frame_ev::PSO_INLINE });
         }
-        return hr;
+        return crate::cbv_copy::after_gfx_pso(hr, pdesc, ppv);
     }
     let t0 = std::time::Instant::now();
     let _ = crate::pso_lib::take_lock_wait_us();
     let hr = unsafe { create_gfx_pso_sync(this, pdesc, num_ext, pext, riid, ppv) };
     note_sync_pso("graphics (CreateGraphicsPipelineState_X)", unsafe { crate::pso_async::sync_reason(pdesc, riid, false) }, t0, hr);
-    hr
+    crate::cbv_copy::after_gfx_pso(hr, pdesc, ppv)
+}
+
+pub(crate) unsafe fn replay_create(wrapper: *mut c_void, gfx: bool, desc: *const u8, riid: *const Guid, out: *mut usize) -> i32 {
+    let this = wrapper as *mut DeviceWrapper;
+    let ppv = out as *mut *mut c_void;
+    if gfx {
+        unsafe { create_gfx_pso_sync(this, desc, 0, core::ptr::null(), riid, ppv) }
+    } else {
+        unsafe { create_compute_pso_sync(this, desc, 0, core::ptr::null(), riid, ppv) }
+    }
+}
+
+pub(crate) fn forget_pso(pso: usize) {
+    crate::frame_ev::lock(pso_registry()).remove(&pso);
 }
 
 fn note_sync_pso(kind: &str, why: &str, t0: std::time::Instant, hr: i32) {
@@ -927,7 +944,7 @@ unsafe extern "system" fn create_gfx_pso_sync(
                     }
                 } else if stage == "VS" {
                     let sems = unsafe { snorm10_semantics(&desc) };
-                    match unsafe { crate::vs_snorm::variant(p, n, &sems) } {
+                    match unsafe { crate::vs_snorm::variant(p, n, &sems, &link(off)) } {
                         Some(v) => {
                             edits.push("vs:vs_snorm");
                             v
@@ -1579,7 +1596,14 @@ pub(crate) fn shader_root_container(rts: &[u8], raw: bool) -> Vec<u8> {
     let console = wrap_root_signature(rts);
     let container = crate::rs_xbox::pc_blob(&console).unwrap_or(console);
     if !raw {
-        return container;
+        return match crate::cbv_raw::alias_blob(&container) {
+            Ok(Some(b)) => b,
+            Ok(None) => container,
+            Err(e) => {
+                record("d3d12_xs", "PSO.rootFromShader", &format!("bindless alias failed ({e}); root signature left as the shader gives it"));
+                container
+            }
+        };
     }
     match crate::cbv_raw::patch_blob(&container) {
         Ok(Some((b, _))) => b,
@@ -1652,18 +1676,19 @@ unsafe extern "system" fn create_compute_pso_x(
     this: *mut DeviceWrapper, pdesc: *const u8, num_ext: u32, pext: *const u8,
     riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
+    unsafe { crate::pso_xrec::note(crate::pso_xrec::CS, pdesc, num_ext) };
     let mut ev = crate::frame_ev::begin(crate::frame_ev::PSO_SYNC);
     if let Some(hr) = unsafe { crate::pso_async::create_compute(this, (*this).real, pdesc, num_ext, pext, riid, ppv, create_compute_pso_sync) } {
         if let Some(s) = ev.as_mut() {
             s.set_kind(if crate::frame_ev::take_async_mark() { crate::frame_ev::PSO_ASYNC } else { crate::frame_ev::PSO_INLINE });
         }
-        return hr;
+        return crate::cbv_copy::after_compute_pso(hr, pdesc, ppv);
     }
     let t0 = std::time::Instant::now();
     let _ = crate::pso_lib::take_lock_wait_us();
     let hr = unsafe { create_compute_pso_sync(this, pdesc, num_ext, pext, riid, ppv) };
     note_sync_pso("compute (CreateComputePipelineState_X)", unsafe { crate::pso_async::sync_reason(pdesc, riid, true) }, t0, hr);
-    hr
+    crate::cbv_copy::after_compute_pso(hr, pdesc, ppv)
 }
 
 unsafe extern "system" fn create_compute_pso_sync(
@@ -2062,7 +2087,7 @@ pub(crate) fn vtable() -> *const usize {
         v[75] = crate::device_x::unregister_page_pool_x as usize;
         v[87] = crate::device_x::device87_release_x as usize;
         crate::device_ext_a::install(&mut v);
-        if crate::rtcap::enabled() {
+        if crate::rtcap::enabled() || crate::passcap::on() {
             v[20] = create_rtv_traced as usize;
             v[21] = create_dsv_traced as usize;
         }

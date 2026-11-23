@@ -526,6 +526,7 @@ mod iphlp_model {
 
     #[test]
     fn nsi_interface_rw_writes_merge_unchanged_groups() {
+        let _g = super::super::sockets::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         nsi_reset();
         let mut rw = vec![0xffu8; NL_INTERFACE_RW_SIZE];
         rw[0x10..0x14].copy_from_slice(&1u32.to_le_bytes());
@@ -547,6 +548,36 @@ mod iphlp_model {
         assert_eq!(&got[0xc0..0xd0], &[7u8; 16]);
         assert!(got[0x20..0x30].iter().all(|b| *b == 0xff));
         assert!(nsi_interface_rw(&NPI_MS_IPV6_MODULEID, NIC_LUID).is_none());
+        nsi_reset();
+    }
+}
+
+mod nsi_read {
+    use super::super::iphlp::*;
+    use super::super::*;
+    use super::rd32;
+
+    #[test]
+    fn nsi_get_all_parameters_returns_written_interface_rows() {
+        let _g = super::super::sockets::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        nsi_reset();
+        let key = NIC_LUID.to_le_bytes();
+        let mut out = vec![0u8; NL_INTERFACE_RW_SIZE];
+        let n = NL_INTERFACE_RW_SIZE as u32;
+        let null = core::ptr::null_mut();
+        unsafe {
+            assert_eq!(nsi_get_all_parameters(1, NPI_MS_IPV6_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, key.as_ptr(), 8, out.as_mut_ptr(), n, null, 0, null, 0), ERROR_NOT_FOUND);
+            let mut rw = vec![0xffu8; NL_INTERFACE_RW_SIZE];
+            rw[0xbc..0xc0].copy_from_slice(&9u32.to_le_bytes());
+            assert_eq!(nsi_set_all_parameters(NSI_STORE_ACTIVE, NSI_SET_DEFAULT, NPI_MS_IPV6_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, key.as_ptr(), 8, rw.as_ptr(), n), ERROR_SUCCESS);
+            assert_eq!(nsi_get_all_parameters(1, NPI_MS_IPV6_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, key.as_ptr(), 8, out.as_mut_ptr(), n, null, 0, null, 0), ERROR_SUCCESS);
+            assert_eq!(rd32(&out, 0xbc), 9);
+            assert_eq!(nsi_get_all_parameters(1, NPI_MS_IPV4_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, key.as_ptr(), 8, out.as_mut_ptr(), n, null, 0, null, 0), ERROR_NOT_FOUND);
+            assert_eq!(nsi_get_all_parameters(1, NPI_MS_IPV6_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, key.as_ptr(), 8, out.as_mut_ptr(), 4, null, 0, null, 0), ERROR_INVALID_PARAMETER);
+            let mut rod = [0u8; 16];
+            assert_eq!(nsi_get_all_parameters(1, NPI_MS_IPV6_MODULEID.as_ptr(), NL_INTERFACE_OBJECT, key.as_ptr(), 8, out.as_mut_ptr(), n, rod.as_mut_ptr(), 16, null, 0), ERROR_NOT_SUPPORTED);
+            assert_eq!(nsi_get_all_parameters(1, NPI_MS_TEREDO_MODULEID.as_ptr(), NSI_TEREDO_OBJECT_STATE, core::ptr::null(), 0, out.as_mut_ptr(), 12, null, 0, null, 0), ERROR_SUCCESS);
+        }
         nsi_reset();
     }
 }

@@ -188,6 +188,9 @@ fn is_title_module(h: usize, windir: &str) -> bool {
     if !windir.is_empty() && path.starts_with(windir) {
         return false;
     }
+    if compat_common::os_host::foreign::is_host_injected(&String::from_utf16_lossy(&buf[..n])) {
+        return false;
+    }
     let file = path.rsplit('\\').next().unwrap_or("");
     let stem = file.strip_suffix(".dll").or_else(|| file.strip_suffix(".exe")).unwrap_or(file);
     if stem.starts_with("api-ms-") || stem.starts_with("ext-ms-") || stem.contains("tombox") {

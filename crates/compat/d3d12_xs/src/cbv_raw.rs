@@ -169,6 +169,15 @@ pub fn patch_rts0(b: &mut [u8]) -> Result<RsPatch, String> {
     Ok(p)
 }
 
+pub fn alias_blob(blob: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let (o, n) = crate::console_slots_mesh::rts0_range(blob).ok_or("root signature blob has no RTS0 part")?;
+    let body = blob.get(o..o + n).ok_or("RTS0 chunk out of bounds")?;
+    match crate::bl_alias::add_aliases(body)? {
+        Some(b) => Ok(Some(crate::bl_alias::replace_rts0(blob, &b)?)),
+        None => Ok(None),
+    }
+}
+
 pub fn patch_blob(blob: &[u8]) -> Result<Option<(Vec<u8>, RsPatch)>, String> {
     let (o, n) = crate::console_slots_mesh::rts0_range(blob).ok_or("root signature blob has no RTS0 part")?;
     let mut body = blob.get(o..o + n).ok_or("RTS0 chunk out of bounds")?.to_vec();
@@ -223,8 +232,25 @@ unsafe fn vslot(o: *mut c_void, i: usize) -> usize {
 
 unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, blob: *const u8, len: usize, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const c_void, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(PREV_RS.load(Ordering::Relaxed)) };
-    if blob.is_null() || len == 0 || !enabled() {
+    if blob.is_null() || len == 0 {
         return unsafe { f(this, mask, blob, len, riid, ppv) };
+    }
+    if !enabled() {
+        let given = unsafe { core::slice::from_raw_parts(blob, len) };
+        return match alias_blob(given) {
+            Ok(Some(b)) => {
+                static N: AtomicUsize = AtomicUsize::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 3 {
+                    record("d3d12_xs", "cbv_raw", &format!("cbv_raw={} root signature: CBVs kept, SRV/UAV ranges aliased for the translator's bindless spaces", if copy_on() { "copy" } else { "off" }));
+                }
+                unsafe { f(this, mask, b.as_ptr(), b.len(), riid, ppv) }
+            }
+            Ok(None) => unsafe { f(this, mask, blob, len, riid, ppv) },
+            Err(e) => {
+                record("d3d12_xs", "cbv_raw", &format!("root signature (raw patch off) not aliased ({e}); created as given"));
+                unsafe { f(this, mask, blob, len, riid, ppv) }
+            }
+        };
     }
     if check_on() {
         log_root_regs(unsafe { core::slice::from_raw_parts(blob, len) });
@@ -253,6 +279,9 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
 
 unsafe extern "system" fn create_cbv(this: *mut c_void, pdesc: *const u8, dest: usize) {
     if !enabled() {
+        if copy_on() && !pdesc.is_null() {
+            crate::cbv_copy::note_table_cbv(unsafe { core::ptr::read_unaligned(pdesc as *const u64) }, unsafe { core::ptr::read_unaligned(pdesc.add(8) as *const u32) });
+        }
         let f: unsafe extern "system" fn(*mut c_void, *const u8, usize) = unsafe { core::mem::transmute(PREV_CBV.load(Ordering::Relaxed)) };
         return unsafe { f(this, pdesc, dest) };
     }
@@ -334,6 +363,7 @@ fn check_root(i: u32, va: u64, compute: bool) {
 }
 
 pub unsafe fn install_root_cbv_hooks(xbox_vt: &[AtomicUsize], real_vt: *const usize) {
+    crate::cbv_copy::install(xbox_vt, false);
     if !enabled() || xbox_vt.len() <= XBOX_SLOT_GRAPHICS_ROOT_CBV {
         return;
     }
@@ -585,6 +615,7 @@ unsafe extern "system" fn draw_checked(this: *mut c_void, a: u32, b: u32, c: u32
 }
 
 pub fn install_draw_check(xbox_vt: &[AtomicUsize]) {
+    crate::cbv_copy::install(xbox_vt, true);
     if !track_on() || xbox_vt.len() <= XBOX_SLOT_SET_GRAPHICS_RS || REAL_ROOT_SRV[1].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -641,6 +672,41 @@ void main() {
         let po = u32::from_le_bytes(r[8..12].try_into().unwrap()) as usize;
         let last = po + 12;
         assert_eq!(u32::from_le_bytes(r[last..last + 4].try_into().unwrap()), PARAM_SRV);
+    }
+
+    #[test]
+    fn off_mode_shader_root_signature_gets_aliases_and_keeps_cbvs() {
+        let body = rts0(2, &[[0, u32::MAX, 0, 0]], true);
+        let plain = crate::device_wrap::shader_root_container(&body, false);
+        assert!(!copy_on() && !enabled());
+        let console = crate::device_wrap::wrap_root_signature(&body);
+        let given = crate::rs_xbox::pc_blob(&console).unwrap_or(console);
+        assert_eq!(Some(plain.clone()), alias_blob(&given).unwrap());
+        assert_eq!(root_cbv_params(&plain), root_cbv_params(&given));
+        assert_eq!(root_cbv_params(&plain).len(), 1);
+        let only_cbv = rts0(2, &[[2, 1, 0, 0]], true);
+        let c = crate::device_wrap::wrap_root_signature(&only_cbv);
+        let g = crate::rs_xbox::pc_blob(&c).unwrap_or(c);
+        assert_eq!(crate::device_wrap::shader_root_container(&only_cbv, false), g);
+    }
+
+    #[test]
+    fn copy_mode_aliases_unbounded_ranges_but_keeps_root_cbvs() {
+        let body = rts0(2, &[[0, u32::MAX, 0, 0]], true);
+        let container = crate::device_wrap::shader_root_container(&body, false);
+        let raw = patch_blob(&container).unwrap().unwrap().0;
+        let aliased = alias_blob(&container).unwrap().expect("an unbounded range gets aliases");
+        assert_eq!(root_cbv_params(&aliased), root_cbv_params(&container));
+        assert_eq!(root_cbv_params(&aliased).len(), 1);
+        let ranges = |b: &[u8]| {
+            let (o, n) = crate::console_slots_mesh::rts0_range(b).unwrap();
+            let r = &b[o..o + n];
+            let rd = |x: usize| u32::from_le_bytes(r[x..x + 4].try_into().unwrap()) as usize;
+            let (np, po) = (rd(4), rd(8));
+            (0..np).filter(|i| rd(po + i * 12) == 0).map(|i| rd(rd(po + i * 12 + 8))).sum::<usize>()
+        };
+        assert_eq!(ranges(&aliased), ranges(&raw));
+        assert!(ranges(&aliased) > ranges(&container));
     }
 
     #[test]

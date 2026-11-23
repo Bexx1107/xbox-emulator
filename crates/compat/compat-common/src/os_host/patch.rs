@@ -209,7 +209,7 @@ pub unsafe fn sweep_modules(mods: &[*mut c_void], hooks: &[Hook], report: &mut V
     for &m in mods {
         let Some(pinned) = pin_module(m) else { continue };
         let path = module_path(pinned);
-        if !path.is_empty() && is_title_module(&path, pinned as usize) {
+        if !path.is_empty() && is_title_module(&path, pinned as usize) && !super::foreign::is_host_injected(&path) {
             let mut hits = Vec::new();
             let n = patch_image(pinned as *mut u8, hooks, &mut hits);
             if n > 0 {

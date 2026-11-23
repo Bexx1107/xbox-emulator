@@ -35,6 +35,8 @@ mod mixed;
 mod mimg_d16;
 mod atomic;
 mod user_data;
+mod smem_bounds;
+pub use smem_bounds::{CBFIT_CBUFFER, CBFIT_RAW};
 pub mod infer;
 use mimg_d16::{mimg_data_regs, Lane};
 
@@ -49,6 +51,7 @@ pub struct Translated {
     pub needs_global: bool,
     pub uses_typed_atomic64: bool,
     pub user_data_base: Option<usize>,
+    pub cb_limits: BTreeMap<u32, u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -382,6 +385,9 @@ struct Emitter<'a> {
     insns: Vec<Insn>,
     res: HashMap<usize, Vec<Res>>, // per-instruction resolved resources
     cb_size: BTreeMap<u32, u32>,   // slot -> dwords
+    vs_lat: HashMap<usize, [smem_bounds::Lat; 3]>,
+    uses_smem_bounds: bool,
+    cb_lim: HashMap<u32, Option<u64>>,
     tex: BTreeMap<u32, u32>,       // slot -> dim
     samp: BTreeSet<u32>,
     samp_cmp: BTreeSet<u32>,
@@ -499,6 +505,18 @@ pub const BL_ALIASES: u32 = 6;
 
 pub fn bl_alias_space(k: u32, space: u32) -> u32 {
     TB_BLALIAS_SPACE + (k - 1) * 100_000 + space
+}
+
+pub fn msaa_dim_on() -> bool {
+    static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("TOMBOX_XS_MSAA_DIM").map(|v| v.trim() == "1").unwrap_or(false))
+}
+
+pub fn psv_image_dim_ms(kind: u32, da_dim: u32, ms: bool) -> u32 {
+    if ms && kind == 3 && da_dim == 1 {
+        return 6;
+    }
+    psv_image_dim(kind, da_dim)
 }
 
 pub fn psv_image_dim(kind: u32, da_dim: u32) -> u32 {
@@ -1106,6 +1124,9 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         insns,
         res: HashMap::new(),
         cb_size: BTreeMap::new(),
+        vs_lat: HashMap::new(),
+        uses_smem_bounds: false,
+        cb_lim: HashMap::new(),
         tex: BTreeMap::new(),
         samp: BTreeSet::new(),
         samp_cmp: BTreeSet::new(),
@@ -1243,7 +1264,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         (_, Some("ms")) => "ms_6_8",
         _ => profile,
     };
-    Ok(Translated { hlsl, entry: "main", profile, mip_uavs: em.uav_mips.iter().copied().collect(), mip_srvs: em.tex_mips.iter().copied().collect(), needs_gmem: em.uses_bvh, needs_global: em.uses_global, uses_typed_atomic64: !em.uav_u64.is_empty(), user_data_base: em.ud_active().then(|| em.user_base()) })
+    Ok(Translated { hlsl, entry: "main", profile, mip_uavs: em.uav_mips.iter().copied().collect(), mip_srvs: em.tex_mips.iter().copied().collect(), needs_gmem: em.uses_bvh, needs_global: em.uses_global, uses_typed_atomic64: !em.uav_u64.is_empty(), user_data_base: em.ud_active().then(|| em.user_base()), cb_limits: em.cb_limits() })
 }
 
 impl<'a> Emitter<'a> {
@@ -1426,7 +1447,7 @@ impl<'a> Emitter<'a> {
         let (space, reg) = (id >> 16, id & 0xffff);
         let want = if is_uav { 6 } else { 3 };
         let Some(p) = self.ex.resources.iter().find(|p| p.res_type == want && p.space == space && p.lower <= reg && reg <= p.upper) else { return dim };
-        psv_image_dim(p.kind, dim)
+        psv_image_dim_ms(p.kind, dim, msaa_dim_on())
     }
 
     fn decl(&self, used: &mut Vec<(String, u8, usize)>, ty: &str, name: &str, slot: u32, class: char, range_type: u32, stride: u32) -> Result<String, String> {
@@ -1634,6 +1655,7 @@ impl<'a> Emitter<'a> {
             }
             eprintln!("first analysis error: {first_err:?}");
         }
+        self.vs_lat = smem_bounds::lattice(&self.insns, &ranges, &succs);
         self.msel.clear();
         self.bsel.clear();
         self.dsel_loads.clear();
@@ -3763,12 +3785,27 @@ impl<'a> Emitter<'a> {
                     Some(Res::Buf(slot, is_uav)) => {
                         // Structured buffer read by byte offset (see `tb_sbw_*`).
                         let nm = if is_uav { "ubuf" } else { "sbuf" };
-                        let dynamic = if soff != 0x7d { format!(" + {}", ssrc_name(soff)?) } else { String::new() };
+                        let bound = match ins.src.first() {
+                            Some(Opnd::Sgpr(b)) => self.vs_bound(idx, *b),
+                            _ => smem_bounds::Bound::Mem,
+                        };
+                        let imm4 = ins.aux.imm as u32 & !3;
                         let t = self.tmp;
                         self.tmp += 1;
-                        self.line(&format!("uint t{t} = {:#x}u{dynamic};", ins.aux.imm as u32));
+                        if soff != 0x7d {
+                            self.line(&format!("uint t{t} = ({} & 0xfffffffcu) + {imm4:#x}u; uint t{t}c = (t{t} < {imm4:#x}u) ? 1u : 0u;", ssrc_name(soff)?));
+                        } else {
+                            self.line(&format!("uint t{t} = {imm4:#x}u;"));
+                        }
                         for k in 0..n {
-                            self.line(&format!("uint t{t}_{k} = tb_sbw_{nm}{slot}(t{t} + {}u);", 4 * k));
+                            let read = format!("tb_sbw_{nm}{slot}(t{t} + {}u)", 4 * k);
+                            let cond = if soff != 0x7d { self.smem_cond_dyn(&bound, &format!("t{t}"), &format!("t{t}c"), k, false, false) } else { self.smem_cond_static(&bound, imm4 as u64 + 4 * k as u64) };
+                            let e = match cond {
+                                smem_bounds::Cond::Always => read,
+                                smem_bounds::Cond::Never => "0u".to_string(),
+                                smem_bounds::Cond::Expr(c) => format!("({c} ? {read} : 0u)"),
+                            };
+                            self.line(&format!("uint t{t}_{k} = {e};"));
                         }
                         for k in 0..n {
                             let dst = sreg_opnd(base + k as u8);
@@ -3779,15 +3816,27 @@ impl<'a> Emitter<'a> {
                     }
                     _ => return Err("unresolved constant buffer".into()),
                 };
+                let bound = match ins.src.first() {
+                    Some(Opnd::Sgpr(b)) => self.vs_bound(idx, *b),
+                    _ => smem_bounds::Bound::Mem,
+                };
+                self.note_cb_bound(slot, Some(&bound));
+                let imm4 = ins.aux.imm as u32 & !3;
                 if soff != 0x7d {
-                    // Dynamic byte offset = imm + SGPR[soffset].
                     let so = ssrc_name(soff)?;
                     let t = self.tmp;
                     self.tmp += 1;
-                    self.line(&format!("uint t{t} = ({:#x}u + {so}) >> 2;", ins.aux.imm as u32));
-                    // Read all words before writing (the offset register may be a destination).
+                    self.line(&format!("uint t{t} = ({so} & 0xfffffffcu) + {imm4:#x}u; uint t{t}c = (t{t} < {imm4:#x}u) ? 1u : 0u;"));
                     for k in 0..n {
-                        self.line(&format!("uint t{t}_{k} = cb{slot}[((t{t} + {k}u) >> 2) & 4095u][(t{t} + {k}u) & 3u];"));
+                        let lo = if k == 0 { format!("t{t}") } else { format!("(t{t} + {:#x}u)", 4 * k) };
+                        match self.smem_cond_dyn(&bound, &format!("t{t}"), &format!("t{t}c"), k, true, true) {
+                            smem_bounds::Cond::Never => self.line(&format!("uint t{t}_{k} = 0u;")),
+                            smem_bounds::Cond::Always => self.line(&format!("uint t{t}_{k} = cb{slot}[{lo} >> 4][({lo} >> 2) & 3u];")),
+                            smem_bounds::Cond::Expr(c) => {
+                                self.line(&format!("bool t{t}b{k} = {c};"));
+                                self.line(&format!("uint t{t}_{k} = t{t}b{k} ? cb{slot}[(t{t}b{k} ? {lo} : 0u) >> 4][({lo} >> 2) & 3u] : 0u;"));
+                            }
+                        }
                     }
                     for k in 0..n {
                         let dst = sreg_opnd(base + k as u8);
@@ -3796,12 +3845,29 @@ impl<'a> Emitter<'a> {
                     }
                     return Ok(());
                 }
-                let w0 = ins.aux.imm as u32 / 4;
+                let w0 = imm4 / 4;
+                let mut vals = Vec::with_capacity(n as usize);
                 for k in 0..n {
                     let w = w0 + k;
+                    let read = format!("cb{slot}[{}].{}", w / 4, XYZW[(w % 4) as usize]);
+                    vals.push(match self.smem_cond_static(&bound, 4 * w as u64) {
+                        smem_bounds::Cond::Always => read,
+                        smem_bounds::Cond::Never => "0u".to_string(),
+                        smem_bounds::Cond::Expr(c) => format!("({c} ? {read} : 0u)"),
+                    });
+                }
+                let staged = vals.iter().any(|v| v.contains("tb_smem_in"));
+                let t = self.tmp;
+                if staged {
+                    self.tmp += 1;
+                    for (k, v) in vals.iter().enumerate() {
+                        self.line(&format!("uint t{t}_{k} = {v};"));
+                    }
+                }
+                for (k, v) in vals.iter().enumerate() {
                     let dst = sreg_opnd(base + k as u8);
                     self.touch(&dst);
-                    self.ws(&dst, &format!("cb{slot}[{}].{}", w / 4, XYZW[(w % 4) as usize]))?;
+                    self.ws(&dst, &if staged { format!("t{t}_{k}") } else { v.clone() })?;
                 }
                 Ok(())
             }
@@ -5273,11 +5339,28 @@ impl<'a> Emitter<'a> {
             } else {
                 format!("{:#x}u", ins.aux.imm as u32)
             };
+            let bound = match (idxen, ins.src.get(1)) {
+                (false, Some(Opnd::Sgpr(b))) => match self.vs_bound(idx, *b) {
+                    b @ smem_bounds::Bound::Static { stride: Some(0), .. } => b,
+                    smem_bounds::Bound::Static { nr, .. } => smem_bounds::Bound::Static { nr, stride: None },
+                    _ => smem_bounds::Bound::Mem,
+                },
+                _ => smem_bounds::Bound::Mem,
+            };
+            self.note_cb_bound(slot, None);
             let t = self.tmp;
             self.tmp += 1;
-            self.line(&format!("uint t{t} = {base} >> 2;"));
+            self.line(&format!("uint t{t} = {base}; uint t{t}c = 0u;"));
             for k in 0..n {
-                self.line(&format!("uint t{t}_{k} = cb{slot}[((t{t} + {k}u) >> 2) & 4095u][(t{t} + {k}u) & 3u];"));
+                let lo = if k == 0 { format!("t{t}") } else { format!("(t{t} + {:#x}u)", 4 * k) };
+                match self.smem_cond_dyn(&bound, &format!("t{t}"), &format!("t{t}c"), k, true, true) {
+                    smem_bounds::Cond::Never => self.line(&format!("uint t{t}_{k} = 0u;")),
+                    smem_bounds::Cond::Always => self.line(&format!("uint t{t}_{k} = cb{slot}[{lo} >> 4][({lo} >> 2) & 3u];")),
+                    smem_bounds::Cond::Expr(c) => {
+                        self.line(&format!("bool t{t}b{k} = {c};"));
+                        self.line(&format!("uint t{t}_{k} = t{t}b{k} ? cb{slot}[(t{t}b{k} ? {lo} : 0u) >> 4][({lo} >> 2) & 3u] : 0u;"));
+                    }
+                }
             }
             for k in 0..n {
                 self.wv(&Opnd::Vgpr(vd + k as u8), &format!("t{t}_{k}"))?;
@@ -6682,6 +6765,9 @@ impl<'a> Emitter<'a> {
                 h.push_str(&d);
                 let _ = writeln!(h, "#define cb{slot} cb{slot}_.v");
             }
+        }
+        if self.uses_smem_bounds {
+            h.push_str(smem_bounds::HELPERS);
         }
         for (slot, dim) in &self.tex {
             let ty = match dim {

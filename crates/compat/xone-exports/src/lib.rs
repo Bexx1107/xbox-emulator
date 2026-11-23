@@ -183,16 +183,27 @@ fn profile_dir_of(exe: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 pub fn build_cdylib(cargo: &str, manifest_dir: &str, package: &str, dll: &str) -> std::path::PathBuf {
+    build_cdylib_with_features(cargo, manifest_dir, package, dll, "")
+}
+
+pub fn build_cdylib_with_features(cargo: &str, manifest_dir: &str, package: &str, dll: &str, features: &str) -> std::path::PathBuf {
     static BUILT: std::sync::Mutex<Vec<(String, std::path::PathBuf)>> = std::sync::Mutex::new(Vec::new());
     let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, p)) = built.iter().find(|(k, _)| k == package) {
+    let tag = format!("{package}|{features}");
+    if let Some((_, p)) = built.iter().find(|(k, _)| *k == tag) {
         return p.clone();
     }
     let exe = std::env::current_exe().expect("test exe path");
-    let profile = profile_dir_of(&exe).unwrap_or_else(|| panic!("no debug/release directory above {}", exe.display()));
-    let target = profile.parent().unwrap().to_path_buf();
+    let base_profile = profile_dir_of(&exe).unwrap_or_else(|| panic!("no debug/release directory above {}", exe.display()));
+    let base_target = base_profile.parent().unwrap().to_path_buf();
+    let profile_name = base_profile.file_name().unwrap().to_owned();
+    let target = if features.is_empty() { base_target } else { base_target.join(format!("features-{}", features.replace([',', ' '], "-"))) };
+    let profile = target.join(&profile_name);
     let mut cmd = std::process::Command::new(cargo);
     cmd.current_dir(manifest_dir).args(["build", "--offline", "-p", package]).env("CARGO_TARGET_DIR", &target).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+    if !features.is_empty() {
+        cmd.args(["--features", features]);
+    }
     if profile.file_name().and_then(|n| n.to_str()) == Some("release") {
         cmd.arg("--release");
     }
@@ -221,7 +232,7 @@ pub fn build_cdylib(cargo: &str, manifest_dir: &str, package: &str, dll: &str) -
     assert!(status.success(), "cargo build -p {package} failed ({status}):\n{err}");
     let p = profile.join(dll);
     assert!(p.is_file(), "cargo build -p {package} succeeded but {} is missing", p.display());
-    built.push((package.to_string(), p.clone()));
+    built.push((tag, p.clone()));
     p
 }
 

@@ -131,6 +131,34 @@ fn crossvm_audio_pc_events_become_guest_notification_frames() {
 }
 
 #[test]
+fn crossvm_audio_media_manager_calls_reach_the_pc_playback_manager() {
+    run_step("media");
+}
+
+#[test]
+fn crossvm_audio_property_values_over_0x104_bytes_follow_the_console_memcpy() {
+    let data: Vec<u8> = (0..0x300u32).map(|i| (i * 7 + 3) as u8).collect();
+    let mut e = envelope(crossvm::PROPERTY_GET_VALUE, 0);
+    let room = e.len() - crossvm::PAYLOAD;
+    let r = unsafe { e.as_mut_ptr().add(crossvm::PAYLOAD) };
+    assert_eq!(unsafe { crossvm::put_property(r, room, 3, &data) }, 0, "MMDevAPI 5f240 memcpys the whole serialised value (no size check) and returns S_OK");
+    let p = &e[crossvm::PAYLOAD..];
+    assert_eq!(u32_at(p, crossvm::PROP_TAG), 3);
+    assert_eq!(u64::from_le_bytes(p[crossvm::PROP_LEN..crossvm::PROP_LEN + 8].try_into().unwrap()), 0x300, "len is stored at R+0x11c after the copy");
+    assert_eq!(&p[crossvm::PROP_BYTES..crossvm::PROP_LEN], &data[..crossvm::PROP_DATA], "the first 0x104 bytes land in the data field");
+    assert_eq!(&p[crossvm::PROP_LEN + 8..crossvm::PROP_BYTES + 0x300], &data[crossvm::PROP_DATA + 8..], "the bytes after the len field are the rest of the value");
+    let max = room - crossvm::PROP_BYTES;
+    let big = vec![0x5au8; max];
+    assert_eq!(unsafe { crossvm::put_property(r, room, 3, &big) }, 0, "a value filling the envelope payload still fits");
+    let over = vec![0x5au8; max + 1];
+    assert_eq!(unsafe { crossvm::put_property(r, room, 3, &over) }, 0x8007000Eu32 as i32, "past the payload the console memcpy overruns its 0x810 heap block; the host refuses");
+    let small = [1u8, 2, 3, 4];
+    assert_eq!(unsafe { crossvm::put_property(r, room, 4, &small) }, 0);
+    let p = &e[crossvm::PAYLOAD..];
+    assert_eq!((u32_at(p, crossvm::PROP_TAG), &p[crossvm::PROP_BYTES..crossvm::PROP_BYTES + 4], u64::from_le_bytes(p[crossvm::PROP_LEN..crossvm::PROP_LEN + 8].try_into().unwrap())), (4, &small[..], 4));
+}
+
+#[test]
 fn inner() {
     let Ok(step) = std::env::var(STEP) else { return };
     let dir = std::env::temp_dir().join(format!("xvmaudio_crossvm_{}", std::process::id()));
@@ -154,6 +182,7 @@ fn inner() {
         "items" => items(&mix),
         "capture" => capture(),
         "notify" => notify(),
+        "media" => media(),
         _ => objects(&mix),
     }
     println!("STEP OK");
@@ -352,7 +381,7 @@ fn render(mix: &[u8]) {
 fn objects(mix: &[u8]) {
     crossvm::set_hello(2);
     let (hr, _) = create(0x19, 1, 0, 0x7b, &[]);
-    assert_eq!(hr, 0, "type 0x19 is accepted after the 0x00020008 hello");
+    assert_eq!(hr, 0x8000_4005u32 as i32, "type 0x19 is accepted after the 0x00020008 hello and reaches the 0x7b instance-id parse, which fails on an empty key");
     crossvm::set_hello(1);
     let (hr, _) = create(0x19, 1, 0, 0x7b, &[]);
     assert_eq!(hr, 0x8007_0057u32 as i32, "19041 guests only take types below 0x17");
@@ -555,6 +584,8 @@ fn objects(mix: &[u8]) {
     assert_eq!(send(&mut e), 0, "the mix format is supported in shared mode");
 
     let mut e = envelope(0x64, dev);
+    assert_eq!(send(&mut e), 0x8007_0057u32 as i32, "0x64 on a device object, not a 0x61 MediaManager, is refused");
+    let mut e = envelope(0xfff, dev);
     assert_eq!(send(&mut e), 0x8000_4001u32 as i32, "an id with no decoded layout reports E_NOTIMPL");
     for o in [ps, vol, sess, ep, dev, enumerator] {
         let mut e = envelope(crossvm::RELEASE_OBJECT, o);
@@ -1408,6 +1439,43 @@ fn notify() {
     println!("frames after the enumerated SetDisplayName: {all:?}");
     let got: Vec<u32> = all.iter().filter(|(_, k, _)| *k == 0x10).map(|(l, _, _)| *l).collect();
     assert_eq!((got.iter().filter(|&&l| l == own).count(), got.iter().filter(|&&l| l == sess_live).count()), (1, 1), "one PC IAudioSessionEvents per session instance id: each listener gets the display name change once");
+    let key = |s: &str| -> Vec<u8> {
+        let mut b = vec![0u8; crossvm::EXISTING_SESSION_CHARS * 2];
+        for (i, c) in s.encode_utf16().enumerate() {
+            b[i * 2..i * 2 + 2].copy_from_slice(&c.to_le_bytes());
+        }
+        b
+    };
+    let (hr, e) = create(crossvm::EXISTING_SESSION_TYPE, 1, 0, crossvm::METHOD_EXISTING_SESSION, &key(&sid));
+    assert_eq!(hr, 0, "0x7b looks the title's session up by its instance identifier (AudioSrv GetExistingSession)");
+    let ex = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::SESSION_GET_INSTANCE_IDENTIFIER, ex);
+    assert_eq!(send(&mut e), 0);
+    assert!(wide_at(&e, 0x10, crossvm::SESSION_STRING_CHARS).eq_ignore_ascii_case(&sid), "the 0x7b session control is the keyed session");
+    let mut e = envelope(crossvm::SET_SIMPLE_VOLUME, ex);
+    e[0x10..0x14].copy_from_slice(&0.6f32.to_le_bytes());
+    assert_eq!(send(&mut e), 0);
+    let mut e = envelope(crossvm::GET_SIMPLE_VOLUME, sess_live);
+    assert_eq!(send(&mut e), 0);
+    assert_eq!(f32_at(&e, 0x10), 0.6, "the 0x7b control and the title session object share one volume");
+    let mut e = envelope(crossvm::RELEASE_OBJECT, ex);
+    assert_eq!(send(&mut e), 0);
+    let (hr, _) = create(crossvm::EXISTING_SESSION_TYPE, 1, 0, crossvm::METHOD_EXISTING_SESSION, &key("{0.0.0.00000000}.{00000000-0000-0000-0000-000000000000}|tombox-none%b{00000000-0000-0000-0000-000000000000}|1%b0"));
+    assert_eq!(hr, 0x80070002u32 as i32, "an unknown instance id is ERROR_FILE_NOT_FOUND (audiosrv 1fd50)");
+    let (hr, _) = create(crossvm::EXISTING_SESSION_TYPE, 1, 0, crossvm::METHOD_EXISTING_SESSION, &key(""));
+    assert_eq!(hr, 0x80004005u32 as i32, "an empty key fails CAudioSessionInstanceId::Initialize (E_FAIL)");
+    let mut bad = key(&sid);
+    let n = bad.len();
+    bad[n - 2] = b'x';
+    let (hr, _) = create(crossvm::EXISTING_SESSION_TYPE, 1, 0, crossvm::METHOD_EXISTING_SESSION, &bad);
+    assert_eq!(hr, -2147024809, "validator a6bc0 needs a NUL WCHAR at args+0x3fe");
+    let (hr, _) = create(crossvm::EXISTING_SESSION_TYPE, 1, 0, crossvm::METHOD_SESSION_ENUMERATOR, &key(&sid));
+    assert_eq!(hr, -2147024809, "type 0x19 only takes method 0x7b");
+    crossvm::set_hello(1);
+    let (hr, _) = create(crossvm::EXISTING_SESSION_TYPE, 1, 0, crossvm::METHOD_EXISTING_SESSION, &key(&sid));
+    assert_eq!(hr, -2147024809, "19041 hosts have no type 0x19");
+    crossvm::set_hello(2);
+    println!("0x7b: existing session {ex:#x} by instance id, unknown -> 0x80070002, empty -> 0x80004005, no NUL -> E_INVALIDARG");
     let mut e = envelope(crossvm::SET_SIMPLE_VOLUME, sess_live);
     e[0x10..0x14].copy_from_slice(&1.0f32.to_le_bytes());
     assert_eq!(send(&mut e), 0);
@@ -1415,6 +1483,44 @@ fn notify() {
     crossvm::set_hello(1);
     let mut e = envelope(crossvm::RELEASE_OBJECT, sess);
     assert_eq!(send(&mut e), 0);
+}
+
+fn media() {
+    use console_sandbox::wasapi::{HANDLER_INVOKES, HANDLER_LIVE};
+    use std::sync::atomic::Ordering;
+    crossvm::set_hello(2);
+    let (hr, _) = create(crossvm::MEDIA_MANAGER_TYPE, 1, 0, crossvm::METHOD_DEFAULT_ENDPOINT, &[0; 8]);
+    assert_eq!(hr, -2147024809, "the type 0x13 creator 8ecf0 rejects a method other than 0x61 (8bfd8)");
+    let (hr, _) = create(0x2, 1, 0, crossvm::METHOD_MEDIA_MANAGER, &[]);
+    assert_eq!(hr, -2147024809, "method 0x61 belongs to type 0x13");
+    let live = HANDLER_LIVE.load(Ordering::SeqCst);
+    let (hr, e) = create(crossvm::MEDIA_MANAGER_TYPE, 1, 0, crossvm::METHOD_MEDIA_MANAGER, &[]);
+    assert_eq!(hr, 0, "0x61 opens the PC Windows.Media.Internal.MediaManager statics and adds the no-op EventHandler<Object>");
+    let m = u32_at(&e, 0x1c);
+    assert!(m != 0);
+    assert_eq!(HANDLER_LIVE.load(Ordering::SeqCst), live + 1, "the PC MediaManager keeps the host handler while the object lives");
+    for id in [crossvm::MEDIA_PLAY_TO_STREAM_STATE, crossvm::MEDIA_CASTING_APP_STATE, crossvm::MEDIA_VOIP_CALL_STATE] {
+        let mut e = envelope(id, m);
+        e[0x10..0x14].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(send(&mut e), -2147024809, "id {id:#x}: the PC MediaManager local path rejects a state above 1 (f6820 / 64670 / 5e740, as XD 119de0)");
+        let mut e = envelope(id, m);
+        assert_eq!(send(&mut e), 0, "id {id:#x}: state 0 reaches PC AudioSrv PlaybackManager");
+    }
+    let mut e = envelope(crossvm::MEDIA_PLAY_TO_STREAM_STATE, 0x7fff_fff0);
+    assert_eq!(send(&mut e), -2147024809, "no MediaManager object behind the id");
+    let mut e = envelope(crossvm::RELEASE_OBJECT, m);
+    assert_eq!(send(&mut e), 0);
+    let mut released = false;
+    for _ in 0..50 {
+        if HANDLER_LIVE.load(Ordering::SeqCst) == live {
+            released = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(released, "ReleaseObject removes the handler from the PC MediaManager, which drops its reference");
+    println!("media: 0x61 object {m:#x}, 0x64-0x66 state 2 -> E_INVALIDARG and state 0 -> S_OK on the PC, handler removed on release, {} handler invokes", HANDLER_INVOKES.load(Ordering::SeqCst));
+    crossvm::set_hello(1);
 }
 
 fn session_valid<'a>(f: &'a [u8], sid: &str) -> &'a [u8] {

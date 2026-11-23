@@ -19,6 +19,7 @@ mod xone_dxgi;
 mod xone_queue;
 mod ecl_probe;
 mod cbv_raw;
+mod cbv_copy;
 mod hang_cap;
 mod hang_snap;
 mod rootlog;
@@ -48,6 +49,7 @@ mod frame_ev;
 mod xlat_index;
 mod pso_lib;
 mod pso_prewarm;
+mod pso_xrec;
 mod overlay_font;
 mod overlay_sensors;
 #[cfg(test)]
@@ -65,6 +67,9 @@ mod guard;
 mod upload;
 mod reaper;
 mod rtcap;
+mod passcap;
+#[cfg(test)]
+mod passcap_tests;
 mod bindtrace;
 mod replay;
 mod map_x;

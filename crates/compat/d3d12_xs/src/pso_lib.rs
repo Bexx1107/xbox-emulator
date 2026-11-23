@@ -95,6 +95,9 @@ pub fn save_due(now: u64, saved_at: u64, last_store: u64) -> bool {
 static PREV_RS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn enabled() -> bool {
+    if cfg!(test) {
+        return false;
+    }
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
         let on = std::env::var("TOMBOX_PSO_LIBRARY").map(|v| v.trim() != "0").unwrap_or(true);
@@ -297,6 +300,11 @@ pub fn hook_device(v: &mut [usize]) {
     v[16] = create_root_signature as *const () as usize;
 }
 
+pub fn cache_file(stem: &str, mode: &str) -> String {
+    let tag: String = mode.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    format!("{stem}.{tag}.bin")
+}
+
 pub(crate) fn mode_tag() -> &'static str {
     crate::shader_xlat::runtime_mode().cbv_raw.key_tag()
 }
@@ -393,7 +401,7 @@ unsafe fn open(real: *mut c_void) -> Option<Lib> {
         return None;
     }
     let ident = ident();
-    let path = tombox_xshader::shader_cache::title_dir(&crate::shader_xlat::title_name_pub()).join("pso_library.bin");
+    let path = tombox_xshader::shader_cache::title_dir(&crate::shader_xlat::title_name_pub()).join(cache_file("pso_library", mode_tag()));
     let file = std::fs::read(&path).ok();
     let check = check_file(file.as_deref(), &ident);
     let (blob, why): (&'static [u8], Option<String>) = match check {
@@ -440,13 +448,20 @@ pub fn warm(real: *mut c_void, wrapper: *mut c_void) {
         return;
     }
     let (r, w) = (real as usize, wrapper as usize);
-    let _ = std::thread::Builder::new().name("tombox-pso-lib".into()).spawn(move || {
-        if let Some(l) = lib(r as *mut c_void) {
-            if let Some(dir) = l.path.parent() {
+    let addref: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(vslot(real, 1)) };
+    unsafe { addref(real) };
+    let spawned = std::thread::Builder::new().name("tombox-pso-lib".into()).spawn(move || {
+        match lib(r as *mut c_void).and_then(|l| l.path.parent().map(|d| (l, d))) {
+            Some((l, dir)) => {
                 crate::pso_prewarm::start(r as *mut c_void, w as *mut c_void, &l.ident, dir);
+                crate::pso_xrec::start(w as *mut c_void, dir);
             }
+            None => unsafe { release(r as *mut c_void) },
         }
     });
+    if spawned.is_err() {
+        unsafe { release(real) };
+    }
 }
 
 fn wide(k: u128) -> [u16; 33] {
@@ -544,6 +559,13 @@ unsafe fn with_cached(k: u128, desc: &[u8], at: usize, ppv: *mut *mut c_void, cr
     hr
 }
 
+static FLIGHTS: crate::pso_xrec::Flights = crate::pso_xrec::Flights::new();
+static FLIGHT_WAITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn flight_waits() -> u64 {
+    FLIGHT_WAITS.load(Relaxed)
+}
+
 unsafe fn run(key: Option<u128>, kind: Option<u8>, real: *mut c_void, desc: &[u8], cached_at: Option<usize>, riid: *const Guid, ppv: *mut *mut c_void, load: &dyn Fn(usize, *const u16) -> i32, create: &dyn Fn(*const u8) -> i32) -> i32 {
     if !enabled() {
         return create(desc.as_ptr());
@@ -552,10 +574,14 @@ unsafe fn run(key: Option<u128>, kind: Option<u8>, real: *mut c_void, desc: &[u8
         UNKEYED.fetch_add(1, Relaxed);
         return create(desc.as_ptr());
     };
-    if kind.is_some() {
+    if kind.is_some() && !crate::pso_xrec::replaying() {
         if let Some(hr) = unsafe { crate::pso_prewarm::claim(k, riid, ppv) } {
             return hr;
         }
+    }
+    let (_flight, waited) = FLIGHTS.enter(k);
+    if waited {
+        FLIGHT_WAITS.fetch_add(1, Relaxed);
     }
     let l = lib(real);
     if let Some(l) = l {
@@ -758,6 +784,10 @@ extern "C" fn exit_save() {
         save_logged("process exit");
     }
     let _ = crate::pso_prewarm::save(true);
+    crate::pso_xrec::save_at_exit();
+    if crate::pso_xrec::enabled() {
+        record("d3d12_xs", "pso_xrec", &format!("final totals at process exit: {}; same-PSO creates that waited for another thread's build: {}", crate::pso_xrec::summary(), flight_waits()));
+    }
     if crate::pso_prewarm::enabled() {
         record("d3d12_xs", "pso_prewarm", &format!("final totals at process exit: {}", crate::pso_prewarm::summary()));
     }
@@ -921,6 +951,13 @@ void main() { o.Store(0, 5u); }
         assert!(!save_due(130, 100, 129));
         assert!(!save_due(219, 100, 219));
         assert!(save_due(220, 100, 220));
+    }
+
+    #[test]
+    fn each_cbv_mode_keeps_its_own_cache_files() {
+        assert_eq!(cache_file("pso_library", "cbraw=1"), "pso_library.cbraw_1.bin");
+        assert_eq!(cache_file("pso_prewarm", "cbraw=copy"), "pso_prewarm.cbraw_copy.bin");
+        assert_ne!(cache_file("pso_library", "cbraw=0"), cache_file("pso_library", "cbraw=1"));
     }
 
     #[test]

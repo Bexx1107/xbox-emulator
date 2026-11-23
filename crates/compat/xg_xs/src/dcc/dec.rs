@@ -188,6 +188,7 @@ thread_local! {
     static BLOCK_UNDEF: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     static UNMODELED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     static RELAY2_HOLES: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static G19: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 fn site(k: usize) {
@@ -263,7 +264,14 @@ pub(crate) fn remap(d: &mut Dcc, dst: usize, src: usize, maps: &[Option<(u32, u3
     let s = d.b[src];
     let mut tmp = [0u8; 64];
     let mut ever = [false; 64];
-    if maps.iter().any(|m| m.is_some()) {
+    let g19 = G19.with(|c| c.replace(false));
+    let mut kn = [true; 64];
+    if g19 {
+        let g = super::enc::relay_g();
+        tmp = g.b;
+        ever = g.known;
+        kn = g.known;
+    } else if maps.iter().any(|m| m.is_some()) {
         if let Some(b) = fed() {
             tmp = b;
             ever = [true; 64];
@@ -283,14 +291,15 @@ pub(crate) fn remap(d: &mut Dcc, dst: usize, src: usize, maps: &[Option<(u32, u3
             mark(d, dst, k, u);
             continue;
         };
+        let tainted = undef(d, src, k);
         for a in o..o + 64 {
             let c = get(d, a as u32, from)?;
             let b = (set(d, &c, to)? & 0x3f) as usize;
             tmp[b] = s[a];
             ever[b] = true;
+            kn[b] = !tainted;
         }
         let holes = ever.iter().any(|&x| !x);
-        let tainted = undef(d, src, k);
         if holes && AT.with(|c| c.get()) == 1 && !frame_written(1, &ever) {
             RELAY2_HOLES.with(|c| c.set(true));
         }
@@ -300,6 +309,9 @@ pub(crate) fn remap(d: &mut Dcc, dst: usize, src: usize, maps: &[Option<(u32, u3
         }
         d.b[dst][o..o + 64].copy_from_slice(&tmp);
         mark(d, dst, k, u);
+    }
+    if g19 {
+        super::enc::set_relay_g(super::enc::RelayG { b: tmp, known: kn });
     }
     Ok(())
 }
@@ -312,6 +324,7 @@ pub(crate) fn relay(d: &mut Dcc, dst: usize, src: usize, mode: u32) -> Result<()
         0 => 3,
         _ => 9,
     });
+    G19.with(|c| c.set(crate::dcc::xg_build() == 19041));
     remap(d, dst, src, &[Some((from, mode)); 4])?;
     d.w32(0xf0, mode);
     Ok(())

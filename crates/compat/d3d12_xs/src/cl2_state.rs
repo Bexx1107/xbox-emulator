@@ -1453,6 +1453,7 @@ pub(crate) unsafe fn reapply_so(list: *mut c_void) {
 }
 
 pub unsafe fn note_executed(queue: *mut c_void, lists: &[*mut c_void]) {
+    unsafe { crate::cbv_copy::note_executed(queue, lists) };
     unsafe { crate::dbcount::note_executed(queue, lists) };
     let Some(&first) = lists.first() else { return };
     let keys: Vec<usize> = lists.iter().map(|&l| crate::list_split::origin_of(l)).collect();
@@ -1493,12 +1494,11 @@ pub unsafe fn after_bundle(this: *mut c_void, bundle: *mut c_void) {
         if let Some(x) = b.depth_bias_x {
             unsafe { apply_depth_bias_x(this, x) };
         }
-        if is_rect(this) {
-            unsafe { apply_rect(this) };
-        } else if was {
+        if was && !is_rect(this) {
             unsafe { rebind_pso(this) };
         }
     }
+    unsafe { apply_rect(this) };
 }
 
 unsafe extern "system" fn w_z_order(this: *mut c_void, enable: u32) {

@@ -760,6 +760,7 @@ unsafe fn present_x_body(queue: *mut c_void, plane_count: u32, planes: *const u8
     crate::gpuprof::on_present();
     crate::hot_reload::on_present();
     crate::present_probe::on_present(src, plane_count, planes);
+    crate::passcap::on_present(queue, src, plane_count, planes);
     crate::upload::register_direct_queue(queue);
     crate::slowcall::time("PresentX upload pump", || crate::frame_ev::time(crate::frame_ev::UPLOAD, || crate::perf::timed(crate::perf::UPLOAD, || crate::upload::pump(queue))));
     crate::slowcall::time("PresentX replay/rtcap", || crate::perf::timed(crate::perf::RTCAP, || {
@@ -949,6 +950,9 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     let before = crate::ecl_probe::removed_reason(queue);
     let real: Vec<*mut c_void> =
         (0..n as usize).map(|i| crate::cmdlist_wrap::unwrap(*lists.add(i))).collect();
+    if crate::passcap::on() {
+        crate::passcap::note_submit(queue as usize, &crate::list_split::expand(&real));
+    }
     let mut real = crate::cl2_state::skip_presubmitted(crate::list_split::expand(&real));
     crate::indirect_bundle::resolve(&mut real);
     let real = crate::ecl_probe::refuse_failed(real);

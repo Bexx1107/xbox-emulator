@@ -424,6 +424,7 @@ pub fn apply(real_list: *mut c_void) {
             crate::depth_uav::install_cmdlist(&XBOX_VT);
             crate::pso_async::install(&XBOX_VT);
             crate::cbv_raw::install_draw_check(&XBOX_VT);
+            crate::passcap::install(&XBOX_VT);
             XBOX_VT[CONSOLE_NULL_SLOT].store(0, Ordering::Relaxed);
             record("d3d12_xs", "cmdlist.vtable",
                 &format!("built Xbox-layout cmdlist vtable from real {real_vt:p} (+4 shift at PC28)"));

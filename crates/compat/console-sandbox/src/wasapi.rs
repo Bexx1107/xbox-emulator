@@ -676,6 +676,137 @@ pub fn session_set_ducking(r: &SessionRef, opt_out: bool) -> i32 {
     }
 }
 
+pub const SESSION_NOT_FOUND: i32 = 0x8007_0002u32 as i32;
+pub const SESSION_KEY_INVALID: i32 = 0x8000_4005u32 as i32;
+
+pub fn session_existing(id: Option<&str>, instance: &str) -> Result<Arc<PcSession>, i32> {
+    if instance.is_empty() {
+        return Err(SESSION_KEY_INVALID);
+    }
+    for p in session_enumerate(id)? {
+        let r = SessionRef::Pc(p.clone());
+        if session_instance(&r)?.eq_ignore_ascii_case(instance) {
+            return Ok(p);
+        }
+    }
+    Err(SESSION_NOT_FOUND)
+}
+
+#[link(name = "runtimeobject")]
+extern "system" {
+    fn RoGetActivationFactory(id: *mut c_void, iid: *const Guid, out: *mut *mut c_void) -> i32;
+    fn WindowsCreateString(s: *const u16, len: u32, out: *mut *mut c_void) -> i32;
+    fn WindowsDeleteString(h: *mut c_void) -> i32;
+}
+
+pub const MEDIA_MANAGER_CLASS: &str = "Windows.Media.Internal.MediaManager";
+pub const IID_MEDIA_MANAGER_STATICS: Guid = Guid { data1: 0xD6F7BE30, data2: 0x77CD, data3: 0x4139, data4: [0x96, 0xD0, 0xC7, 0xA2, 0x69, 0xBD, 0xCE, 0x79] };
+pub const IID_EVENT_HANDLER_OBJECT: Guid = Guid { data1: 0xC50898F6, data2: 0xC536, data3: 0x5F47, data4: [0x85, 0x83, 0x8B, 0x2C, 0x24, 0x38, 0xA1, 0x3B] };
+pub const MEDIA_ADD_HANDLER: usize = 6;
+pub const MEDIA_REMOVE_HANDLER: usize = 7;
+pub const MEDIA_PLAY_TO_STREAM_STATE: usize = 8;
+pub const MEDIA_CASTING_APP_STATE: usize = 9;
+pub const MEDIA_VOIP_CALL_STATE: usize = 10;
+
+#[repr(C)]
+struct Handler {
+    vtbl: *const HandlerVtbl,
+    refs: AtomicU32,
+}
+
+#[repr(C)]
+struct HandlerVtbl {
+    query: unsafe extern "system" fn(*mut Handler, *const Guid, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut Handler) -> u32,
+    release: unsafe extern "system" fn(*mut Handler) -> u32,
+    invoke: unsafe extern "system" fn(*mut Handler, *mut c_void, *mut c_void) -> i32,
+}
+
+pub static HANDLER_INVOKES: AtomicU32 = AtomicU32::new(0);
+pub static HANDLER_LIVE: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn handler_query(h: *mut Handler, iid: *const Guid, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003u32 as i32;
+    }
+    if *iid == IID_IUNKNOWN || *iid == IID_EVENT_HANDLER_OBJECT {
+        handler_add_ref(h);
+        *out = h as *mut c_void;
+        0
+    } else {
+        *out = core::ptr::null_mut();
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn handler_add_ref(h: *mut Handler) -> u32 {
+    (*h).refs.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+unsafe extern "system" fn handler_release(h: *mut Handler) -> u32 {
+    let n = (*h).refs.fetch_sub(1, Ordering::SeqCst) - 1;
+    if n == 0 {
+        drop(Box::from_raw(h));
+        HANDLER_LIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+    n
+}
+
+unsafe extern "system" fn handler_invoke(_h: *mut Handler, _sender: *mut c_void, _args: *mut c_void) -> i32 {
+    HANDLER_INVOKES.fetch_add(1, Ordering::SeqCst);
+    0
+}
+
+static HANDLER_VTBL: HandlerVtbl = HandlerVtbl { query: handler_query, add_ref: handler_add_ref, release: handler_release, invoke: handler_invoke };
+
+pub struct MediaManager(usize);
+
+unsafe impl Send for MediaManager {}
+unsafe impl Sync for MediaManager {}
+
+impl Drop for MediaManager {
+    fn drop(&mut self) {
+        unsafe { release(self.0 as *mut c_void) }
+    }
+}
+
+pub fn media_manager() -> Result<MediaManager, i32> {
+    unsafe {
+        CoInitializeEx(core::ptr::null_mut(), 0);
+        let name: Vec<u16> = MEDIA_MANAGER_CLASS.encode_utf16().collect();
+        let mut h = core::ptr::null_mut();
+        let hr = WindowsCreateString(name.as_ptr(), name.len() as u32, &mut h);
+        if hr < 0 {
+            return Err(hr);
+        }
+        let mut f = core::ptr::null_mut();
+        let hr = RoGetActivationFactory(h, &IID_MEDIA_MANAGER_STATICS, &mut f);
+        WindowsDeleteString(h);
+        if hr < 0 { Err(hr) } else { Ok(MediaManager(f as usize)) }
+    }
+}
+
+impl MediaManager {
+    pub fn state_changed(&self, method: usize, value: u32) -> i32 {
+        unsafe { slot::<unsafe extern "system" fn(*mut c_void, u32) -> i32>(self.0 as *mut c_void, method)(self.0 as *mut c_void, value) }
+    }
+
+    pub fn add_handler(&self) -> Result<i64, i32> {
+        unsafe {
+            let h = Box::into_raw(Box::new(Handler { vtbl: &HANDLER_VTBL, refs: AtomicU32::new(1) }));
+            HANDLER_LIVE.fetch_add(1, Ordering::SeqCst);
+            let mut token = 0i64;
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i64) -> i32>(self.0 as *mut c_void, MEDIA_ADD_HANDLER)(self.0 as *mut c_void, h as *mut c_void, &mut token);
+            handler_release(h);
+            if hr < 0 { Err(hr) } else { Ok(token) }
+        }
+    }
+
+    pub fn remove_handler(&self, token: i64) -> i32 {
+        unsafe { slot::<unsafe extern "system" fn(*mut c_void, i64) -> i32>(self.0 as *mut c_void, MEDIA_REMOVE_HANDLER)(self.0 as *mut c_void, token) }
+    }
+}
+
 pub fn endpoint_offload(id: Option<&str>) -> Result<u32, i32> {
     let mut any = 0u32;
     for cat in 0..AUDIO_CATEGORIES {

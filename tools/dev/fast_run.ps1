@@ -15,6 +15,7 @@ param(
   [switch]$NoWaitUser,
   [string]$Seed = 'default',
   [switch]$ListScenes,
+  [switch]$Headless,
   [switch]$Fps
 )
 
@@ -331,7 +332,7 @@ try {
   $oldEnv = @{}
   foreach ($k in $envKeys) { $oldEnv[$k] = [Environment]::GetEnvironmentVariable($k) }
   Remove-Item Env:TOMBOX_ALLOW_NETWORK, Env:TOMBOX_NET_LOCAL_PORT, Env:TOMBOX_TAKEOVER_FILE, Env:TOMBOX_USER_PLAYING_FILE -ErrorAction SilentlyContinue
-  $env:TOMBOX_HEADLESS = '1'
+  if ($Headless) { $env:TOMBOX_HEADLESS = '1' } else { Remove-Item Env:TOMBOX_HEADLESS -ErrorAction SilentlyContinue }
   $env:TOMBOX_TEST_RUN = '1'
   $env:TOMBOX_HOST_PAD = '0'
   $env:TOMBOX_HOST_KBM = '0'

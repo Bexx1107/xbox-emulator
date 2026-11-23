@@ -1,6 +1,7 @@
 pub mod affinity;
 pub mod coverage;
 pub mod dlldir;
+pub mod foreign;
 pub mod fortnite_match;
 pub mod k32legacy;
 pub mod patch;
@@ -117,7 +118,7 @@ pub unsafe extern "system" fn dll_loaded(reason: u32, data: *const u8, _ctx: *mu
         return;
     }
     let path = String::from_utf16_lossy(core::slice::from_raw_parts(buf, len));
-    if !patch::is_title_module(&path, base as usize) {
+    if !patch::is_title_module(&path, base as usize) || foreign::is_host_injected(&path) {
         return;
     }
     let mut hits = Vec::new();
@@ -135,6 +136,7 @@ pub fn load_watch_active() -> bool {
 }
 
 unsafe fn watch_loads() -> bool {
+    foreign::prime();
     let p = resolve("ntdll.dll", "LdrRegisterDllNotification");
     if p.is_null() {
         return false;

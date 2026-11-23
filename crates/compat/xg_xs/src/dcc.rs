@@ -131,7 +131,12 @@ pub fn decode(count: u32, src: &[u8], meta: &[u8], dst: &mut [u8], fmt: u32, sw:
         d.w32(0x58, meta[i] as u32);
         match dec::run_block(&mut d) {
             Ok(u) => undef.push(u),
-            Err(e) => return e,
+            Err(e) => {
+                if dec::last_unmodeled() {
+                    enc::relay_g_lost();
+                }
+                return e;
+            }
         }
         dst[i * 256..i * 256 + 256].copy_from_slice(&d.b[0]);
     }
@@ -179,6 +184,9 @@ pub unsafe fn decode_export(count: u32, src: *const u8, meta: *const u8, dst: *m
         match dec::run_block(&mut d) {
             Ok(u) => undef.push(u),
             Err(e) => {
+                if dec::last_unmodeled() {
+                    enc::relay_g_lost();
+                }
                 let why = if dec::last_unmodeled() { "its remap temp holes are driver-frame locals that console code writes (unpack 0x23560 / tid 0x244d8 / seg_info 0x4af40 / the previous relayout temp) and native does not model them yet" } else { "the console faults in its color stage (integer divide or /GS)" };
                 compat_common::record(crate::M, "XGDecodeDCC", &format!("block {} meta {:#04x} format {} swizzle {}: {}; native rejects", i, m, fmt, sw, why));
                 return e;
@@ -275,9 +283,24 @@ fn unknowns(k: u64) -> [u8; 64] {
 
 pub(crate) const SAMPLES: u64 = 7;
 
-fn enc_samples(pre: &Dcc, seen: &[u8; 64], vary: u32) -> Result<Vec<(Dcc, u32)>, i32> {
+fn enc_samples(pre: &Dcc, seen: &[u8; 64], vary: u32) -> Result<(Vec<(Dcc, u32)>, enc::RelayG), i32> {
+    let g0 = enc::relay_g();
+    let mut ends = Vec::new();
+    let r = enc_samples_from(pre, seen, vary, g0, &mut ends);
+    enc::set_relay_g(g0);
+    let mut end0 = ends.first().copied().unwrap_or(g0);
+    for e in &ends[1.min(ends.len())..] {
+        for p in 0..64 {
+            end0.known[p] &= e.known[p] && e.b[p] == end0.b[p];
+        }
+    }
+    r.map(|v| (v, end0))
+}
+
+fn enc_samples_from(pre: &Dcc, seen: &[u8; 64], vary: u32, g0: enc::RelayG, ends: &mut Vec<enc::RelayG>) -> Result<Vec<(Dcc, u32)>, i32> {
     let mut runs = Vec::new();
     for k in 0..SAMPLES {
+        enc::set_relay_g(g0);
         let q = |b: u32, x: u64| if vary >> b & 1 != 0 { x } else { 7 };
         let fills = [unknowns(q(0, 3 * k)), unknowns(q(1, 3 * k + 1)), unknowns(q(2, 3 * k + 2))];
         let mut conv = match (vary >> 3 & 1 != 0, k) {
@@ -302,6 +325,7 @@ fn enc_samples(pre: &Dcc, seen: &[u8; 64], vary: u32) -> Result<Vec<(Dcc, u32)>,
             }
         }
         runs.push(enc_try(pre, &fills, &conv)?);
+        ends.push(enc::relay_g());
     }
     Ok(runs)
 }
@@ -311,16 +335,17 @@ fn enc_block(d: &mut Dcc) -> Result<(u32, bool, bool), i32> {
     let p = ENTRY.with(|c| c.get()).map(|e| e.wrapping_sub(CONV_FROM_ENTRY));
     let seen = enc::conv_seen(p);
     let vary = VARY.with(|v| v.get());
-    let mut runs = enc_samples(&pre, &seen, vary)?;
+    let (mut runs, end0) = enc_samples(&pre, &seen, vary)?;
     let agree = |r: &Vec<(Dcc, u32)>| r[1..].iter().all(|x| same(x, &r[0]));
     let defined = agree(&runs);
-    if !defined && vary & 8 != 0 && agree(&enc_samples(&pre, &seen, vary & !0xff_0007)?) {
+    if !defined && vary & 8 != 0 && agree(&enc_samples(&pre, &seen, vary & !0xff_0007)?.0) {
         ENC_UNMODELED.with(|c| c.set(true));
         return Err(E_INVALIDARG);
     }
     let carried = runs[1..].iter().all(|r| r.0.m == runs[0].0.m && r.0.b == runs[0].0.b);
     let (t, s) = runs.swap_remove(0);
     *d = t;
+    enc::set_relay_g(end0);
     Ok((s, !defined, !carried))
 }
 
@@ -351,7 +376,12 @@ pub fn encode(count: u32, src: &[u8], dst: &mut [u8], meta: &mut [u8], mut sizes
                 taint |= c;
                 s
             }
-            Err(e) => return e,
+            Err(e) => {
+                if last_enc_unmodeled() {
+                    enc::relay_g_lost();
+                }
+                return e;
+            }
         };
         if let Some(s) = sizes.as_deref_mut() {
             s[i] = size;
@@ -387,6 +417,9 @@ pub unsafe fn encode_export(count: u32, src: *const u8, dst: *mut u8, meta: *mut
                 s
             }
             Err(e) => {
+                if last_enc_unmodeled() {
+                    enc::relay_g_lost();
+                }
                 let why = if last_enc_unmodeled() { "its output depends on relayout entry locals (channel/colour locals, caller-frame bytes) whose console writers native does not model yet" } else { "the console faults in its colour stage (integer divide or /GS) for some or all contents of its uninitialised stack scratch" };
                 compat_common::record(crate::M, "XGEncodeDCC", &format!("block {} format {} swizzle {} dim {} params {:#x},{:#x}: {}; native rejects", i, fmt, sw, dim, p0, p1, why));
                 return e;

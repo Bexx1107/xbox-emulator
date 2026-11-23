@@ -477,6 +477,9 @@ pub unsafe fn nsi_get_all_parameters(_store: u32, module: *const u8, object: u32
         return ERROR_INVALID_PARAMETER;
     }
     let id = core::slice::from_raw_parts(module, NPI_MS_TEREDO_MODULEID.len());
+    if id == iphlp::NPI_MS_IPV4_MODULEID || id == iphlp::NPI_MS_IPV6_MODULEID {
+        return iphlp::nsi_get_interface_rw(id, object, key, key_len, rw, rw_len, rod, rod_len, ros, ros_len);
+    }
     if id != NPI_MS_TEREDO_MODULEID {
         return ERROR_NOT_FOUND;
     }

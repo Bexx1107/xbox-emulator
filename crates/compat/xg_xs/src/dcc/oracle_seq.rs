@@ -1016,8 +1016,9 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
     let n: u64 = std::env::var("TOMBOX_DCC_INV_N").ok().and_then(|x| x.parse().ok()).unwrap_or(3000);
     let (nd, ne) = natives();
     let (cd, ce) = (o.f("XGDecodeDCC") as usize, o.f("XGEncodeDCC") as usize);
-    let (_rh, rd, re) = relocated_copy();
+    let (rh, rd, re) = relocated_copy();
     arm_veh(o.h);
+    let gp: Option<[*mut [u8; 64]; 2]> = crate::dcc_oracle::console_relay_g(&o).map(|p| [p, (rh + 0x80bf0) as *mut [u8; 64]]);
     let (mut acc, mut runs, mut bad) = (0usize, 0usize, Vec::new());
     let (mut defined, mut undef_varied, mut undef_stable, mut unmodeled) = (0usize, 0usize, 0usize, Vec::new());
     let mut undef_ids = Vec::new();
@@ -1031,6 +1032,7 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
         if std::env::var("TOMBOX_DCC_UNDEF_WHY").is_ok() {
             println!("undef-why case {id}");
         }
+        let g = crate::dcc_oracle::sync_relay_g(&o);
         let (nat, u) = native_masked(nd, ne, &c);
         if nat.hr != 0 {
             if if c.enc { crate::dcc::last_enc_unmodeled() } else { crate::dcc::dec::last_unmodeled() } {
@@ -1042,6 +1044,12 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
         CUR_ID.store(id as usize, std::sync::atomic::Ordering::SeqCst);
         let mut seen: Vec<Out> = Vec::new();
         for v in 0..10usize {
+            if let (Some(gp), Some(g)) = (gp, g) {
+                unsafe {
+                    *gp[0] = g;
+                    *gp[1] = g;
+                }
+            }
             let r = match v {
                 5 => perturbed_call(rd, re, &c, 0),
                 6 | 7 => with_xmem_hook(v, || perturbed_call(cd, ce, &c, 0)),

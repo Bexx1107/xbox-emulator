@@ -102,6 +102,15 @@ pub fn near(va: u64, n: usize) -> Vec<Entry> {
     })
 }
 
+pub fn lookup_buffer(va: u64) -> Option<(Entry, u64)> {
+    with(|t| {
+        t.ranges.iter()
+            .filter_map(|m| m.range(..=va).next_back().map(|(_, e)| *e).filter(|e| e.buffer && va < e.start.saturating_add(e.len)))
+            .min_by_key(|e| e.len)
+            .map(|e| crate::placed_offset::true_entry(e, va))
+    })
+}
+
 pub fn lookup_gpu(va: u64) -> Option<(Entry, u64)> {
     with(|t| find_in(&t.ranges, va))
 }
@@ -366,6 +375,16 @@ mod tests {
         assert_eq!(lookup(0x1_0000_0800), None);
         assert_eq!(lookup(0x1_0000_2050).map(|(e, _)| e.res), Some(3));
         assert_eq!(lookup(0x1_0000_2f00), None);
+    }
+
+    #[test]
+    fn buffer_lookup_sees_through_a_texture_registered_inside_a_buffer_range() {
+        let base = 0x5_0800_0000u64;
+        insert(Entry { start: base, len: 0x600_0000, res: 0x30, buffer: true });
+        insert(Entry { start: base + 0x544_0000, len: 0x2_0000, res: 0x31, buffer: false });
+        assert_eq!(lookup(base + 0x544_c9c0).map(|(e, _)| e.res), Some(0x31));
+        assert_eq!(lookup_buffer(base + 0x544_c9c0).map(|(e, o)| (e.res, o)), Some((0x30, 0x544_c9c0)));
+        assert_eq!(lookup_buffer(base + 0x600_0000), None);
     }
 
     #[test]

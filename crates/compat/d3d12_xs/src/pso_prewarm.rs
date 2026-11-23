@@ -656,7 +656,7 @@ pub fn start(real: *mut c_void, wrapper: *mut c_void, lib_ident: &str, dir: &std
     }
     let t0 = std::time::Instant::now();
     let id = ident(lib_ident);
-    let path = dir.join("pso_prewarm.bin");
+    let path = dir.join(crate::pso_lib::cache_file("pso_prewarm", crate::pso_lib::mode_tag()));
     let _ = FILE.set((path.clone(), id.clone()));
     let file = std::fs::read(&path).ok();
     let mut why = None;
@@ -707,7 +707,7 @@ pub fn start(real: *mut c_void, wrapper: *mut c_void, lib_ident: &str, dir: &std
     if PW.set(pw).is_err() {
         return;
     }
-    let workers = if n == 0 { 0 } else { (std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4) / 4).clamp(1, 4).min(n) };
+    let workers = crate::pso_xrec::workers_for(n, std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4));
     record("d3d12_xs", "pso_prewarm", &format!(
         "{} with {n} PSO records ({invalid} dropped: key no longer matches) read in {:.0} ms{}; {workers} BELOW_NORMAL workers build them in first-use order; unclaimed ones are released {IDLE_RELEASE_SECS} s after the last claim; TOMBOX_PSO_PREWARM_LIB=0 disables",
         path.display(), t0.elapsed().as_secs_f64() * 1000.0, why.map(|w| format!(" (old records dropped: {w})")).unwrap_or_default()));

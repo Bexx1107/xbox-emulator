@@ -501,3 +501,71 @@ pub fn nsi_interface_rw(module: &[u8; 24], luid: u64) -> Option<Vec<u8>> {
 pub fn nsi_reset() {
     NSI_ROWS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
+
+pub const SIO_ADDRESS_LIST_QUERY: u32 = 0x4800_0016;
+pub const SIO_ADDRESS_LIST_CHANGE: u32 = 0x2800_0017;
+pub const SIO_ROUTING_INTERFACE_QUERY: u32 = 0xC800_0014;
+pub const SIO_ROUTING_INTERFACE_CHANGE: u32 = 0x8800_0015;
+
+pub fn local_addresses(family: u32) -> Vec<(IpAddr, u32)> {
+    adapters().into_iter().filter(|a| a.if_type != IF_TYPE_SOFTWARE_LOOPBACK).flat_map(|a| a.unicast.into_iter().map(move |u| (u.addr, scope_of(&u.addr, a.if_index)))).filter(|(ip, _)| family_matches(family, ip)).collect()
+}
+
+pub fn address_list_size(family: u32) -> usize {
+    let a = local_addresses(family);
+    8 + 16 * a.len() + a.iter().map(|(ip, _)| if ip.is_ipv4() { 16 } else { 28 }).sum::<usize>()
+}
+
+pub unsafe fn write_address_list(family: u32, out: *mut u8, out_len: usize) -> Result<usize, usize> {
+    let need = address_list_size(family);
+    if out.is_null() || out_len < need {
+        return Err(need);
+    }
+    let a = local_addresses(family);
+    core::ptr::write_bytes(out, 0, need);
+    core::ptr::write_unaligned(out as *mut i32, a.len() as i32);
+    let mut tail = 8 + 16 * a.len();
+    for (i, (ip, sc)) in a.iter().enumerate() {
+        let b = sockaddr_bytes(ip, 0, *sc);
+        core::ptr::copy_nonoverlapping(b.as_ptr(), out.add(tail), b.len());
+        core::ptr::write_unaligned(out.add(8 + 16 * i) as *mut usize, out.add(tail) as usize);
+        core::ptr::write_unaligned(out.add(16 + 16 * i) as *mut i32, b.len() as i32);
+        tail += b.len();
+    }
+    Ok(need)
+}
+
+pub fn routing_interface(dest: &IpAddr) -> Option<Vec<u8>> {
+    let src = source_for(dest)?;
+    let r = best_route(dest)?;
+    Some(sockaddr_bytes(&src, 0, scope_of(&src, r.if_index)))
+}
+
+pub const ERROR_NOT_SUPPORTED: u32 = 50;
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn nsi_get_interface_rw(module: &[u8], object: u32, key: *const u8, key_len: u32, rw: *mut u8, rw_len: u32, rod: *mut u8, rod_len: u32, ros: *mut u8, ros_len: u32) -> u32 {
+    if object != NL_INTERFACE_OBJECT {
+        return ERROR_NOT_FOUND;
+    }
+    if key.is_null() || key_len != 8 || (rw.is_null() && rw_len != 0) || (!rw.is_null() && rw_len as usize != NL_INTERFACE_RW_SIZE) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if !rod.is_null() || rod_len != 0 || !ros.is_null() || ros_len != 0 {
+        return ERROR_NOT_SUPPORTED;
+    }
+    let m: [u8; 24] = module.try_into().unwrap_or([0; 24]);
+    let luid = core::ptr::read_unaligned(key as *const u64);
+    if !adapters().iter().any(|a| a.luid == luid) {
+        return ERROR_NOT_FOUND;
+    }
+    match nsi_interface_rw(&m, luid) {
+        Some(row) => {
+            if !rw.is_null() {
+                core::ptr::copy_nonoverlapping(row.as_ptr(), rw, NL_INTERFACE_RW_SIZE);
+            }
+            ERROR_SUCCESS
+        }
+        None => ERROR_NOT_FOUND,
+    }
+}

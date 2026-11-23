@@ -32,6 +32,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 mod ext;
+mod ioctl;
 
 extern "system" {
     fn GetModuleHandleA(name: *const u8) -> *mut c_void;
@@ -614,6 +615,7 @@ unsafe extern "system" fn h_wsaaccept(s: usize, addr: *mut u8, len: *mut i32, co
 }
 
 unsafe extern "system" fn h_closesocket(s: usize) -> i32 {
+    ioctl::socket_closing(s);
     crate::netview::sockets::forget(s as u64);
     PENDING_ACCEPTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, a)| *a != s);
     orig!(H_CLOSESOCKET, fn(usize) -> i32)(s)
@@ -711,86 +713,9 @@ fn wrap_extension(guid: &[u8; 16], real: usize) -> usize {
     }
 }
 
-const WSAEFAULT: u32 = 10014;
-const WSAEINVAL: u32 = 10022;
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn SetEvent(h: *mut c_void) -> i32;
-    fn QueueUserAPC(f: unsafe extern "system" fn(usize), thread: *mut c_void, data: usize) -> u32;
-    fn GetCurrentThread() -> *mut c_void;
-    fn DuplicateHandle(sp: *mut c_void, s: *mut c_void, tp: *mut c_void, t: *mut *mut c_void, access: u32, inherit: i32, options: u32) -> u32;
-    fn CloseHandle(h: *mut c_void) -> i32;
-}
-
-type WsaCompletion = unsafe extern "system" fn(u32, u32, *mut c_void, u32);
-
-struct SortApc {
-    cr: WsaCompletion,
-    bytes: u32,
-    ov: *mut c_void,
-    thread: *mut c_void,
-}
-
-unsafe extern "system" fn sort_apc(data: usize) {
-    let a = Box::from_raw(data as *mut SortApc);
-    (a.cr)(0, a.bytes, a.ov, 0);
-    CloseHandle(a.thread);
-}
-
-pub unsafe fn emulated_address_list_sort(input: *const c_void, in_len: u32, out: *mut c_void, out_len: u32, ret: *mut u32, ov: *mut c_void, cr: *mut c_void) -> i32 {
-    if input.is_null() || out.is_null() || (in_len as usize) < 4 {
-        SetLastError(WSAEINVAL);
-        return -1;
-    }
-    let n = core::ptr::read_unaligned(input as *const i32);
-    let need = if n < 0 { usize::MAX } else { 8 + 16 * n as usize };
-    if (in_len as usize) < need {
-        SetLastError(WSAEINVAL);
-        return -1;
-    }
-    if (out_len as usize) < need {
-        SetLastError(WSAEFAULT);
-        return -1;
-    }
-    if input as usize != out as usize {
-        core::ptr::copy(input as *const u8, out as *mut u8, need);
-    }
-    let bytes = match crate::netview::iphlp::address_list_sort(out as *mut u8, out_len) {
-        Ok(b) => b,
-        Err(_) => {
-            SetLastError(WSAEINVAL);
-            return -1;
-        }
-    };
-    if !ret.is_null() {
-        *ret = bytes;
-    }
-    if !ov.is_null() {
-        let o = ov as *mut usize;
-        *o = 0;
-        *o.add(1) = bytes as usize;
-        let ev = *o.add(3);
-        if cr.is_null() && ev != 0 && ev & 1 == 0 {
-            SetEvent(ev as *mut c_void);
-        }
-    }
-    if !cr.is_null() {
-        let mut t: *mut c_void = core::ptr::null_mut();
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &mut t, 0, 0, 2);
-        let a = Box::into_raw(Box::new(SortApc { cr: core::mem::transmute::<*mut c_void, WsaCompletion>(cr), bytes, ov, thread: t }));
-        if QueueUserAPC(sort_apc, t, a as usize) == 0 {
-            drop(Box::from_raw(a));
-            CloseHandle(t);
-        }
-    }
-    SetLastError(0);
-    0
-}
-
 unsafe extern "system" fn h_wsaioctl(s: usize, code: u32, input: *const c_void, in_len: u32, out: *mut c_void, out_len: u32, ret: *mut u32, ov: *mut c_void, cr: *mut c_void) -> i32 {
-    if code == crate::netview::iphlp::SIO_ADDRESS_LIST_SORT {
-        return emulated_address_list_sort(input, in_len, out, out_len, ret, ov, cr);
+    if let Some(r) = ioctl::handle_ioctl(s, code, input, in_len, out, out_len, ret, ov, cr) {
+        return r;
     }
     let r = orig!(H_WSAIOCTL, fn(usize, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *mut c_void) -> i32)(s, code, input, in_len, out, out_len, ret, ov, cr);
     if r == 0 && code == SIO_GET_EXTENSION_FUNCTION_POINTER && !input.is_null() && in_len as usize >= 16 && !out.is_null() && out_len as usize >= core::mem::size_of::<usize>() {
@@ -798,7 +723,14 @@ unsafe extern "system" fn h_wsaioctl(s: usize, code: u32, input: *const c_void, 
         let real = core::ptr::read_unaligned(out as *const usize);
         core::ptr::write_unaligned(out as *mut usize, wrap_extension(&guid, real));
     }
+    if r == 0 {
+        ext::guard_extension_out(code, input as *const u8, in_len, out as *mut u8, out_len);
+    }
     r
+}
+
+pub(crate) fn wsaioctl_shared() -> bool {
+    ORIG[H_WSAIOCTL].load(Ordering::SeqCst) != 0
 }
 
 unsafe extern "system" fn h_setsockopt(s: usize, level: i32, name: i32, val: *const u8, len: i32) -> i32 {
@@ -853,8 +785,11 @@ fn install_socket_table_hooks() -> (usize, Vec<String>) {
 }
 
 fn socket_table_note() -> String {
-    let (hooked, missing) = install_socket_table_hooks();
-    format!("; socket table: {hooked}/{SOCKET_TABLE_HOOKS} hooked{}", if missing.is_empty() { String::new() } else { format!(" (not patched: {})", missing.join(", ")) })
+    let (mut hooked, mut missing) = install_socket_table_hooks();
+    let (ih, im) = ioctl::install();
+    hooked += ih;
+    missing.extend(im);
+    format!("; socket table: {hooked}/{} hooked{}", SOCKET_TABLE_HOOKS + ioctl::HOOKS, if missing.is_empty() { String::new() } else { format!(" (not patched: {})", missing.join(", ")) })
 }
 
 unsafe extern "system" fn h_wsaconnect(s: usize, name: *const u8, len: i32, a: *mut c_void, b: *mut c_void, c: *mut c_void, d: *mut c_void) -> i32 {
@@ -1662,7 +1597,9 @@ mod socket_table_tests {
             let port = l.local_addr().unwrap().port();
             let s = socket(2, 1, 6);
             assert_eq!(h_bind(s, loopback_any().as_ptr(), 16), 0);
-            let p = extension(s, &WSAID_CONNECTEX);
+            let outer = extension(s, &WSAID_CONNECTEX);
+            assert_ne!(outer, w_connectex as *const () as usize);
+            let p = ext::guarded_inner(outer).expect("ConnectEx pointer guarded by ext");
             assert_eq!(p, w_connectex as *const () as usize);
             let transmit = [0xf0, 0x7d, 0x36, 0xb5, 0xac, 0xcb, 0xcf, 0x11, 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92];
             let mut real = 0usize;
@@ -1777,7 +1714,7 @@ mod socket_table_tests {
             assert_eq!(usize::from_le_bytes(out[24..32].try_into().unwrap()), root4.as_ptr() as usize);
             let r = h_wsaioctl(s, crate::netview::iphlp::SIO_ADDRESS_LIST_SORT, list.as_ptr() as *const c_void, 40, out.as_mut_ptr() as *mut c_void, 20, &mut got, core::ptr::null_mut(), core::ptr::null_mut());
             assert_eq!(r, -1);
-            assert_eq!(GetLastError(), WSAEFAULT);
+            assert_eq!(GetLastError(), ioctl::WSAEFAULT);
             let ev = CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null());
             let mut ov = [0usize; 4];
             ov[3] = ev as usize;
@@ -1788,5 +1725,176 @@ mod socket_table_tests {
             assert_eq!(usize::from_le_bytes(list[8..16].try_into().unwrap()), lo6.as_ptr() as usize);
             assert_eq!(h_closesocket(s), 0);
         }
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetQueuedCompletionStatus(port: usize, bytes: *mut u32, key: *mut usize, ov: *mut *mut c_void, ms: u32) -> i32;
+        fn SleepEx(ms: u32, alertable: i32) -> u32;
+        fn CloseHandle(h: *mut c_void) -> i32;
+    }
+
+    fn arm_all() -> std::sync::MutexGuard<'static, ()> {
+        let g = arm();
+        ioctl::arm_for_tests();
+        g
+    }
+
+    unsafe fn ioctl_call(s: usize, code: u32, input: &[u8], out: &mut [u8], ov: *mut c_void) -> (i32, u32, u32) {
+        let mut got = 0u32;
+        let r = h_wsaioctl(s, code, if input.is_empty() { core::ptr::null() } else { input.as_ptr() as *const c_void }, input.len() as u32, if out.is_empty() { core::ptr::null_mut() } else { out.as_mut_ptr() as *mut c_void }, out.len() as u32, &mut got, ov, core::ptr::null_mut());
+        (r, got, if r == 0 { 0 } else { GetLastError() })
+    }
+
+    #[test]
+    fn address_and_routing_queries_come_from_the_view() {
+        use crate::netview::iphlp::{SIO_ADDRESS_LIST_QUERY, SIO_ROUTING_INTERFACE_QUERY};
+        let _g = arm_all();
+        unsafe {
+            let s4 = socket(2, 2, 0);
+            let (r, need, e) = ioctl_call(s4, SIO_ADDRESS_LIST_QUERY, &[], &mut [0u8; 4], core::ptr::null_mut());
+            assert_eq!((r, e), (-1, ioctl::WSAEFAULT));
+            assert_eq!(need, 8 + 16 + 16);
+            let mut out = vec![0u8; need as usize];
+            let (r, got, _) = ioctl_call(s4, SIO_ADDRESS_LIST_QUERY, &[], &mut out, core::ptr::null_mut());
+            assert_eq!((r, got), (0, need));
+            assert_eq!(i32::from_le_bytes(out[0..4].try_into().unwrap()), 1);
+            let p = usize::from_le_bytes(out[8..16].try_into().unwrap());
+            assert_eq!(p, out.as_ptr() as usize + 24);
+            assert_eq!(&out[24 + 4..24 + 8], &[169, 254, 66, 1]);
+            let s6 = socket(23, 2, 0);
+            let mut out6 = vec![0u8; 256];
+            let (r, got, _) = ioctl_call(s6, SIO_ADDRESS_LIST_QUERY, &[], &mut out6, core::ptr::null_mut());
+            assert_eq!((r, got), (0, 8 + 16 + 28));
+            assert_eq!(&out6[24 + 8..24 + 24], &crate::netview::NIC_IPV6.octets());
+            assert_eq!(u32::from_le_bytes(out6[24 + 24..24 + 28].try_into().unwrap()), crate::netview::NIC_IF_INDEX);
+            let mut o = [0u8; 16];
+            let (r, got, _) = ioctl_call(s4, SIO_ROUTING_INTERFACE_QUERY, &sin([169, 254, 9, 9], 80), &mut o, core::ptr::null_mut());
+            assert_eq!((r, got), (0, 16));
+            assert_eq!(&o[4..8], &[169, 254, 66, 1]);
+            let (r, got, _) = ioctl_call(s4, SIO_ROUTING_INTERFACE_QUERY, &sin([127, 0, 0, 1], 80), &mut o, core::ptr::null_mut());
+            assert_eq!((r, got), (0, 16));
+            assert_eq!(&o[4..8], &[127, 0, 0, 1]);
+            let (r, _, e) = ioctl_call(s4, SIO_ROUTING_INTERFACE_QUERY, &sin([8, 8, 8, 8], 53), &mut o, core::ptr::null_mut());
+            assert_eq!((r, e), (-1, ioctl::WSAENETUNREACH));
+            let (r, need, e) = ioctl_call(s4, SIO_ROUTING_INTERFACE_QUERY, &sin([127, 0, 0, 1], 80), &mut [0u8; 8], core::ptr::null_mut());
+            assert_eq!((r, need, e), (-1, 16, ioctl::WSAEFAULT));
+            assert_eq!(h_closesocket(s4), 0);
+            assert_eq!(h_closesocket(s6), 0);
+        }
+    }
+
+    #[test]
+    fn change_notifications_pend_until_close_and_complete_cancelled() {
+        use crate::netview::iphlp::{SIO_ADDRESS_LIST_CHANGE, SIO_ROUTING_INTERFACE_CHANGE};
+        let _g = arm_all();
+        unsafe {
+            let s = socket(2, 2, 0);
+            let ev = CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null());
+            let mut ov = [0usize; 4];
+            ov[3] = ev as usize;
+            let (r, _, e) = ioctl_call(s, SIO_ADDRESS_LIST_CHANGE, &[], &mut [], ov.as_mut_ptr() as *mut c_void);
+            assert_eq!((r, e), (-1, ioctl::WSA_IO_PENDING));
+            assert_eq!(ov[0], ioctl::STATUS_PENDING);
+            assert_eq!(WaitForSingleObject(ev, 50), 0x102);
+            assert_eq!(ioctl::pending_count(s), 1);
+            let mut nb = 1u32;
+            assert_eq!(ioctl::test_ioctlsocket(s, ioctl::FIONBIO, &mut nb), 0);
+            let (r, _, e) = ioctl_call(s, SIO_ROUTING_INTERFACE_CHANGE, &[], &mut [], core::ptr::null_mut());
+            assert_eq!((r, e), (-1, ioctl::WSAEWOULDBLOCK));
+            assert_eq!(h_closesocket(s), 0);
+            assert_eq!(WaitForSingleObject(ev, 0), 0);
+            assert_eq!(ov[0], ioctl::STATUS_CANCELLED);
+            assert_eq!(ioctl::pending_count(s), 0);
+            let b = socket(2, 2, 0);
+            let t = std::thread::spawn(move || {
+                let r = h_wsaioctl(b, SIO_ADDRESS_LIST_CHANGE, core::ptr::null(), 0, core::ptr::null_mut(), 0, &mut 0u32, core::ptr::null_mut(), core::ptr::null_mut());
+                (r, GetLastError())
+            });
+            let mut spins = 0;
+            while ioctl::pending_count(b) == 0 && spins < 500 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                spins += 1;
+            }
+            assert_eq!(ioctl::pending_count(b), 1);
+            assert_eq!(h_closesocket(b), 0);
+            assert_eq!(t.join().unwrap(), (-1, ioctl::WSAEINTR));
+        }
+    }
+
+    static APC_SEEN: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "system" fn record_apc(err: u32, bytes: u32, _ov: *mut c_void, _flags: u32) {
+        APC_SEEN.lock().unwrap().push((err, bytes));
+    }
+
+    #[test]
+    fn overlapped_queries_post_to_bound_completion_ports_and_routines() {
+        use crate::netview::iphlp::{SIO_ADDRESS_LIST_CHANGE, SIO_ADDRESS_LIST_SORT};
+        let _g = arm_all();
+        unsafe {
+            let s = socket(23, 2, 0);
+            let port = ioctl::test_create_iocp(s, 0, 0x77, 0);
+            assert_ne!(port, 0);
+            let lo6 = {
+                let mut b = [0u8; 28];
+                b[0] = 0x17;
+                b[8 + 15] = 1;
+                b
+            };
+            let mut list = [0u8; 24];
+            list[0] = 1;
+            list[8..16].copy_from_slice(&(lo6.as_ptr() as usize).to_le_bytes());
+            list[16] = 28;
+            let mut out = [0u8; 24];
+            let mut ov = [0usize; 4];
+            let mut got = 0u32;
+            assert_eq!(h_wsaioctl(s, SIO_ADDRESS_LIST_SORT, list.as_ptr() as *const c_void, 24, out.as_mut_ptr() as *mut c_void, 24, &mut got, ov.as_mut_ptr() as *mut c_void, core::ptr::null_mut()), 0);
+            let (mut bytes, mut key, mut po) = (0u32, 0usize, core::ptr::null_mut());
+            assert_ne!(GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut po, 0), 0);
+            assert_eq!((bytes, key, po as usize), (24, 0x77, ov.as_ptr() as usize));
+            assert_eq!(ioctl::test_set_fcnm(s, ioctl::FILE_SKIP_COMPLETION_PORT_ON_SUCCESS), 1);
+            assert_eq!(h_wsaioctl(s, SIO_ADDRESS_LIST_SORT, list.as_ptr() as *const c_void, 24, out.as_mut_ptr() as *mut c_void, 24, &mut got, ov.as_mut_ptr() as *mut c_void, core::ptr::null_mut()), 0);
+            assert_eq!(GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut po, 0), 0);
+            let mut ov2 = [0usize; 4];
+            assert_eq!(h_wsaioctl(s, SIO_ADDRESS_LIST_CHANGE, core::ptr::null(), 0, core::ptr::null_mut(), 0, &mut got, ov2.as_mut_ptr() as *mut c_void, core::ptr::null_mut()), -1);
+            assert_eq!(GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut po, 0), 0);
+            assert_eq!(h_closesocket(s), 0);
+            assert_eq!(GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut po, 0), 0);
+            assert_eq!(GetLastError(), ioctl::WSA_OPERATION_ABORTED);
+            assert_eq!(po as usize, ov2.as_ptr() as usize);
+            let s2 = socket(23, 2, 0);
+            let mut ov3 = [0usize; 4];
+            APC_SEEN.lock().unwrap().clear();
+            assert_eq!(h_wsaioctl(s2, SIO_ADDRESS_LIST_SORT, list.as_ptr() as *const c_void, 24, out.as_mut_ptr() as *mut c_void, 24, &mut got, ov3.as_mut_ptr() as *mut c_void, record_apc as *mut c_void), 0);
+            assert_eq!(h_wsaioctl(s2, SIO_ADDRESS_LIST_CHANGE, core::ptr::null(), 0, core::ptr::null_mut(), 0, &mut got, ov3.as_mut_ptr() as *mut c_void, record_apc as *mut c_void), -1);
+            assert_eq!(h_closesocket(s2), 0);
+            SleepEx(0, 1);
+            assert_eq!(*APC_SEEN.lock().unwrap(), vec![(0, 24), (ioctl::WSA_OPERATION_ABORTED, 0)]);
+            CloseHandle(port as *mut c_void);
+        }
+    }
+
+    #[test]
+    fn completion_port_bindings_are_recorded_for_sockets_only() {
+        use std::os::windows::io::AsRawHandle;
+        let _g = arm_all();
+        let path = std::env::temp_dir().join(format!("tombox_iocp_{}.bin", std::process::id()));
+        let f = { use std::os::windows::fs::OpenOptionsExt; std::fs::OpenOptions::new().write(true).create(true).truncate(true).custom_flags(0x4000_0000).open(&path).unwrap() };
+        let h = f.as_raw_handle() as usize;
+        unsafe {
+            let port = ioctl::test_create_iocp(h, 0, 0x55, 0);
+            assert_ne!(port, 0);
+            assert!(!ioctl::is_bound(h));
+            let s = socket(2, 2, 0);
+            assert!(!ioctl::is_bound(s));
+            assert_eq!(ioctl::test_create_iocp(s, port, 0x66, 0), port);
+            assert!(ioctl::is_bound(s));
+            assert_eq!(h_closesocket(s), 0);
+            assert!(!ioctl::is_bound(s));
+            CloseHandle(port as *mut c_void);
+        }
+        drop(f);
+        let _ = std::fs::remove_file(&path);
     }
 }

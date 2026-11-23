@@ -122,9 +122,24 @@ pub fn exit_code(hr: Option<i32>) -> u32 {
     hr.filter(|h| is_removal(*h)).map_or(0x887A_0006, |h| h as u32)
 }
 
+#[cfg(test)]
+static TEST_EXIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn schedule_exit(hr: Option<i32>) {
     let Some(ms) = exit_delay_ms(std::env::var("TOMBOX_REMOVED_EXIT_MS").ok().as_deref()) else { return };
     let code = exit_code(hr);
+    #[cfg(test)]
+    {
+        let _ = ms;
+        TEST_EXIT.store(code, Ordering::Release);
+        record(M, "dred.removed", &format!("test build: would exit with code {code:#010x}; the test process keeps running"));
+    }
+    #[cfg(not(test))]
+    exit_after(ms, code);
+}
+
+#[cfg(not(test))]
+fn exit_after(ms: u64, code: u32) {
     let log = std::env::var("TOMBOX_LOG").unwrap_or_else(|_| "tombox_compat.log".into());
     record(M, "dred.removed", &format!("the GPU device is lost ({}); the process exits with code {code:#010x} in {ms} ms instead of letting the title run on a dead device. DRED summary: dred.* lines in {log}; hang captures in {}", removed_reason_name(code as i32), crate::hang_cap::dump_dir().display()));
     let _ = std::thread::Builder::new().name("tombox-removed-exit".into()).spawn(move || {
@@ -660,8 +675,11 @@ mod tests {
 
     #[test]
     fn report_is_one_shot_and_needs_an_armed_device() {
-        let _ = report_once("test", None);
+        let first = report_once("test", None);
         assert!(!report_once("test", None));
+        if first {
+            assert_eq!(TEST_EXIT.load(Ordering::Acquire), 0x887A_0006, "a report arms the exit, which a test build records instead of exiting");
+        }
     }
 
     #[test]

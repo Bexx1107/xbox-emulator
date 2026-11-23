@@ -231,7 +231,11 @@ fn translate_uncached(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInter
 }
 
 pub(crate) fn translate_edited(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: &dyn Fn(&str) -> Result<String, String>) -> Result<Vec<u8>, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| translate_uncached_with(blob, hash, rtfmt, &InputInterp::default(), Some(edit), None))).unwrap_or_else(|_| Err("translator panicked".to_string()))
+    translate_edited_linked(blob, hash, rtfmt, &InputInterp::default(), edit)
+}
+
+pub(crate) fn translate_edited_linked(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, edit: &dyn Fn(&str) -> Result<String, String>) -> Result<Vec<u8>, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| translate_uncached_with(blob, hash, rtfmt, link, Some(edit), None))).unwrap_or_else(|_| Err("translator panicked".to_string()))
 }
 
 pub(crate) struct RtSrc {

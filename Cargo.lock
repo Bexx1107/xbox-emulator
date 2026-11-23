@@ -398,6 +398,8 @@ version = "0.1.0"
 name = "netprofmsvc_c"
 version = "0.1.0"
 dependencies = [
+ "compat-common",
+ "console-sandbox",
  "xone-exports",
 ]
 
