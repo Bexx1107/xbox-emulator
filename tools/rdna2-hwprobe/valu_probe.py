@@ -110,11 +110,11 @@ def fma16_input(k):
     for i in range(N):
         a, b, c = rnd16(rnd), rnd16(rnd), rnd16(rnd)
         mode = i % 4
-        if mode == 0:      # a*b + c cancels to the rounding residual of a*b
+        if mode == 0:
             c = rne16(h2q(a) * h2q(b)) ^ 0x8000
-        elif mode == 1:    # a*K + c cancels
+        elif mode == 1:
             c = rne16(h2q(a) * kq) ^ 0x8000
-        elif mode == 2:    # a*b + K cancels
+        elif mode == 2:
             b = rne16(-kq / h2q(a))
         out += struct.pack('<4I', 0xabcd0000 | a, 0x12340000 | b, 0x56780000 | c, 0)
     return bytes(out)
@@ -123,9 +123,9 @@ A32 = 0x89abcdef
 A64 = 0x89abcdef01234567
 def sbfe_cases():
     c32 = [(o, w, 0) for o in (0, 4, 31) for w in (0, 1, 28, 31, 32, 33, 63, 64, 65, 96, 127)]
-    c32 += [(4, 8, 1), (4, 40, 1), (36, 8, 0), (36, 40, 0)]            # junk bits / offset bit 5
+    c32 += [(4, 8, 1), (4, 40, 1), (36, 8, 0), (36, 40, 0)]
     c64 = [(o, w, 0) for o in (0, 4, 40, 63) for w in (0, 1, 31, 32, 33, 63, 64, 65, 127)]
-    c64 += [(4, 8, 1), (4, 72, 1), (68, 8, 0)]                          # junk bits / offset bit 6
+    c64 += [(4, 8, 1), (4, 72, 1), (68, 8, 0)]
     return c32, c64
 
 def s1(o, w, junk):

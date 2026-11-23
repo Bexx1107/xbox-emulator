@@ -81,27 +81,27 @@ pub fn from_xinput(g: &XinputGamepad) -> PadState {
 }
 
 pub const KEY_BUTTONS: [(i32, u32); 14] = [
-    (0x20, BTN_A),          // Space
-    (0x08, BTN_B),          // Backspace
+    (0x20, BTN_A),
+    (0x08, BTN_B),
     (b'E' as i32, BTN_X),
     (b'R' as i32, BTN_Y),
     (b'Q' as i32, BTN_LB),
     (b'F' as i32, BTN_RB),
-    (0xA0, BTN_LS),         // Left Shift
+    (0xA0, BTN_LS),
     (b'C' as i32, BTN_RS),
     (b'I' as i32, BTN_UP),
     (b'K' as i32, BTN_DOWN),
     (b'J' as i32, BTN_LEFT),
     (b'L' as i32, BTN_RIGHT),
-    (0x1B, BTN_MENU),       // Esc
-    (0x09, BTN_VIEW),       // Tab
+    (0x1B, BTN_MENU),
+    (0x09, BTN_VIEW),
 ];
 
 pub const KEY_TRIGGERS: [(i32, usize); 4] = [
     (b'Z' as i32, AX_LT),
     (b'X' as i32, AX_RT),
-    (0x02, AX_LT), // right mouse button
-    (0x01, AX_RT), // left mouse button
+    (0x02, AX_LT),
+    (0x01, AX_RT),
 ];
 
 pub const KEY_STICKS: [([i32; 4], usize, usize); 2] = [
