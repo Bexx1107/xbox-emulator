@@ -492,9 +492,28 @@ pub fn layout_from(o: &crate::title_offsets::Offsets, stamp: u32) -> Result<Layo
     Ok(Layout { source: o.source.clone(), xasync: o.require(&XASYNC_NAMES)?, xuser: o.require(&XUSER_NAMES)?, xstore: o.require(&crate::gdk_store::XSTORE_NAMES)? })
 }
 
+pub const JUMP_BYTES: usize = 12;
+
+pub fn layout_from_symbols(t: &crate::title_symbols::Table) -> Result<Layout, String> {
+    let rvas = |names: &[&str], patched: bool| -> Result<Vec<usize>, String> {
+        let syms = t.require(names)?;
+        if patched {
+            if let Some((n, s)) = names.iter().zip(&syms).find(|(_, s)| s.size < JUMP_BYTES) {
+                return Err(format!("{n} is only {} bytes, too short for a {JUMP_BYTES}-byte jump", s.size));
+            }
+        }
+        Ok(syms.iter().map(|s| s.rva).collect())
+    };
+    Ok(Layout { source: t.source.clone(), xasync: rvas(&XASYNC_NAMES, false)?, xuser: rvas(&XUSER_NAMES, true)?, xstore: rvas(&crate::gdk_store::XSTORE_NAMES, true)? })
+}
+
 unsafe fn layout(base: *mut u8) -> Result<Layout, String> {
-    let o = crate::title_offsets::for_this_title().ok_or_else(crate::title_offsets::status_for_this_title)?;
-    layout_from(o, crate::title_offsets::image_timestamp(base))
+    let se = match crate::title_symbols::for_this_title().and_then(layout_from_symbols) {
+        Ok(l) => return Ok(l),
+        Err(e) => e,
+    };
+    let o = crate::title_offsets::for_this_title().ok_or_else(|| format!("symbols: {se}; offsets file: {}", crate::title_offsets::status_for_this_title()))?;
+    layout_from(o, crate::title_offsets::image_timestamp(base)).map_err(|je| format!("symbols: {se}; offsets file: {je}"))
 }
 
 #[cfg(test)]
@@ -516,6 +535,22 @@ mod layout_tests {
         assert_eq!(l.xasync[0], 0x100);
         assert_eq!(l.xuser[0], 0x100 + 6 * 0x10);
         assert_eq!(l.xstore[21], 0x100 + 55 * 0x10);
+    }
+
+    #[test]
+    fn the_title_symbols_supply_every_address_when_present() {
+        let names: Vec<&str> = XASYNC_NAMES.iter().chain(XUSER_NAMES.iter()).chain(crate::gdk_store::XSTORE_NAMES.iter()).copied().collect();
+        let syms: Vec<(&str, u32, u32)> = names.iter().enumerate().map(|(i, n)| (*n, 0x1000 + i as u32 * 0x80, 0x40)).collect();
+        let f = crate::title_symbols::build_for_test("T", &syms);
+        let t = crate::title_symbols::parse_bytes(&f, &names, "t").unwrap();
+        let l = layout_from_symbols(&t).unwrap();
+        assert_eq!((l.xasync[0], l.xuser[0], l.xstore[21]), (0x1000, 0x1000 + 6 * 0x80, 0x1000 + 55 * 0x80));
+        let mut short = syms.clone();
+        short[10].2 = 8;
+        let t = crate::title_symbols::parse_bytes(&crate::title_symbols::build_for_test("T", &short), &names, "t").unwrap();
+        assert!(layout_from_symbols(&t).unwrap_err().contains("too short"));
+        let t = crate::title_symbols::parse_bytes(&crate::title_symbols::build_for_test("T", &syms[1..]), &names, "t").unwrap();
+        assert!(layout_from_symbols(&t).unwrap_err().contains("XAsyncBegin"));
     }
 
     #[test]

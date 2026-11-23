@@ -355,10 +355,13 @@ pub unsafe fn note_resource(real_device: *mut c_void, res: *mut c_void, desc: &[
         if let Some(x) = placed_va {
             insert(Entry { start: x, len: width, res: res as usize, buffer: true });
         }
+        crate::va_census::note(res as usize, desc, placed_va.unwrap_or(pc_va), width, placed_va.is_some());
         return;
     }
     unsafe { ensure_patched(res) };
-    assign_texture_va(res as usize, xbox_texture_size(desc).max(1), placed_va);
+    let len = xbox_texture_size(desc).max(1);
+    let va = assign_texture_va(res as usize, len, placed_va);
+    crate::va_census::note(res as usize, desc, va, len, va < SYNTHETIC_TEXTURE_BASE);
 }
 
 #[cfg(test)]

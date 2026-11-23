@@ -54,6 +54,33 @@ pub struct Sel {
     pub raw: bool,
     pub unknown: Vec<String>,
     pub ps_ms: Option<(u64, f64)>,
+    pub ps_draw: Option<(u64, f64)>,
+}
+
+pub fn parse_ps_draw(v: &str) -> Option<(u64, f64)> {
+    let (h, m) = match v.split_once(':') {
+        Some((h, m)) => (h, Some(m)),
+        None => (v, None),
+    };
+    let h = h.trim();
+    let h = u64::from_str_radix(h.strip_prefix("0x").unwrap_or(h), 16).ok().filter(|x| *x != 0)?;
+    let t = match m {
+        Some(m) => m.trim().parse::<f64>().ok().filter(|f| f.is_finite() && *f >= 0.0)?,
+        None => 0.0,
+    };
+    Some((h, t))
+}
+
+pub fn ps_draw_due(seen: bool, t: f64, target: Option<(u64, f64)>, done: u32, last: f64) -> bool {
+    seen && done < SLOW_MAX_SHOTS && target.is_some_and(|(_, tmin)| t >= tmin) && (done == 0 || t - last >= PS_DRAW_GAP_S)
+}
+
+pub const PS_DRAW_GAP_S: f64 = 2.0;
+static PS_SHOTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PS_LAST: Mutex<f64> = Mutex::new(0.0);
+
+pub fn ps_draw_target() -> Option<u64> {
+    sel().and_then(|s| s.ps_draw).map(|x| x.0)
 }
 
 pub fn parse_ps_ms(v: &str) -> Option<(u64, f64)> {
@@ -98,7 +125,7 @@ pub fn parse(v: &str) -> Option<Sel> {
     if v.is_empty() || v == "0" {
         return None;
     }
-    let mut s = Sel { secs: Vec::new(), presents: Vec::new(), file: false, frames: 1, budget_mb: 1200, max_caps: 400, chain_every: 600, all: false, raw: false, unknown: Vec::new(), ps_ms: None };
+    let mut s = Sel { secs: Vec::new(), presents: Vec::new(), file: false, frames: 1, budget_mb: 1200, max_caps: 400, chain_every: 600, all: false, raw: false, unknown: Vec::new(), ps_ms: None, ps_draw: None };
     for tok in v.split([',', ';', ' ']).map(str::trim).filter(|t| !t.is_empty()) {
         let (k, val) = match tok.find([':', '=']) {
             Some(i) => (tok[..i].to_ascii_lowercase(), Some(tok[i + 1..].trim())),
@@ -122,6 +149,7 @@ pub fn parse(v: &str) -> Option<Sel> {
                 true
             }
             ("ps_ms" | "psms", Some(v)) => parse_ps_ms(v).map(|x| s.ps_ms = Some(x)).is_some(),
+            ("ps", Some(v)) => parse_ps_draw(v).map(|x| s.ps_draw = Some(x)).is_some(),
             ("raw", None) => {
                 s.raw = true;
                 true
@@ -604,6 +632,7 @@ struct G {
     device: usize,
     own: Option<(usize, usize, usize, u64)>,
     slow_seen: bool,
+    ps_seen: bool,
     slow_cache: HashMap<usize, u64>,
 }
 
@@ -736,7 +765,9 @@ unsafe fn boundary(g: &mut G, list: *mut c_void, end: &str) {
     }
     for (name, r, depth) in slots {
         let lab = cached_label(g, r);
-        pass.targets.push(format!("{name}={lab}"));
+        let va = if r == 0 || r == usize::MAX { String::new() } else if let Some(p) = crate::placed::lookup(r as *mut c_void) { format!(" placed title va={:#x}", p.va) } else if let Some(v) = crate::gpu_va::texture_va(r) { format!(" texture va={v:#x}") } else { " not placed".to_string() };
+        pass.targets.push(format!("{name}={lab}{va}"));
+        crate::va_census::touch(r, if depth { crate::va_census::P_DSV } else { crate::va_census::P_RTV });
         if r == g.last_src && r != 0 {
             pass.writes_src = true;
         }
@@ -786,7 +817,9 @@ pub fn probe_hashes() -> &'static [u64] {
 
 unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
     let Some(st) = g.lists.get(&k) else { return };
-    if st.probe_notes.iter().filter(|x| x.starts_with("probe PS ")).count() >= 8 {
+    let mine = format!("probe PS {h:016x}:");
+    let (all, this) = st.probe_notes.iter().fold((0usize, 0usize), |(a, t), x| (a + x.starts_with("probe PS ") as usize, t + x.starts_with(&mine) as usize));
+    if this >= 2 || all >= 32 {
         return;
     }
     let mut cbv: Vec<(u32, u64)> = st.cbv.iter().map(|(a, b)| (*a, *b)).collect();
@@ -1159,6 +1192,14 @@ fn note_draw(this: *mut c_void, kind: u8) {
             }
             for r in rts.iter().filter(|r| **r != 0) {
                 *g.fc.per_rt.entry(*r).or_default() += 1;
+            }
+        }
+        if !active && kind != 2 && pso != 0 {
+            if let Some(t) = ps_draw_target() {
+                let h = *g.slow_cache.entry(pso).or_insert_with(|| ps_of(pso));
+                if h == t {
+                    g.ps_seen = true;
+                }
             }
         }
         if !active && kind != 2 && pso != 0 && SLOW_HIT.load(Ordering::Relaxed) {
@@ -1636,6 +1677,7 @@ pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32,
             }
         }
         let seen = core::mem::take(&mut g.slow_seen);
+        let ps_seen = core::mem::take(&mut g.ps_seen);
         if g.shot.is_none() && !ACTIVE.load(Ordering::Relaxed) {
             let mut why = None;
             if slow_due(SLOW_HIT.load(Ordering::Relaxed), seen, SLOW_SHOTS.load(Ordering::Relaxed), SLOW_MAX_SHOTS) {
@@ -1643,6 +1685,12 @@ pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32,
                 let n = SLOW_SHOTS.fetch_add(1, Ordering::Relaxed) + 1;
                 let last = *SLOW_LAST.lock().unwrap_or_else(|e| e.into_inner());
                 why = Some(format!("ps_ms trigger {n}/{SLOW_MAX_SHOTS}: PS {:016x} drawn in the frame just presented after a {} call", ps_ms_target().unwrap_or(0), last.map_or("?".to_string(), |(ms, f)| format!("{ms:.2} ms (gpuprof frame {f})"))));
+            }
+            let ps_last = *PS_LAST.lock().unwrap_or_else(|e| e.into_inner());
+            if ps_draw_due(ps_seen, t, s.ps_draw, PS_SHOTS.load(Ordering::Relaxed), ps_last) {
+                let n = PS_SHOTS.fetch_add(1, Ordering::Relaxed) + 1;
+                *PS_LAST.lock().unwrap_or_else(|e| e.into_inner()) = t;
+                why = Some(format!("ps trigger {n}/{SLOW_MAX_SHOTS}: PS {:016x} drawn in the frame just presented at t={t:.1}s (>= {:.1}s)", s.ps_draw.map_or(0, |x| x.0), s.ps_draw.map_or(0.0, |x| x.1)));
             }
             if take_due(&s.secs, &mut g.sec_idx, t) {
                 why = Some(format!("t>={:.1}s after first present", s.secs[g.sec_idx - 1]));
@@ -1820,6 +1868,12 @@ fn write_shot(sh: Shot, gpu_done: bool, waited: Vec<(usize, bool)>, raw: bool) {
         }
     }
     let _ = std::fs::write(dir.join("passes.txt"), &out);
+    if crate::va_census::on() {
+        let views: Vec<(usize, u8)> = crate::bindtrace::all_views().into_iter().map(|(r, u)| (r, if u { crate::va_census::P_UAV } else { crate::va_census::P_SRV })).collect();
+        let c = crate::va_census::census(&views);
+        let _ = std::fs::write(dir.join("va_census.txt"), &c);
+        record("d3d12_xs", "passcap", &format!("TOMBOX_VA_ALIAS_CENSUS: {}", c.lines().next().unwrap_or("")));
+    }
     if !sh.probes.is_empty() {
         let mut pt = format!("passcap shot {} probe readbacks (GPU complete={gpu_done}); pass seq matches the pass#/seq of passes.txt lists
 ", sh.id);

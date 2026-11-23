@@ -942,6 +942,7 @@ qlow!((l8,8),(l9,9),(l10,10),(l11,11),(l12,12),(l13,13),(l14,14),(l15,15),(l16,1
 /// Title-side ExecuteCommandLists (PC slot 10): the title passes command-list *shims*
 /// (see cmdlist_wrap); translate them to the real lists before submitting.
 unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const *mut c_void) {
+    let _ours = crate::gpuprof_q::ours_scope();
     let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
         core::mem::transmute(REAL_QVT[10].load(Ordering::Relaxed));
     if lists.is_null() || n == 0 {
@@ -970,7 +971,9 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     crate::slowcall::time("queue ExecuteCommandLists replay hook", || crate::replay::on_execute(queue, &real));
     crate::hang_cap::note_exec(queue, &title, &real);
     crate::placed_offset::before_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
+    crate::gpuprof::ecl_begin(queue, f);
     crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed))));
+    crate::gpuprof::ecl_end(queue, f);
     crate::placed_offset::after_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
     crate::ecl_probe::check("ExecuteCommandLists", queue, REAL_QVT[18].load(Ordering::Relaxed), &title, &real, before);
     crate::title_shadow::after_execute(queue, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed)));
@@ -1057,6 +1060,7 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
                 // which would have read the same memory through the original vtable anyway.
                 REAL_QVT[i].store(*real_vt.add(i), Ordering::Relaxed);
             }
+            crate::gpuprof_q::install(&REAL_QVT);
             for i in 0..PC_QUEUE_SLOTS {
                 QUEUE_VT[i].store(*real_vt.add(i), Ordering::Relaxed);
             }

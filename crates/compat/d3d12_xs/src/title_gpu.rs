@@ -19,7 +19,14 @@ type DestroyedFn = unsafe extern "system" fn(*mut c_void);
 static CHARGE: AtomicUsize = AtomicUsize::new(0);
 static TRACKED: AtomicUsize = AtomicUsize::new(0);
 static UNTRACKED: AtomicUsize = AtomicUsize::new(0);
+static LIVE: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
 const MISSING: usize = 1;
+const HEAP_BIT: u64 = 1 << 63;
+
+pub fn live_bytes() -> (u64, u64, bool) {
+    let f = CHARGE.load(Ordering::Acquire);
+    (LIVE[0].load(Ordering::Relaxed), LIVE[1].load(Ordering::Relaxed), f != 0 && f != MISSING)
+}
 
 fn charge_fn() -> Option<ChargeFn> {
     let mut f = CHARGE.load(Ordering::Acquire);
@@ -50,12 +57,22 @@ unsafe fn slot(obj: *mut c_void, i: usize) -> usize {
 }
 
 unsafe extern "system" fn on_destroyed(data: *mut c_void) {
+    let d = data as u64;
+    let bytes = d & !HEAP_BIT;
+    LIVE[(d & HEAP_BIT != 0) as usize].fetch_sub(bytes, Ordering::Relaxed);
     if let Some(f) = charge_fn() {
-        unsafe { f(data as u64, 1) };
+        unsafe { f(bytes, 1) };
     }
 }
 
 pub unsafe fn track(obj: *mut c_void, bytes: u64, what: &str) -> bool {
+    unsafe { track_kind(obj, bytes, what, false) }
+}
+
+unsafe fn track_kind(obj: *mut c_void, bytes: u64, what: &str, is_heap: bool) -> bool {
+    if bytes & HEAP_BIT != 0 {
+        return false;
+    }
     if obj.is_null() || bytes == 0 {
         return false;
     }
@@ -71,7 +88,7 @@ pub unsafe fn track(obj: *mut c_void, bytes: u64, what: &str) -> bool {
     let register: unsafe extern "system" fn(*mut c_void, DestroyedFn, *mut c_void, *mut u32) -> i32 = unsafe { core::mem::transmute(slot(n, 3)) };
     let release: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(slot(n, 2)) };
     let mut id = 0u32;
-    let hr = unsafe { register(n, on_destroyed, bytes as usize as *mut c_void, &mut id) };
+    let hr = unsafe { register(n, on_destroyed, (bytes | if is_heap { HEAP_BIT } else { 0 }) as usize as *mut c_void, &mut id) };
     unsafe { release(n) };
     if hr < 0 {
         if UNTRACKED.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -79,6 +96,7 @@ pub unsafe fn track(obj: *mut c_void, bytes: u64, what: &str) -> bool {
         }
         return false;
     }
+    LIVE[is_heap as usize].fetch_add(bytes, Ordering::Relaxed);
     let total = unsafe { charge(bytes, 0) };
     if TRACKED.fetch_add(1, Ordering::Relaxed) < 6 {
         record("d3d12_xs", "title_gpu", &format!("{what} {obj:p} charged {bytes:#x} bytes to title memory (title GPU total {:.1} MB), released when the object is destroyed", total as f64 / (1u64 << 20) as f64));
@@ -91,5 +109,5 @@ pub unsafe fn committed(res: *mut c_void, xdesc: &[u8; 0x38]) -> bool {
 }
 
 pub unsafe fn heap(heap: *mut c_void, size: u64) -> bool {
-    unsafe { track(heap, size, "heap") }
+    unsafe { track_kind(heap, size, "heap", true) }
 }

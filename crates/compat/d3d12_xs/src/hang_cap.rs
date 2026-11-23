@@ -149,12 +149,18 @@ pub fn note_evict(old: &crate::gpu_va::Entry, new: &crate::gpu_va::Entry) {
 
 static RESIDENCY: Mutex<Option<HashMap<usize, (bool, u64)>>> = Mutex::new(None);
 static RESIDENCY_CALLS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static RESIDENCY_OBJS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+pub fn residency_counts() -> [u64; 4] {
+    [RESIDENCY_CALLS[0].load(Ordering::Relaxed), RESIDENCY_CALLS[1].load(Ordering::Relaxed), RESIDENCY_OBJS[0].load(Ordering::Relaxed), RESIDENCY_OBJS[1].load(Ordering::Relaxed)]
+}
 
 pub unsafe fn note_residency(evict: bool, n: u32, objs: *const *mut c_void) {
+    RESIDENCY_CALLS[evict as usize].fetch_add(1, Ordering::Relaxed);
+    RESIDENCY_OBJS[evict as usize].fetch_add(n as u64, Ordering::Relaxed);
     if !on() || objs.is_null() {
         return;
     }
-    RESIDENCY_CALLS[evict as usize].fetch_add(1, Ordering::Relaxed);
     let t = now_us();
     let mut g = RESIDENCY.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(HashMap::new);

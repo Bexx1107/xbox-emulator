@@ -1,6 +1,6 @@
 {
     "schema":  1,
-    "updated":  "2026-11-22T12:18:02Z",
+    "updated":  "2026-11-23T09:40:03Z",
     "statuses":  [
                      "Nothing",
                      "Boots",
@@ -165,13 +165,13 @@
                                       "name":  "Trackmania (test boot TrainingFirst)",
                                       "status":  "Menus",
                                       "last":  {
-                                                   "run":  "20261122_061250",
-                                                   "date":  "2026-11-22T12:18:02Z",
-                                                   "build":  "7e8064f+54 modified built 2026-11-22T12:12:43Z",
+                                                   "run":  "20261123_033637",
+                                                   "date":  "2026-11-23T09:40:03Z",
+                                                   "build":  "7e8064f+62 modified built 2026-11-23T09:13:13Z",
                                                    "commit":  "7e8064f",
-                                                   "modified_files":  54,
+                                                   "modified_files":  62,
                                                    "status":  "Menus",
-                                                   "status_basis":  "menu / lobby at run.txt:80",
+                                                   "status_basis":  "menu / lobby at run.txt:75",
                                                    "furthest":  "menu / lobby",
                                                    "milestones":  [
                                                                       "boot",
@@ -179,78 +179,70 @@
                                                                       "menu / lobby"
                                                                   ],
                                                    "run_result":  "ran to timeout",
-                                                   "seconds":  300.4,
-                                                   "fps_avg":  712.1,
-                                                   "fps_min":  232.6,
-                                                   "fps_max":  975.8,
-                                                   "frametime_p99_ms":  2.6,
+                                                   "seconds":  200.3,
+                                                   "fps_avg":  143.4,
+                                                   "fps_min":  71.9,
+                                                   "fps_max":  1156.5,
+                                                   "frametime_p99_ms":  13.42,
                                                    "meets_60fps":  true,
                                                    "frames_drawn":  true,
                                                    "captures":  [
                                                                     {
-                                                                        "t":  20,
-                                                                        "verdict":  "dark",
-                                                                        "mean":  5,
-                                                                        "std":  31.9,
-                                                                        "colours":  32
-                                                                    },
-                                                                    {
-                                                                        "t":  45,
-                                                                        "verdict":  "black",
-                                                                        "mean":  0,
-                                                                        "std":  0,
-                                                                        "colours":  1
-                                                                    },
-                                                                    {
-                                                                        "t":  106,
-                                                                        "verdict":  "black",
-                                                                        "mean":  0,
-                                                                        "std":  0,
-                                                                        "colours":  1
-                                                                    },
-                                                                    {
-                                                                        "t":  111,
+                                                                        "t":  13,
                                                                         "verdict":  "drawn",
-                                                                        "mean":  105,
-                                                                        "std":  56.6,
-                                                                        "colours":  344
+                                                                        "mean":  59.2,
+                                                                        "std":  73.3,
+                                                                        "colours":  342
+                                                                    },
+                                                                    {
+                                                                        "t":  20,
+                                                                        "verdict":  "drawn",
+                                                                        "mean":  60.5,
+                                                                        "std":  74.2,
+                                                                        "colours":  385
+                                                                    },
+                                                                    {
+                                                                        "t":  22,
+                                                                        "verdict":  "drawn",
+                                                                        "mean":  59.2,
+                                                                        "std":  73.3,
+                                                                        "colours":  346
+                                                                    },
+                                                                    {
+                                                                        "t":  46,
+                                                                        "verdict":  "drawn",
+                                                                        "mean":  41.8,
+                                                                        "std":  46.1,
+                                                                        "colours":  947
+                                                                    },
+                                                                    {
+                                                                        "t":  105,
+                                                                        "verdict":  "drawn",
+                                                                        "mean":  41.6,
+                                                                        "std":  46.3,
+                                                                        "colours":  958
                                                                     },
                                                                     {
                                                                         "t":  165,
                                                                         "verdict":  "drawn",
-                                                                        "mean":  104.6,
-                                                                        "std":  57.3,
-                                                                        "colours":  376
+                                                                        "mean":  41.3,
+                                                                        "std":  46.2,
+                                                                        "colours":  944
                                                                     },
                                                                     {
-                                                                        "t":  226,
+                                                                        "t":  200,
                                                                         "verdict":  "drawn",
-                                                                        "mean":  104.6,
-                                                                        "std":  57.3,
-                                                                        "colours":  376
-                                                                    },
-                                                                    {
-                                                                        "t":  285,
-                                                                        "verdict":  "drawn",
-                                                                        "mean":  104.6,
-                                                                        "std":  57.3,
-                                                                        "colours":  376
-                                                                    },
-                                                                    {
-                                                                        "t":  300,
-                                                                        "verdict":  "drawn",
-                                                                        "mean":  104.6,
-                                                                        "std":  57.3,
-                                                                        "colours":  376
+                                                                        "mean":  41,
+                                                                        "std":  46.3,
+                                                                        "colours":  942
                                                                     }
                                                                 ],
                                                    "graphics_issues":  [
-                                                                           "captures: drawn x5, black x2, dark x1",
-                                                                           "large brightness swings between captures (possible flicker)"
+                                                                           "captures: drawn x7"
                                                                        ],
-                                                   "top_issue":  "D3D12 debug layer / DRED / device removal: [d3d12_xs] dred DRED auto-breadcrumbs, breadcrumb contexts (PSO markers) and page-fault reporting FORCED_ON via Agility device factory (before device creation) (tombox_compat.log:124)",
-                                                   "screenshot":  "tools/dev/batch_runs/20261122_061250/trackmania.png",
-                                                   "d3d12_debug_layer":  true
+                                                   "top_issue":  "D3D12 debug layer / DRED / device removal: [d3d12_xs] dred DRED page-fault reporting (TOMBOX_DRED=1 adds auto-breadcrumbs, 2 PSO markers, 0 disables) FORCED_ON via D3D12GetDebugInterface (before device creation) (tombox_compat.log:117)",
+                                                   "screenshot":  "tools/dev/batch_runs/20261123_033637/trackmania.png",
+                                                   "d3d12_debug_layer":  false
                                                },
                                       "history":  [
                                                       {
@@ -2289,6 +2281,239 @@
                                                           "top_issue":  "D3D12 debug layer / DRED / device removal: [d3d12_xs] dred DRED auto-breadcrumbs, breadcrumb contexts (PSO markers) and page-fault reporting FORCED_ON via Agility device factory (before device creation) (tombox_compat.log:124)",
                                                           "screenshot":  "tools/dev/batch_runs/20261122_061250/trackmania.png",
                                                           "d3d12_debug_layer":  true
+                                                      },
+                                                      {
+                                                          "run":  "20261123_032707",
+                                                          "date":  "2026-11-23T09:31:13Z",
+                                                          "build":  "7e8064f+62 modified built 2026-11-23T09:13:13Z",
+                                                          "commit":  "7e8064f",
+                                                          "modified_files":  62,
+                                                          "status":  "Menus",
+                                                          "status_basis":  "menu / lobby at run.txt:77",
+                                                          "furthest":  "menu / lobby",
+                                                          "milestones":  [
+                                                                             "boot",
+                                                                             "first frame",
+                                                                             "menu / lobby"
+                                                                         ],
+                                                          "run_result":  "ran to timeout",
+                                                          "seconds":  240.4,
+                                                          "fps_avg":  1108.5,
+                                                          "fps_min":  881.9,
+                                                          "fps_max":  1157.3,
+                                                          "frametime_p99_ms":  1.89,
+                                                          "meets_60fps":  true,
+                                                          "frames_drawn":  true,
+                                                          "captures":  [
+                                                                           {
+                                                                               "t":  13,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  59.2,
+                                                                               "std":  73.3,
+                                                                               "colours":  340
+                                                                           },
+                                                                           {
+                                                                               "t":  20,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           },
+                                                                           {
+                                                                               "t":  46,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           },
+                                                                           {
+                                                                               "t":  106,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           },
+                                                                           {
+                                                                               "t":  165,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           },
+                                                                           {
+                                                                               "t":  225,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           },
+                                                                           {
+                                                                               "t":  240,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           }
+                                                                       ],
+                                                          "graphics_issues":  [
+                                                                                  "captures: drawn x7"
+                                                                              ],
+                                                          "top_issue":  "D3D12 debug layer / DRED / device removal: [d3d12_xs] dred DRED page-fault reporting (TOMBOX_DRED=1 adds auto-breadcrumbs, 2 PSO markers, 0 disables) FORCED_ON via D3D12GetDebugInterface (before device creation) (tombox_compat.log:117)",
+                                                          "screenshot":  "tools/dev/batch_runs/20261123_032707/trackmania.png",
+                                                          "d3d12_debug_layer":  false
+                                                      },
+                                                      {
+                                                          "run":  "20261123_033257",
+                                                          "date":  "2026-11-23T09:36:03Z",
+                                                          "build":  "7e8064f+62 modified built 2026-11-23T09:13:13Z",
+                                                          "commit":  "7e8064f",
+                                                          "modified_files":  62,
+                                                          "status":  "Menus",
+                                                          "status_basis":  "menu / lobby at run.txt:75",
+                                                          "furthest":  "menu / lobby",
+                                                          "milestones":  [
+                                                                             "boot",
+                                                                             "first frame",
+                                                                             "menu / lobby"
+                                                                         ],
+                                                          "run_result":  "ran to timeout",
+                                                          "seconds":  180.2,
+                                                          "fps_avg":  1109.4,
+                                                          "fps_min":  889.4,
+                                                          "fps_max":  1157.4,
+                                                          "frametime_p99_ms":  1.57,
+                                                          "meets_60fps":  true,
+                                                          "frames_drawn":  true,
+                                                          "captures":  [
+                                                                           {
+                                                                               "t":  12,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  59.9,
+                                                                               "std":  74.2,
+                                                                               "colours":  354
+                                                                           },
+                                                                           {
+                                                                               "t":  20,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           },
+                                                                           {
+                                                                               "t":  45,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           },
+                                                                           {
+                                                                               "t":  105,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           },
+                                                                           {
+                                                                               "t":  165,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           },
+                                                                           {
+                                                                               "t":  180,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           }
+                                                                       ],
+                                                          "graphics_issues":  [
+                                                                                  "captures: drawn x6"
+                                                                              ],
+                                                          "top_issue":  "D3D12 debug layer / DRED / device removal: [d3d12_xs] dred DRED page-fault reporting (TOMBOX_DRED=1 adds auto-breadcrumbs, 2 PSO markers, 0 disables) FORCED_ON via D3D12GetDebugInterface (before device creation) (tombox_compat.log:119)",
+                                                          "screenshot":  "tools/dev/batch_runs/20261123_033257/trackmania.png",
+                                                          "d3d12_debug_layer":  false
+                                                      },
+                                                      {
+                                                          "run":  "20261123_033637",
+                                                          "date":  "2026-11-23T09:40:03Z",
+                                                          "build":  "7e8064f+62 modified built 2026-11-23T09:13:13Z",
+                                                          "commit":  "7e8064f",
+                                                          "modified_files":  62,
+                                                          "status":  "Menus",
+                                                          "status_basis":  "menu / lobby at run.txt:75",
+                                                          "furthest":  "menu / lobby",
+                                                          "milestones":  [
+                                                                             "boot",
+                                                                             "first frame",
+                                                                             "menu / lobby"
+                                                                         ],
+                                                          "run_result":  "ran to timeout",
+                                                          "seconds":  200.3,
+                                                          "fps_avg":  143.4,
+                                                          "fps_min":  71.9,
+                                                          "fps_max":  1156.5,
+                                                          "frametime_p99_ms":  13.42,
+                                                          "meets_60fps":  true,
+                                                          "frames_drawn":  true,
+                                                          "captures":  [
+                                                                           {
+                                                                               "t":  13,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  59.2,
+                                                                               "std":  73.3,
+                                                                               "colours":  342
+                                                                           },
+                                                                           {
+                                                                               "t":  20,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  60.5,
+                                                                               "std":  74.2,
+                                                                               "colours":  385
+                                                                           },
+                                                                           {
+                                                                               "t":  22,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  59.2,
+                                                                               "std":  73.3,
+                                                                               "colours":  346
+                                                                           },
+                                                                           {
+                                                                               "t":  46,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  41.8,
+                                                                               "std":  46.1,
+                                                                               "colours":  947
+                                                                           },
+                                                                           {
+                                                                               "t":  105,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  41.6,
+                                                                               "std":  46.3,
+                                                                               "colours":  958
+                                                                           },
+                                                                           {
+                                                                               "t":  165,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  41.3,
+                                                                               "std":  46.2,
+                                                                               "colours":  944
+                                                                           },
+                                                                           {
+                                                                               "t":  200,
+                                                                               "verdict":  "drawn",
+                                                                               "mean":  41,
+                                                                               "std":  46.3,
+                                                                               "colours":  942
+                                                                           }
+                                                                       ],
+                                                          "graphics_issues":  [
+                                                                                  "captures: drawn x7"
+                                                                              ],
+                                                          "top_issue":  "D3D12 debug layer / DRED / device removal: [d3d12_xs] dred DRED page-fault reporting (TOMBOX_DRED=1 adds auto-breadcrumbs, 2 PSO markers, 0 disables) FORCED_ON via D3D12GetDebugInterface (before device creation) (tombox_compat.log:117)",
+                                                          "screenshot":  "tools/dev/batch_runs/20261123_033637/trackmania.png",
+                                                          "d3d12_debug_layer":  false
                                                       }
                                                   ]
                                   },

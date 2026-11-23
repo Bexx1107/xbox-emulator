@@ -116,6 +116,16 @@ pub fn note_desc_after(dest: usize, heap_type: u32, d: Desc) {
     }
 }
 
+pub fn all_views() -> Vec<(usize, bool)> {
+    with(|s| {
+        s.descs.values().filter_map(|e| match &e.d {
+            Desc::Srv { res, .. } if *res != 0 => Some((*res, false)),
+            Desc::Uav { res, .. } if *res != 0 => Some((*res, true)),
+            _ => None,
+        }).collect()
+    })
+}
+
 pub fn note_desc(dest: usize, d: Desc) {
     with(|s| {
         let frame = s.frame;

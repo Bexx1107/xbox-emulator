@@ -62,12 +62,31 @@ fn tag_name(tag: u64) -> &'static str {
 }
 
 fn stampable(ty: u32) -> bool {
-    ty == 0 || ty == 2
+    ty == 0 || ty == 2 || ty == 3
 }
+
+#[derive(Clone, Copy)]
+struct Span {
+    ty: u32,
+    s0: u32,
+    s1: u32,
+}
+
+const IID_ALLOCATOR: Guid = Guid { d1: 0x6102_dee4, d2: 0xaf59, d3: 0x4b09, d4: [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24] };
+const IID_FENCE: Guid = Guid { d1: 0x0a75_3dcf, d2: 0xc4d8, d3: 0x4b91, d4: [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76] };
+const IID_LIST: Guid = Guid { d1: 0x5b16_0d0f, d2: 0xac1b, d3: 0x4185, d4: [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55] };
+type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
 
 struct State {
     heap: usize,
+    cheap: usize,
     rb: usize,
+    open: HashMap<usize, (u32, u32)>,
+    spans: Vec<Span>,
+    retire: Vec<(usize, usize, u64, u32)>,
+    done_ty: Vec<u32>,
+    fence: usize,
+    fence_val: u64,
     lists: HashMap<usize, ListRec>,
     labels: HashMap<usize, Label>,
     done: Vec<Vec<Ev>>,
@@ -127,7 +146,14 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let s = g.get_or_insert_with(|| State {
         heap: 0,
+        cheap: 0,
         rb: 0,
+        open: HashMap::new(),
+        spans: Vec::new(),
+        retire: Vec::new(),
+        done_ty: Vec::new(),
+        fence: 0,
+        fence_val: 0,
         lists: HashMap::new(),
         labels: HashMap::new(),
         done: Vec::new(),
@@ -210,12 +236,45 @@ unsafe fn ensure_resources(s: &mut State, list: *mut c_void) -> bool {
     if unsafe { get(list, &IID_DEVICE, &mut dev) } < 0 || dev.is_null() {
         return false;
     }
+    unsafe { ensure_on_device(s, dev) }
+}
+
+unsafe fn device_of(obj: *mut c_void) -> *mut c_void {
+    let get: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*(*(obj as *const *const usize)).add(7)) };
+    let mut dev: *mut c_void = core::ptr::null_mut();
+    if unsafe { get(obj, &IID_DEVICE, &mut dev) } < 0 {
+        return core::ptr::null_mut();
+    }
+    dev
+}
+
+unsafe fn ensure_on_device(s: &mut State, dev: *mut c_void) -> bool {
+    if s.heap != 0 && s.rb != 0 {
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(*(*(dev as *const *const usize)).add(2)) };
+        unsafe { release(dev) };
+        return true;
+    }
+    if s.heap == usize::MAX {
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(*(*(dev as *const *const usize)).add(2)) };
+        unsafe { release(dev) };
+        return false;
+    }
     let vt = unsafe { *(dev as *const *const usize) };
     let qdesc: [u32; 3] = [1, SLOTS, 0];
     let create_qh: unsafe extern "system" fn(*mut c_void, *const u32, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*vt.add(39)) };
     let mut heap: *mut c_void = core::ptr::null_mut();
     let hr_h = unsafe { create_qh(dev, qdesc.as_ptr(), &IID_QUERY_HEAP, &mut heap) };
+    let cdesc: [u32; 3] = [5, SLOTS, 0];
+    let mut cheap: *mut c_void = core::ptr::null_mut();
+    let hr_c = unsafe { create_qh(dev, cdesc.as_ptr(), &IID_QUERY_HEAP, &mut cheap) };
+    if hr_c < 0 || cheap.is_null() {
+        record("d3d12_xs", "gpuprof", &format!("copy-queue timestamp heap unavailable hr={hr_c:#010x}: copy lists and copy-queue submissions stay untimed"));
+        s.cheap = usize::MAX;
+    } else {
+        s.cheap = cheap as usize;
+    }
     let props: [u32; 5] = [3, 0, 0, 1, 1];
     let mut bd = [0u8; 0x38];
     bd[0..4].copy_from_slice(&1u32.to_le_bytes());
@@ -245,12 +304,25 @@ unsafe fn stamp(list: *mut c_void, kind: u8) {
     unsafe { stamp_ev(list, None, kind, true) };
 }
 
+fn heap_for(s: &State, ty: u32) -> usize {
+    let h = if ty == 3 { s.cheap } else { s.heap };
+    if h == usize::MAX { 0 } else { h }
+}
+
 unsafe fn stamp_ev(list: *mut c_void, tag: Option<u8>, kind: u8, count: bool) {
-    if !ARMED.load(Ordering::Relaxed) || !stampable(unsafe { crate::fill::list_type(list) }) {
+    if !ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    let ty = unsafe { crate::fill::list_type(list) };
+    if !stampable(ty) {
         return;
     }
     with(|s| {
         if !unsafe { ensure_resources(s, list) } {
+            return;
+        }
+        let heap = heap_for(s, ty);
+        if heap == 0 {
             return;
         }
         let slot = SLOT.fetch_add(1, Ordering::Relaxed);
@@ -258,7 +330,7 @@ unsafe fn stamp_ev(list: *mut c_void, tag: Option<u8>, kind: u8, count: bool) {
             return;
         }
         let end: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = unsafe { core::mem::transmute(real(53)) };
-        unsafe { end(list, s.heap as *mut c_void, QUERY_TIMESTAMP, slot) };
+        unsafe { end(list, heap as *mut c_void, QUERY_TIMESTAMP, slot) };
         let r = s.lists.entry(list as usize).or_default();
         let (label, kind) = match tag {
             Some(t) => (Label { a: t as u64, b: 0, compute: false }, KIND_PASS),
@@ -271,6 +343,174 @@ unsafe fn stamp_ev(list: *mut c_void, tag: Option<u8>, kind: u8, count: bool) {
         r.evs.push(Ev { slot, label, kind, count, frame: FRAME_IX.load(Ordering::Relaxed) });
     });
 }
+
+unsafe fn vt_at(obj: usize, i: usize) -> usize {
+    unsafe { *(*(obj as *const *const usize)).add(i) }
+}
+
+unsafe fn release_obj(obj: usize) {
+    if obj != 0 {
+        let f: unsafe extern "system" fn(usize) -> u32 = unsafe { core::mem::transmute(vt_at(obj, 2)) };
+        unsafe { f(obj) };
+    }
+}
+
+const POOL_KEEP: usize = 64;
+
+unsafe fn sweep_retired(s: &mut State) {
+    if s.fence == 0 || s.retire.len() <= POOL_KEEP {
+        return;
+    }
+    let get: unsafe extern "system" fn(usize) -> u64 = unsafe { core::mem::transmute(vt_at(s.fence, 8)) };
+    let done = unsafe { get(s.fence) };
+    let mut keep = Vec::new();
+    for e in core::mem::take(&mut s.retire) {
+        if e.2 <= done && keep.len() >= POOL_KEEP {
+            unsafe { release_obj(e.1) };
+            unsafe { release_obj(e.0) };
+        } else {
+            keep.push(e);
+        }
+    }
+    s.retire = keep;
+}
+
+unsafe fn ecl_stamp(queue: *mut c_void, ty: u32) -> Option<(u32, usize, usize, u64)> {
+    let dev = unsafe { device_of(queue) };
+    if dev.is_null() {
+        return None;
+    }
+    let ok = with(|s| unsafe { ensure_on_device(s, dev) });
+    if !ok {
+        return None;
+    }
+    let dev = unsafe { device_of(queue) };
+    if dev.is_null() {
+        return None;
+    }
+    let d = dev as usize;
+    let out = unsafe { ecl_record(d, ty) };
+    unsafe { release_obj(d) };
+    out
+}
+
+unsafe fn ecl_record(d: usize, ty: u32) -> Option<(u32, usize, usize, u64)> {
+    let (heap, rb, mut fence) = with(|s| (heap_for(s, ty), s.rb, s.fence));
+    if heap == 0 || rb == 0 {
+        return None;
+    }
+    if fence == 0 {
+        let cf: unsafe extern "system" fn(usize, u64, u32, *const Guid, *mut usize) -> i32 = unsafe { core::mem::transmute(vt_at(d, 36)) };
+        let mut f = 0usize;
+        if unsafe { cf(d, 0, 0, &IID_FENCE, &mut f) } < 0 || f == 0 {
+            return None;
+        }
+        let kept = with(|s| {
+            if s.fence == 0 {
+                s.fence = f;
+            }
+            s.fence
+        });
+        if kept != f {
+            unsafe { release_obj(f) };
+        }
+        fence = kept;
+    }
+    let get: unsafe extern "system" fn(usize) -> u64 = unsafe { core::mem::transmute(vt_at(fence, 8)) };
+    let reached = unsafe { get(fence) };
+    let slot = SLOT.fetch_add(1, Ordering::Relaxed);
+    if slot >= SLOTS {
+        return None;
+    }
+    let reuse = with(|s| {
+        let i = s.retire.iter().position(|e| e.2 <= reached && e.3 == ty)?;
+        let e = s.retire.swap_remove(i);
+        Some((e.0, e.1))
+    });
+    let (a, l) = match reuse {
+        Some((a, l)) => {
+            let ra: unsafe extern "system" fn(usize) -> i32 = unsafe { core::mem::transmute(vt_at(a, 8)) };
+            let rl: unsafe extern "system" fn(usize, usize, usize) -> i32 = unsafe { core::mem::transmute(vt_at(l, 10)) };
+            if unsafe { ra(a) } < 0 || unsafe { rl(l, a, 0) } < 0 {
+                unsafe { release_obj(l) };
+                unsafe { release_obj(a) };
+                return None;
+            }
+            (a, l)
+        }
+        None => {
+            let ca: unsafe extern "system" fn(usize, u32, *const Guid, *mut usize) -> i32 = unsafe { core::mem::transmute(vt_at(d, 9)) };
+            let mut a = 0usize;
+            if unsafe { ca(d, ty, &IID_ALLOCATOR, &mut a) } < 0 || a == 0 {
+                return None;
+            }
+            let cl: unsafe extern "system" fn(usize, u32, u32, usize, usize, *const Guid, *mut usize) -> i32 = unsafe { core::mem::transmute(vt_at(d, 12)) };
+            let mut l = 0usize;
+            if unsafe { cl(d, 0, ty, a, 0, &IID_LIST, &mut l) } < 0 || l == 0 {
+                unsafe { release_obj(a) };
+                return None;
+            }
+            (a, l)
+        }
+    };
+    let end: unsafe extern "system" fn(usize, usize, u32, u32) = unsafe { core::mem::transmute(vt_at(l, 53)) };
+    let resolve: unsafe extern "system" fn(usize, usize, u32, u32, u32, usize, u64) = unsafe { core::mem::transmute(vt_at(l, 54)) };
+    let close: unsafe extern "system" fn(usize) -> i32 = unsafe { core::mem::transmute(vt_at(l, 9)) };
+    unsafe { end(l, heap, QUERY_TIMESTAMP, slot) };
+    unsafe { resolve(l, heap, QUERY_TIMESTAMP, slot, 1, rb, slot as u64 * 8) };
+    if unsafe { close(l) } < 0 {
+        unsafe { release_obj(l) };
+        unsafe { release_obj(a) };
+        return None;
+    }
+    let v = with(|s| {
+        s.fence_val += 1;
+        let v = s.fence_val;
+        s.retire.push((a, l, v, ty));
+        v
+    });
+    Some((slot, l, fence, v))
+}
+
+unsafe fn submit_stamp(queue: *mut c_void, exec: ExecFn, ty: u32) -> Option<u32> {
+    let (slot, l, fence, v) = unsafe { ecl_stamp(queue, ty) }?;
+    let lists = [l as *mut c_void];
+    unsafe { exec(queue, 1, lists.as_ptr()) };
+    let sig = crate::gpuprof_q::real_signal();
+    let sig = if sig != 0 { sig } else { crate::present::real_queue_slot(14) };
+    if sig != 0 {
+        let f: unsafe extern "system" fn(*mut c_void, usize, u64) -> i32 = unsafe { core::mem::transmute(sig) };
+        unsafe { f(queue, fence, v) };
+    }
+    Some(slot)
+}
+
+pub unsafe fn ecl_begin(queue: *mut c_void, exec: ExecFn) {
+    if !ARMED.load(Ordering::Relaxed) || queue.is_null() || !enabled() {
+        return;
+    }
+    let ty = unsafe { crate::gpuprof_q::queue_type(queue) };
+    if let Some(s0) = unsafe { submit_stamp(queue, exec, ty) } {
+        with(|s| {
+            s.open.insert(queue as usize, (ty, s0));
+        });
+    }
+}
+
+pub unsafe fn ecl_end(queue: *mut c_void, exec: ExecFn) {
+    if !enabled() {
+        return;
+    }
+    let open = with(|s| s.open.remove(&(queue as usize)));
+    let Some((ty, s0)) = open else { return };
+    if !ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(s1) = unsafe { submit_stamp(queue, exec, ty) } {
+        with(|s| s.spans.push(Span { ty, s0, s1 }));
+    }
+}
+
 
 pub unsafe fn pass_begin(list: *mut c_void, tag: u8) {
     unsafe { stamp_ev(list, Some(tag), KIND_PASS, true) };
@@ -298,9 +538,11 @@ pub unsafe fn own_close(list: *mut c_void) {
 }
 
 unsafe fn close_list(list: *mut c_void) {
+    let ty = unsafe { crate::fill::list_type(list) };
     with(|s| {
+        let heap = heap_for(s, ty);
         let Some(r) = s.lists.get_mut(&(list as usize)) else { return };
-        if r.evs.is_empty() || s.heap == 0 || s.heap == usize::MAX {
+        if r.evs.is_empty() || heap == 0 {
             r.evs.clear();
             return;
         }
@@ -312,7 +554,7 @@ unsafe fn close_list(list: *mut c_void) {
         let end: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = unsafe { core::mem::transmute(real(53)) };
         let resolve: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64) =
             unsafe { core::mem::transmute(real(54)) };
-        unsafe { end(list, s.heap as *mut c_void, QUERY_TIMESTAMP, slot) };
+        unsafe { end(list, heap as *mut c_void, QUERY_TIMESTAMP, slot) };
         evs.push(Ev { slot, label: Label { a: 0, b: 0, compute: false }, kind: KIND_CLOSE, count: false, frame: FRAME_IX.load(Ordering::Relaxed) });
         let mut slots: Vec<u32> = evs.iter().map(|e| e.slot).collect();
         slots.sort_unstable();
@@ -322,10 +564,11 @@ unsafe fn close_list(list: *mut c_void) {
             while j < slots.len() && slots[j] == slots[j - 1] + 1 {
                 j += 1;
             }
-            unsafe { resolve(list, s.heap as *mut c_void, QUERY_TIMESTAMP, slots[i], (j - i) as u32, s.rb as *mut c_void, slots[i] as u64 * 8) };
+            unsafe { resolve(list, heap as *mut c_void, QUERY_TIMESTAMP, slots[i], (j - i) as u32, s.rb as *mut c_void, slots[i] as u64 * 8) };
             i = j;
         }
         s.done.push(evs);
+        s.done_ty.push(ty);
     });
 }
 
@@ -355,7 +598,10 @@ unsafe fn report(s: &mut State) {
     let mut per_frame: HashMap<u32, u64> = HashMap::new();
     let mut by_frame: HashMap<(u32, u64, u64, bool, u8), u64> = HashMap::new();
     let (mut lo, mut hi, mut bad, mut n) = (u64::MAX, 0u64, 0u64, 0u64);
-    for seq in &s.done {
+    let mut iv: Vec<(u64, u64)> = Vec::new();
+    let mut list_q: HashMap<u32, (u64, u64)> = HashMap::new();
+    for (si, seq) in s.done.iter().enumerate() {
+        let lty = s.done_ty.get(si).copied().unwrap_or(0);
         for w in seq.windows(2) {
             let (t0, t1) = (ts(w[0].slot), ts(w[1].slot));
             if t0 != 0 && t1 >= t0 && w[0].kind <= 1 && !w[0].label.compute && crate::passcap::ps_ms_target() == Some(w[0].label.b) {
@@ -368,6 +614,10 @@ unsafe fn report(s: &mut State) {
             lo = lo.min(t0);
             hi = hi.max(t1);
             n += 1;
+            iv.push((t0, t1));
+            let q = list_q.entry(lty).or_default();
+            q.0 += t1 - t0;
+            q.1 += (w[0].kind == 4) as u64;
             let e = agg.entry((w[0].label.a, w[0].label.b, w[0].label.compute, w[0].kind)).or_default();
             e.0 += t1 - t0;
             e.1 += w[0].count as u64;
@@ -375,7 +625,23 @@ unsafe fn report(s: &mut State) {
             *by_frame.entry((w[0].frame, w[0].label.a, w[0].label.b, w[0].label.compute, w[0].kind)).or_default() += t1 - t0;
         }
     }
+    let mut ecl_q: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut ecl_bad = 0u64;
+    for sp in &s.spans {
+        let (t0, t1) = (ts(sp.s0), ts(sp.s1));
+        if t0 == 0 || t1 < t0 || t1 - t0 > max_ticks.saturating_mul(10) {
+            ecl_bad += 1;
+            continue;
+        }
+        lo = lo.min(t0);
+        hi = hi.max(t1);
+        iv.push((t0, t1));
+        let q = ecl_q.entry(sp.ty).or_default();
+        q.0 += t1 - t0;
+        q.1 += 1;
+    }
     unsafe { unmap(s.rb as *mut c_void, 0, core::ptr::null()) };
+    let covered = union_ticks(&mut iv);
     let mut rows: Vec<_> = agg.into_iter().collect();
     rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
     let total: u64 = rows.iter().map(|r| r.1 .0).sum();
@@ -386,6 +652,9 @@ unsafe fn report(s: &mut State) {
         "[gpuprof] window {}: {nf} frames, {n} timed events ({bad} rejected), freq={freq} Hz | summed GPU {:.3} ms/frame, wall span {:.3} ms/frame\n",
         s.reports, per(total), span);
     out.push_str(&format!("[gpuprof]   passes: {}\n", pass_summary(&rows, &per, nf)));
+    out.push_str(&format!("[gpuprof]   {}\n", queue_summary(&ecl_q, &list_q, ecl_bad, &per, nf, if hi > lo { hi - lo } else { 0 }, covered)));
+    out.push_str(&format!("[gpuprof]   {}\n", crate::gpuprof_q::freq_note(&crate::gpuprof_q::freqs(), freq)));
+    out.push_str(&format!("[gpuprof]   {}\n", crate::gpuprof_q::report_line()));
     if let Some((wf, wt, med)) = worst_frame(&per_frame) {
         let ms = |t: u64| t as f64 * tick_ms;
         let mut d: Vec<(f64, String)> = rows.iter().map(|((a, b, compute, kind), (t, _))| {
@@ -405,6 +674,45 @@ unsafe fn report(s: &mut State) {
             per(*t), *t as f64 * 100.0 / total.max(1) as f64, *c as f64 / nf as f64));
     }
     record("d3d12_xs", "gpuprof", &out);
+}
+
+fn union_ticks(iv: &mut Vec<(u64, u64)>) -> u64 {
+    iv.sort_unstable();
+    let mut total = 0u64;
+    let mut cur: Option<(u64, u64)> = None;
+    for &(a, b) in iv.iter() {
+        match cur {
+            Some((c0, c1)) if a <= c1 => cur = Some((c0, c1.max(b))),
+            Some((c0, c1)) => {
+                total += c1 - c0;
+                cur = Some((a, b));
+            }
+            None => cur = Some((a, b)),
+        }
+    }
+    if let Some((c0, c1)) = cur {
+        total += c1 - c0;
+    }
+    total
+}
+
+fn queue_summary(ecl: &HashMap<u32, (u64, u64)>, lists: &HashMap<u32, (u64, u64)>, ecl_bad: u64, per: &dyn Fn(u64) -> f64, nf: u64, span: u64, covered: u64) -> String {
+    let mut tys: Vec<u32> = ecl.keys().chain(lists.keys()).copied().collect();
+    tys.sort_unstable();
+    tys.dedup();
+    let mut parts: Vec<String> = Vec::new();
+    for t in tys {
+        let (et, en) = ecl.get(&t).copied().unwrap_or((0, 0));
+        let (lt, ln) = lists.get(&t).copied().unwrap_or((0, 0));
+        parts.push(format!("{} submissions {:.3} ms/f ({:.1}/f) lists {:.3} ms/f ({:.1}/f)", crate::gpuprof_q::type_name(t), per(et), en as f64 / nf as f64, per(lt), ln as f64 / nf as f64));
+    }
+    let sum: u64 = ecl.values().map(|v| v.0).sum();
+    let mut out = format!("queues: {}", if parts.is_empty() { "-".to_string() } else { parts.join(" | ") });
+    out.push_str(&format!(" | summed submissions {:.3} ms/f, timed union {:.3} ms/f, untimed gap {:.3} ms/f of wall span {:.3} ms/f", per(sum), per(covered), per(span.saturating_sub(covered)), per(span)));
+    if ecl_bad > 0 {
+        out.push_str(&format!(", {ecl_bad} submission spans rejected"));
+    }
+    out
 }
 
 fn pass_summary(rows: &[((u64, u64, bool, u8), (u64, u64))], per: &dyn Fn(u64) -> f64, nf: u64) -> String {
@@ -446,6 +754,9 @@ pub fn on_present() {
                 s.reports += 1;
                 s.finalize_at = None;
                 s.done.clear();
+                s.done_ty.clear();
+                s.spans.clear();
+                unsafe { sweep_retired(s) };
                 s.last = Some(Instant::now());
             }
             return;
@@ -454,6 +765,7 @@ pub fn on_present() {
             FRAME_IX.store((s.presents - start) as u32, Ordering::Relaxed);
             if s.presents >= start + frames() {
                 ARMED.store(false, Ordering::Relaxed);
+                crate::gpuprof_q::disarm();
                 s.window = None;
                 s.finalize_at = Some(s.presents + SETTLE);
             }
@@ -471,9 +783,14 @@ pub fn on_present() {
                 r.evs.clear();
             }
             s.done.clear();
+            s.done_ty.clear();
+            s.spans.clear();
+            s.open.clear();
+            unsafe { sweep_retired(s) };
             SLOT.store(0, Ordering::Relaxed);
             FRAME_IX.store(0, Ordering::Relaxed);
             s.window = Some(s.presents);
+            crate::gpuprof_q::arm();
             ARMED.store(true, Ordering::Relaxed);
         }
     });
@@ -534,6 +851,41 @@ unsafe extern "system" fn h_indirect(this: *mut c_void, sig: *mut c_void, n: u32
 }
 
 #[cfg(test)]
+pub(crate) unsafe fn test_stamp(queue: *mut c_void, exec: ExecFn, ty: u32) -> Option<u32> {
+    unsafe { submit_stamp(queue, exec, ty) }
+}
+
+#[cfg(test)]
+pub(crate) fn test_pool() -> usize {
+    with(|s| s.retire.len())
+}
+
+#[cfg(test)]
+pub(crate) fn test_fence() -> (usize, u64) {
+    with(|s| (s.fence, s.fence_val))
+}
+
+#[cfg(test)]
+pub(crate) fn test_has_copy_heap() -> bool {
+    with(|s| s.cheap != 0 && s.cheap != usize::MAX)
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn test_ticks(slots: &[u32]) -> Vec<u64> {
+    with(|s| {
+        let map: unsafe extern "system" fn(usize, u32, *const c_void, *mut *mut u8) -> i32 = unsafe { core::mem::transmute(vt_at(s.rb, 8)) };
+        let unmap: unsafe extern "system" fn(usize, u32, *const c_void) = unsafe { core::mem::transmute(vt_at(s.rb, 9)) };
+        let mut p: *mut u8 = core::ptr::null_mut();
+        if unsafe { map(s.rb, 0, core::ptr::null(), &mut p) } < 0 || p.is_null() {
+            return Vec::new();
+        }
+        let v = slots.iter().map(|&i| unsafe { core::ptr::read_unaligned((p as *const u64).add(i as usize)) }).collect();
+        unsafe { unmap(s.rb, 0, core::ptr::null()) };
+        v
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -565,11 +917,22 @@ mod tests {
     }
 
     #[test]
-    fn only_direct_and_compute_lists_take_timestamps() {
+    fn direct_compute_and_copy_lists_take_timestamps_but_bundles_do_not() {
         assert!(stampable(0));
         assert!(stampable(2));
+        assert!(stampable(3));
         assert!(!stampable(1));
-        assert!(!stampable(3));
+    }
+
+    #[test]
+    fn union_merges_overlapping_intervals_across_queues() {
+        let mut iv = vec![(10, 20), (15, 30), (40, 50), (0, 5), (45, 48)];
+        assert_eq!(union_ticks(&mut iv), 5 + 20 + 10);
+        assert_eq!(union_ticks(&mut Vec::new()), 0);
+        let ecl: HashMap<u32, (u64, u64)> = [(0, (32, 16)), (2, (16, 16))].into_iter().collect();
+        let lists: HashMap<u32, (u64, u64)> = [(0, (16, 32))].into_iter().collect();
+        let per = |t: u64| t as f64 / 16.0;
+        assert_eq!(queue_summary(&ecl, &lists, 0, &per, 16, 160, 40), "queues: direct submissions 2.000 ms/f (1.0/f) lists 1.000 ms/f (2.0/f) | compute submissions 1.000 ms/f (1.0/f) lists 0.000 ms/f (0.0/f) | summed submissions 3.000 ms/f, timed union 2.500 ms/f, untimed gap 7.500 ms/f of wall span 10.000 ms/f");
     }
 
     #[test]

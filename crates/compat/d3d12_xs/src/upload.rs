@@ -883,8 +883,51 @@ fn ww_sync(up: &mut Uploader) {
     }
 }
 
+static UP_TOTALS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+static UP_QUEUES: Mutex<Vec<(usize, &'static str)>> = Mutex::new(Vec::new());
+static TRACKED_BYTES: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub fn upload_totals() -> [u64; 4] {
+    core::array::from_fn(|i| UP_TOTALS[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn tracked_bytes() -> (u64, u64) {
+    (TRACKED_BYTES[0].load(core::sync::atomic::Ordering::Relaxed), TRACKED_BYTES[1].load(core::sync::atomic::Ordering::Relaxed))
+}
+
+fn publish_tracked(up: &Uploader) {
+    TRACKED_BYTES[0].store(up.tracked.len() as u64, core::sync::atomic::Ordering::Relaxed);
+    TRACKED_BYTES[1].store(up.tracked.iter().map(|t| t.layout.total).sum::<u64>(), core::sync::atomic::Ordering::Relaxed);
+}
+
+unsafe fn queue_type(queue: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void, *mut [u32; 4]) -> *mut [u32; 4] = core::mem::transmute(*vt(queue).add(18));
+    let mut d = [u32::MAX; 4];
+    f(queue, &mut d);
+    d[0]
+}
+
+unsafe fn note_upload_queue(queue: *mut c_void, path: &'static str) {
+    let mut g = UP_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    if g.iter().any(|&(q, p)| q == queue as usize && p == path) || g.len() >= 16 {
+        return;
+    }
+    g.push((queue as usize, path));
+    let ty = queue_type(queue);
+    let name = match ty { 0 => "DIRECT", 1 => "BUNDLE", 2 => "COMPUTE", 3 => "COPY", _ => "?" };
+    record("d3d12_xs", "upload", &format!("upload command lists execute on queue {queue:p} type {ty} ({name}) via {path}"));
+}
+
+fn note_upload_list(bytes: u64, copies: u64) {
+    UP_TOTALS[0].fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
+    UP_TOTALS[1].fetch_add(copies, core::sync::atomic::Ordering::Relaxed);
+    UP_TOTALS[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::frame_ev::note_upload(bytes, copies);
+}
+
 unsafe fn record_uploads(alloc: *mut c_void, list: *mut c_void, staged: &[Staged]) {
     const COPY_DEST: u32 = 0x400;
+    let mut copies = 0u64;
     vcall!(alloc, 8, fn() -> i32);
     vcall!(list, 10, fn(*mut c_void, *mut c_void) -> i32, alloc, core::ptr::null_mut());
     crate::gpuprof::own_begin(list, crate::gpuprof::TAG_UPLOAD);
@@ -907,10 +950,14 @@ unsafe fn record_uploads(alloc: *mut c_void, list: *mut c_void, staged: &[Staged
                     for b in bx {
                         vcall!(list, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (),
                             dst.as_ptr(), 0, b[1], 0, src.as_ptr(), b.as_ptr() as *const c_void);
+                        copies += 1;
                     }
                 }
-                None => vcall!(list, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (),
-                    dst.as_ptr(), 0, 0, 0, src.as_ptr(), core::ptr::null()),
+                None => {
+                    vcall!(list, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (),
+                        dst.as_ptr(), 0, 0, 0, src.as_ptr(), core::ptr::null());
+                    copies += 1;
+                }
             }
         }
         if s.state != COPY_DEST {
@@ -919,6 +966,7 @@ unsafe fn record_uploads(alloc: *mut c_void, list: *mut c_void, staged: &[Staged
         }
     }
     crate::gpuprof::own_close(list);
+    note_upload_list(staged.iter().map(|s| s.size).sum(), copies);
 }
 
 unsafe fn adopt_backlog(up: &mut Uploader, budget_us: u128) {
@@ -1020,6 +1068,7 @@ pub unsafe fn submit_hook(queue: *mut c_void) {
                     record("d3d12_xs", "upload", &format!("submit-time upload list Close FAILED hr={hr:#010x}"));
                 } else {
                     let lists = [list];
+                    note_upload_queue(up.queue, "the ExecuteCommandLists submit hook");
                     vcall!(up.queue, 10, fn(u32, *const *mut c_void) -> (), 1, lists.as_ptr());
                 }
                 up.fence_value += 1;
@@ -1027,6 +1076,11 @@ pub unsafe fn submit_hook(queue: *mut c_void) {
                 up.ring[i].2 = up.fence_value;
                 if queue != up.queue {
                     up.sb.cross_queue += 1;
+                    UP_TOTALS[3].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    let (uq, f, v, n) = (up.queue, up.fence, up.fence_value, up.sb.cross_queue);
+                    if n <= 8 || n.is_power_of_two() {
+                        record("d3d12_xs", "upload", &format!("cross-queue Wait #{n}: title queue {queue:p} type {} waits on upload fence {f:p} value {v} signalled by upload queue {uq:p} type {}", queue_type(queue), queue_type(uq)));
+                    }
                     vcall!(queue, 15, fn(*mut c_void, u64) -> i32, up.fence, up.fence_value);
                 }
                 up.sb.uploads += 1;
@@ -1061,6 +1115,7 @@ unsafe fn init(queue: *mut c_void) -> Result<Uploader, String> {
     if hr < 0 || device.is_null() {
         return Err(format!("queue->GetDevice hr={hr:#010x}"));
     }
+    crate::vram_log::start(device);
     let mut alloc: *mut c_void = core::ptr::null_mut();
     let hr = vcall!(device, 9, fn(u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut alloc);
     if hr < 0 {
@@ -1078,6 +1133,7 @@ unsafe fn init(queue: *mut c_void) -> Result<Uploader, String> {
     if hr < 0 {
         return Err(format!("CreateFence hr={hr:#010x}"));
     }
+    crate::gpuprof_q::name_fence(fence, "upload");
     let fence_addr = fence as usize;
     let reaper = crate::reaper::Reaper::new(
         move || unsafe { vcall!(fence_addr as *mut c_void, 8, fn() -> u64) },
@@ -1796,6 +1852,7 @@ unsafe fn pump_inner(queue: *mut c_void) {
             record("d3d12_xs", "upload", &format!("upload list Close FAILED hr={hr:#010x}"));
         } else {
             let lists = [up.list];
+            note_upload_queue(queue, "the PresentX pump");
             vcall!(queue, 10, fn(u32, *const *mut c_void) -> (), 1, lists.as_ptr());
         }
         up.fence_value += 1;
@@ -1805,6 +1862,7 @@ unsafe fn pump_inner(queue: *mut c_void) {
             up.retire.push((up.fence_value, s.buf as usize, s.size));
         }
     }
+    publish_tracked(up);
     ph.mark("record+submit");
     ph.report(up.pumps, "", fresh_visits, fresh_staged, hashed + rehashed);
 

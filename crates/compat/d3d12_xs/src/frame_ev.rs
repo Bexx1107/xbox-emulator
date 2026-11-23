@@ -35,6 +35,8 @@ static BG: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static BG_TICKS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static QPC_LAST: AtomicI64 = AtomicI64::new(0);
 static QPC_CALLS: AtomicU64 = AtomicU64::new(0);
+static UP_BYTES: AtomicU64 = AtomicU64::new(0);
+static UP_COPIES: AtomicU64 = AtomicU64::new(0);
 static GTC_CALLS: AtomicU64 = AtomicU64::new(0);
 static PRESENT_TID: AtomicU32 = AtomicU32::new(0);
 static ORIG_QPC: AtomicUsize = AtomicUsize::new(0);
@@ -181,6 +183,22 @@ fn on_dxc(us: u64) {
     note_nested(DXC, (us as i128 * qpf() as i128 / 1_000_000) as i64);
 }
 
+pub fn note_upload(bytes: u64, copies: u64) {
+    #[cfg(test)]
+    if T_ON.with(|c| c.get()) {
+        T_ACC.with(|a| {
+            let mut a = a.borrow_mut();
+            a.upload_bytes += bytes;
+            a.upload_copies += copies;
+        });
+        return;
+    }
+    if active() {
+        UP_BYTES.fetch_add(bytes, Relaxed);
+        UP_COPIES.fetch_add(copies, Relaxed);
+    }
+}
+
 pub fn note_frame_wait(ticks: i64) {
     if active() {
         add(FRAME_WAIT, ticks, worker());
@@ -220,6 +238,8 @@ pub struct Snap {
     pub qpc_last: i64,
     pub qpc_calls: u64,
     pub gtc_calls: u64,
+    pub upload_bytes: u64,
+    pub upload_copies: u64,
 }
 
 pub fn take() -> Snap {
@@ -233,6 +253,8 @@ pub fn take() -> Snap {
     s.qpc_last = QPC_LAST.load(Relaxed);
     s.qpc_calls = QPC_CALLS.swap(0, Relaxed);
     s.gtc_calls = GTC_CALLS.swap(0, Relaxed);
+    s.upload_bytes = UP_BYTES.swap(0, Relaxed);
+    s.upload_copies = UP_COPIES.swap(0, Relaxed);
     s
 }
 
@@ -245,7 +267,7 @@ pub fn header() -> String {
     for name in NAMES {
         h.push_str(&format!(",{name}_n,{name}_ms"));
     }
-    h.push_str(",bg_pso_n,bg_xlat_n,bg_xlat_ms,bg_dxc_n,bg_dxc_ms,qpc_calls,gtc_calls,game_dt_ms");
+    h.push_str(",bg_pso_n,bg_xlat_n,bg_xlat_ms,bg_dxc_n,bg_dxc_ms,qpc_calls,gtc_calls,game_dt_ms,upload_bytes,upload_copies");
     h
 }
 
@@ -265,6 +287,7 @@ pub fn row(s: &Snap, game_dt_ms: Option<f64>) -> String {
     if let Some(g) = game_dt_ms {
         r.push_str(&format!("{g:.3}"));
     }
+    r.push_str(&format!(",{},{}", s.upload_bytes, s.upload_copies));
     r
 }
 
@@ -473,7 +496,21 @@ mod tests {
         assert!(!take_async_mark());
         let row = row(&s, Some(1.5));
         assert_eq!(row.split(',').count(), header().split(',').count());
-        assert!(row.ends_with("1.500"));
+        assert!(row.ends_with("1.500,0,0"));
+    }
+
+    #[test]
+    fn upload_bytes_and_copies_are_the_last_two_columns() {
+        let _ = local(true);
+        note_upload(0x4000, 3);
+        note_upload(0x1000, 2);
+        let s = local(false);
+        assert_eq!((s.upload_bytes, s.upload_copies), (0x5000, 5));
+        let h = header();
+        assert!(h.ends_with(",game_dt_ms,upload_bytes,upload_copies"));
+        let r = row(&s, None);
+        assert_eq!(r.split(',').count(), h.split(',').count());
+        assert!(r.ends_with(",20480,5"), "{r}");
     }
 
     #[test]

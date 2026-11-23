@@ -40,6 +40,8 @@ mod cmdlist_wrap;
 mod blendclamp;
 mod blend_probe;
 mod gpuprof;
+mod gpuprof_q;
+mod va_census;
 mod slowcall;
 mod console_slots;
 mod console_slots_cl2;
@@ -57,6 +59,7 @@ mod pso_prewarm;
 mod pso_xrec;
 mod overlay_font;
 mod overlay_sensors;
+mod vram_log;
 #[cfg(test)]
 mod overlay_hw;
 mod present_snap;

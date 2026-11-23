@@ -477,3 +477,32 @@ fn hw_a_freed_then_reallocated_region_is_rescanned_by_the_residency_cache() {
         VirtualFree(mem as *mut c_void, 0, 0x8000);
     }
 }
+
+#[test]
+#[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_ -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
+fn hw_vram_log_reads_the_device_adapter_budget_and_architecture() {
+    unsafe {
+        let g = gpu();
+        let dev = g.dev as *mut c_void;
+        let luid = crate::vram_log::device_luid(dev);
+        assert_ne!(luid, 0);
+        let arch = crate::vram_log::architecture(dev);
+        assert!(arch.is_some(), "CheckFeatureSupport(ARCHITECTURE1) must succeed");
+        let a = crate::vram_log::adapter3(luid).expect("IDXGIAdapter3 for the device LUID");
+        let local = crate::vram_log::query(a, 0).expect("LOCAL QueryVideoMemoryInfo");
+        assert!(local.budget > 0, "{local:?}");
+        assert!(crate::vram_log::query(a, 1).is_some(), "NON_LOCAL QueryVideoMemoryInfo");
+        let s0 = crate::vram_log::sample(a);
+        let s1 = crate::vram_log::sample(a);
+        let l = crate::vram_log::line(1, 2000, &s1, &s0);
+        assert!(l.starts_with("vram #1 (+2000ms): LOCAL: usage="), "{l}");
+        assert!(l.contains("NON_LOCAL: usage=") && l.contains("MakeResident +"), "{l}");
+        let t = crate::vram_log::arch_text(arch);
+        assert!(t.starts_with("UMA=") && !t.contains('?'), "{t}");
+        if g.warp {
+            assert!(arch.unwrap().uma, "WARP reports UMA");
+        }
+        let r: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*(*(a as *const *const usize)).add(2));
+        r(a);
+    }
+}

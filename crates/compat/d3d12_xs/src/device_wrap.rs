@@ -585,6 +585,9 @@ unsafe extern "system" fn create_committed_resource(
         let xdesc: [u8; 0x38] = unsafe { core::ptr::read_unaligned(pdesc as *const [u8; 0x38]) };
         let backing = if heap_type == 1 { unsafe { crate::gpu_va::back_committed_texture(&xdesc) } } else { None };
         unsafe { crate::gpu_va::note_resource(real, *ppv, &desc_copy[..0x38], init_state, backing) };
+        if crate::va_census::on() {
+            crate::va_census::note_how(unsafe { *ppv } as usize, match backing { Some(v) => format!("CreateCommittedResource with title backing {v:#x}"), None => "CreateCommittedResource".to_string() });
+        }
         let res = unsafe { *ppv };
         match backing {
             Some(va) => unsafe { crate::gpu_va::adopt_backing(res, va, xdesc, init_state) },
@@ -1982,6 +1985,9 @@ unsafe extern "system" fn create_placed_resource_x(
         let addref: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(*real_vtbl(res).add(1)) };
         unsafe { addref(res) };
         unsafe { crate::gpu_va::note_resource(real, res, &d, init_state, Some(va)) };
+        if crate::va_census::on() {
+            crate::va_census::note_how(res as usize, match &made { Some(m) => format!("CreatePlacedResourceX aliased {:?} heap {:#x}+{:#x}", m.kind, m.heap, m.offset), None => "CreatePlacedResourceX separate committed".to_string() });
+        }
         crate::placed::register(res, crate::placed::Placed { va, desc: orig, init_state });
         crate::res3d::note_create(res, &orig, &format!("placedX va={va:#x} {}", match &made { Some(m) => format!("aliased {:?} heap {:#x}+{:#x}", m.kind, m.heap, m.offset), None => "separate committed".to_string() }));
         if flags & 0x7 != 0 {

@@ -385,3 +385,23 @@ fn passcap_hw_msaa_r11g11b10_resolves_to_clear_color() {
         assert!(e.is_empty(), "debug layer errors: {e:#?}");
     }
 }
+
+#[test]
+fn passcap_ps_draw_trigger_logic() {
+    use crate::passcap::{parse, parse_ps_draw, ps_draw_due, PS_DRAW_GAP_S, SLOW_MAX_SHOTS};
+    assert_eq!(parse_ps_draw("a946cde5f859340b:60"), Some((0xa946cde5f859340b, 60.0)));
+    assert_eq!(parse_ps_draw("0xa946cde5f859340b"), Some((0xa946cde5f859340b, 0.0)));
+    assert_eq!(parse_ps_draw("zz:1"), None);
+    assert_eq!(parse_ps_draw("a946:-1"), None);
+    let s = parse("ps:a946cde5f859340b:60").unwrap();
+    assert_eq!(s.ps_draw, Some((0xa946cde5f859340b, 60.0)));
+    assert!(s.unknown.is_empty());
+    let tg = Some((1u64, 60.0));
+    assert!(!ps_draw_due(true, 59.9, tg, 0, 0.0));
+    assert!(ps_draw_due(true, 60.0, tg, 0, 0.0));
+    assert!(!ps_draw_due(false, 61.0, tg, 0, 0.0));
+    assert!(!ps_draw_due(true, 61.0, tg, 1, 60.0));
+    assert!(ps_draw_due(true, 60.0 + PS_DRAW_GAP_S, tg, 1, 60.0));
+    assert!(!ps_draw_due(true, 99.0, tg, SLOW_MAX_SHOTS, 60.0));
+    assert!(!ps_draw_due(true, 99.0, None, 0, 0.0));
+}

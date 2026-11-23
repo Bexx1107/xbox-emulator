@@ -17,7 +17,7 @@ pub const BYTE_KEYS: [&str; 5] = ["fn.start_game_instance_original", "fn.start_g
 pub struct Layout {
     pub site: usize,
     pub browse: usize,
-    pub slots: [usize; 3],
+    pub slots: Vec<usize>,
     pub ctor: usize,
     pub ctor_call_site: usize,
     pub dtor: usize,
@@ -36,7 +36,7 @@ pub fn layout(o: &crate::title_offsets::Offsets) -> Result<Layout, String> {
     Ok(Layout {
         site: v[0],
         browse: v[1],
-        slots: [v[2], v[3], v[4]],
+        slots: vec![v[2], v[3], v[4]],
         ctor: v[5],
         ctor_call_site: v[6],
         dtor: v[7],
@@ -319,7 +319,7 @@ unsafe fn install_browse(base: usize, l: &Layout) -> Result<usize, String> {
     ORIG_BROWSE.store(base + l.browse, Ordering::Release);
     let hook = browse_hook as *const () as usize;
     let mut n = 0;
-    for rva in l.slots {
+    for &rva in &l.slots {
         let slot = (base + rva) as *mut usize;
         let cur = core::ptr::read_volatile(slot);
         if cur == hook {
@@ -357,14 +357,28 @@ pub fn apply() {
         Some(b) => b,
         None => return,
     };
-    let l = match crate::title_offsets::load_for(TITLE_EXE).and_then(|o| {
-        let stamp = unsafe { crate::title_offsets::image_timestamp(base as *const u8) };
-        if o.pe_timestamp.is_none() || !o.matches_image(stamp) {
-            return Err(format!("{} does not match image timestamp {stamp:#x}", o.source));
+    let from_symbols = crate::title_symbols::for_this_title().and_then(|t| {
+        let (size, data) = unsafe { image_sections(base as *const u8) };
+        let img = unsafe { core::slice::from_raw_parts(base as *const u8, size) };
+        layout_from_image(img, base, &data, t).map(|l| (l, t.source.clone()))
+    });
+    let chosen = match from_symbols {
+        Ok(v) => Ok(v),
+        Err(se) => crate::title_offsets::load_for(TITLE_EXE)
+            .and_then(|o| {
+                let stamp = unsafe { crate::title_offsets::image_timestamp(base as *const u8) };
+                if o.pe_timestamp.is_none() || !o.matches_image(stamp) {
+                    return Err(format!("{} does not match image timestamp {stamp:#x}", o.source));
+                }
+                layout(&o).map(|l| (l, o.source.clone()))
+            })
+            .map_err(|je| format!("symbols: {se}; offsets file: {je}")),
+    };
+    let l = match chosen {
+        Ok((l, source)) => {
+            crate::record_raw("fn-match", "layout", &format!("from {source}: {} Browse vtable slots", l.slots.len()));
+            l
         }
-        layout(&o)
-    }) {
-        Ok(l) => l,
         Err(e) => {
             crate::record_raw("fn-match", "inert", &format!("{e} - StartGameInstance patch and Browse hook NOT installed"));
             return;
@@ -385,6 +399,105 @@ pub fn apply() {
             Err(e) => crate::record_raw("fn-match", "browse", &format!("hook NOT installed: {e}")),
         }
     }
+}
+
+pub const SYMBOLS: [&str; 4] = ["UGameInstance::StartGameInstance", "UEngine::Browse", "FURL::FURL", "FURL::~FURL"];
+pub const UNIQUE_SYMBOLS: [&str; 3] = ["UGameInstance::StartGameInstance", "UEngine::Browse", "FURL::~FURL"];
+
+pub fn mov_from_rax(lea: &[u8]) -> Option<[u8; 7]> {
+    if lea.len() < 7 || lea[0] & 0xFB != 0x48 || lea[1] != 0x8D || lea[2] & 0xC7 != 0x05 {
+        return None;
+    }
+    let dst = ((lea[0] >> 2) & 1) << 3 | (lea[2] >> 3) & 7;
+    Some([0x48 | (dst >> 3), 0x89, 0xC0 | (dst & 7), 0x90, 0x90, 0x90, 0x90])
+}
+
+fn unique(hits: Vec<usize>, what: &str) -> Result<usize, String> {
+    match hits.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(format!("no {what} found")),
+        many => Err(format!("{} candidates for {what}", many.len())),
+    }
+}
+
+pub fn layout_from_image(img: &[u8], base: usize, data: &[(usize, usize)], t: &crate::title_symbols::Table) -> Result<Layout, String> {
+    let s = t.require(&UNIQUE_SYMBOLS)?;
+    let (start, browse, dtor) = (s[0], s[1], s[2]);
+    let ctors: Vec<usize> = t.all("FURL::FURL").iter().map(|c| c.rva).collect();
+    if ctors.is_empty() {
+        return Err(format!("{} has no FURL::FURL", t.source));
+    }
+    let body = img.get(start.rva..start.rva + start.size).ok_or("StartGameInstance lies outside the image")?;
+    let at = |i: usize| start.rva + i;
+    let site = unique(
+        (5..body.len().saturating_sub(7)).filter(|&i| body[i - 5] == 0xE8 && mov_from_rax(&body[i..i + 7]).is_some()).map(at).collect(),
+        "StartGameInstance command-line load after a call",
+    )?;
+    let sets_travel_type = |i: usize| body[i.saturating_sub(24)..i].windows(2).any(|w| w == [0x41, 0xB9]);
+    let ctor_call_site = unique(
+        (0..body.len().saturating_sub(5))
+            .filter(|&i| call_target(at(i), &body[i..i + 5]).map(|c| ctors.contains(&c)).unwrap_or(false) && sets_travel_type(i))
+            .map(at)
+            .collect(),
+        "FURL(Base, URL, TravelType) constructor call in StartGameInstance",
+    )?;
+    let ctor = call_target(ctor_call_site, &img[ctor_call_site..ctor_call_site + 5]).unwrap();
+    let vcall_site = unique((0..body.len().saturating_sub(7)).filter(|&i| body[i..i + 3] == [0x41, 0xFF, 0x92]).map(at).collect(), "Browse virtual call in StartGameInstance")?;
+    let original: [u8; 7] = img[site..site + 7].try_into().unwrap();
+    let patched = mov_from_rax(&original).unwrap();
+    let want = ((base + browse.rva) as u64).to_le_bytes();
+    let mut slots = Vec::new();
+    for &(rva, len) in data {
+        let Some(sec) = img.get(rva..rva + len) else { continue };
+        for (k, q) in sec.chunks_exact(8).enumerate() {
+            if q == want {
+                slots.push(rva + k * 8);
+            }
+        }
+    }
+    if slots.is_empty() || slots.len() > 16 {
+        return Err(format!("{} vtable slots hold UEngine::Browse", slots.len()));
+    }
+    Ok(Layout {
+        site,
+        browse: browse.rva,
+        slots,
+        ctor,
+        ctor_call_site,
+        dtor: dtor.rva,
+        vcall_site,
+        original,
+        patched,
+        browse_prologue: Vec::new(),
+        dtor_prologue: Vec::new(),
+        vcall: img[vcall_site..vcall_site + 7].to_vec(),
+    })
+}
+
+pub const SCN_INITIALIZED_DATA: u32 = 1 << 6;
+pub const SCN_DISCARDABLE: u32 = 1 << 25;
+pub const SCN_EXECUTE: u32 = 1 << 29;
+
+pub fn is_data_section(ch: u32) -> bool {
+    ch & SCN_EXECUTE == 0 && ch & SCN_DISCARDABLE == 0 && ch & SCN_INITIALIZED_DATA != 0
+}
+
+pub unsafe fn image_sections(base: *const u8) -> (usize, Vec<(usize, usize)>) {
+    let pe = core::ptr::read_unaligned(base.add(0x3c) as *const u32) as usize;
+    let n = core::ptr::read_unaligned(base.add(pe + 6) as *const u16) as usize;
+    let opt = core::ptr::read_unaligned(base.add(pe + 20) as *const u16) as usize;
+    let size = core::ptr::read_unaligned(base.add(pe + 24 + 56) as *const u32) as usize;
+    let mut data = Vec::new();
+    for i in 0..n {
+        let s = base.add(pe + 24 + opt + i * 40);
+        let vsz = core::ptr::read_unaligned(s.add(8) as *const u32) as usize;
+        let va = core::ptr::read_unaligned(s.add(12) as *const u32) as usize;
+        let ch = core::ptr::read_unaligned(s.add(36) as *const u32);
+        if is_data_section(ch) {
+            data.push((va, vsz & !7));
+        }
+    }
+    (size, data)
 }
 
 #[cfg(test)]
@@ -434,7 +547,7 @@ mod tests {
     fn the_layout_comes_from_the_offsets_file() {
         let o = crate::title_offsets::parse(&fixture(), "t").unwrap();
         let l = layout(&o).unwrap();
-        assert_eq!((l.site, l.slots, l.vcall_site), (0x1000, [0x1020, 0x1030, 0x1040], 0x1080));
+        assert_eq!((l.site, l.slots.clone(), l.vcall_site), (0x1000, vec![0x1020, 0x1030, 0x1040], 0x1080));
         assert_eq!((l.original, l.patched), (ORIGINAL, PATCHED));
         assert_eq!(l.vcall, vec![0x41, 0xFF, 0x92]);
         let short = fixture().replace("4989C790909090", "4989C7");
@@ -491,6 +604,7 @@ mod tests {
         base: u64,
         stamp: u32,
         secs: Vec<(u32, u32, u32)>,
+        data: Vec<(usize, usize)>,
     }
 
     impl Pe {
@@ -506,15 +620,20 @@ mod tests {
             let base = u64::from_le_bytes(h[pe + 24 + 24..pe + 24 + 32].try_into().ok()?);
             let st = pe + 24 + opt;
             let mut secs = Vec::new();
+            let mut data = Vec::new();
             for i in 0..nsec {
                 let s = &h[st + i * 40..st + i * 40 + 40];
                 let vsz = u32::from_le_bytes(s[8..12].try_into().ok()?);
                 let va = u32::from_le_bytes(s[12..16].try_into().ok()?);
                 let raw = u32::from_le_bytes(s[20..24].try_into().ok()?);
+                let ch = u32::from_le_bytes(s[36..40].try_into().ok()?);
+                if is_data_section(ch) {
+                    data.push((va as usize, vsz as usize & !7));
+                }
                 secs.push((va, vsz, raw));
             }
             f.seek(SeekFrom::Start(0)).ok()?;
-            Some(Pe { f, base, stamp, secs })
+            Some(Pe { f, base, stamp, secs, data })
         }
         fn read(&mut self, rva: usize, n: usize) -> Vec<u8> {
             use std::io::{Read, Seek, SeekFrom};
@@ -553,7 +672,7 @@ mod tests {
         let c = pe.read(l.ctor_call_site, 5);
         assert_eq!(call_target(l.ctor_call_site, &c), Some(l.ctor));
         assert_eq!(pe.read(l.vcall_site, l.vcall.len()), l.vcall);
-        for slot in l.slots {
+        for &slot in &l.slots {
             let v = u64::from_le_bytes(pe.read(slot, 8).try_into().unwrap());
             assert_eq!(v, pe.base + l.browse as u64, "slot {slot:#x}");
         }
@@ -563,5 +682,87 @@ mod tests {
     fn url_describe_matches_ue_shape() {
         let u = url("127.0.0.1", 7777, "/Game/Maps/Frontend");
         assert_eq!(u.describe(), "127.0.0.1:7777/Game/Maps/Frontend?Name=XboxEmulator");
+    }
+
+    #[test]
+    fn mov_from_rax_follows_the_lea_destination() {
+        assert_eq!(mov_from_rax(&[0x4C, 0x8D, 0x3D, 1, 2, 3, 4]), Some([0x49, 0x89, 0xC7, 0x90, 0x90, 0x90, 0x90]));
+        assert_eq!(mov_from_rax(&[0x48, 0x8D, 0x0D, 1, 2, 3, 4]), Some([0x48, 0x89, 0xC1, 0x90, 0x90, 0x90, 0x90]));
+        assert_eq!(mov_from_rax(&[0x4C, 0x8D, 0x7D, 1, 2, 3, 4]), None);
+        assert_eq!(mov_from_rax(&[0x4C, 0x8B, 0x3D, 1, 2, 3, 4]), None);
+    }
+
+    fn synthetic_image(base: usize) -> (Vec<u8>, crate::title_symbols::Table) {
+        let mut img = vec![0u8; 0x4000];
+        img[0x110] = 0xE8;
+        img[0x115..0x11c].copy_from_slice(&[0x4C, 0x8D, 0x3D, 0x10, 0x20, 0x30, 0x00]);
+        img[0x124..0x12a].copy_from_slice(&[0x41, 0xB9, 0x01, 0x00, 0x00, 0x00]);
+        img[0x130] = 0xE8;
+        img[0x131..0x135].copy_from_slice(&((0x800i32 - 0x135) as i32).to_le_bytes());
+        img[0x170] = 0xE8;
+        img[0x171..0x175].copy_from_slice(&((0xc00i32 - 0x175) as i32).to_le_bytes());
+        img[0x150..0x157].copy_from_slice(&[0x41, 0xFF, 0x92, 0x40, 0x04, 0x00, 0x00]);
+        img[0x2040..0x2048].copy_from_slice(&((base + 0x900) as u64).to_le_bytes());
+        img[0x2088..0x2090].copy_from_slice(&((base + 0x900) as u64).to_le_bytes());
+        let f = crate::title_symbols::build_for_test(TITLE_EXE, &[("UGameInstance::StartGameInstance", 0x100, 0x80), ("UEngine::Browse", 0x900, 0x40), ("FURL::FURL", 0x800, 0x40), ("FURL::FURL", 0xc00, 0x40), ("FURL::~FURL", 0xa00, 0x20)]);
+        let t = crate::title_symbols::parse_bytes(&f, &SYMBOLS, "t").unwrap();
+        (img, t)
+    }
+
+    #[test]
+    fn symbols_and_the_image_give_the_whole_layout() {
+        let base = 5usize << 30;
+        let (img, t) = synthetic_image(base);
+        let l = layout_from_image(&img, base, &[(0x2000, 0x100)], &t).unwrap();
+        assert_eq!((l.site, l.ctor_call_site, l.vcall_site, l.browse, l.ctor, l.dtor), (0x115, 0x130, 0x150, 0x900, 0x800, 0xa00));
+        assert_eq!(l.slots, vec![0x2040, 0x2088]);
+        assert_eq!(l.original, [0x4C, 0x8D, 0x3D, 0x10, 0x20, 0x30, 0x00]);
+        assert_eq!(l.patched, [0x49, 0x89, 0xC7, 0x90, 0x90, 0x90, 0x90]);
+        assert!(layout_from_image(&img, base, &[(0x3000, 0x100)], &t).unwrap_err().contains("0 vtable slots"));
+        let mut two = img.clone();
+        two[0x160] = 0xE8;
+        two[0x165..0x16c].copy_from_slice(&[0x48, 0x8D, 0x05, 0, 0, 0, 0]);
+        assert!(layout_from_image(&two, base, &[(0x2000, 0x100)], &t).unwrap_err().contains("2 candidates"));
+        let missing = crate::title_symbols::parse_bytes(&crate::title_symbols::build_for_test(TITLE_EXE, &[("UEngine::Browse", 0x900, 0x40)]), &SYMBOLS, "t").unwrap();
+        assert!(layout_from_image(&img, base, &[(0x2000, 0x100)], &missing).unwrap_err().contains("StartGameInstance"));
+    }
+
+    #[test]
+    fn dump_symbols_reproduce_the_offsets_file() {
+        let Ok(path) = std::env::var("TOMBOX_FN_DUMP_EXE") else {
+            eprintln!("TOMBOX_FN_DUMP_EXE unset; symbol check not run");
+            return;
+        };
+        let Some(mut pe) = Pe::open(&path) else {
+            eprintln!("dump exe not present at {path}; symbol check not run");
+            return;
+        };
+        let t = match crate::title_symbols::load(std::path::Path::new(&path), &SYMBOLS) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{e}; symbol check not run");
+                return;
+            }
+        };
+        let end = pe.secs.iter().map(|(va, vsz, _)| (*va + *vsz) as usize).max().unwrap();
+        let mut img = vec![0u8; end];
+        let secs = pe.secs.clone();
+        for (va, vsz, _) in &secs {
+            let b = pe.read(*va as usize, *vsz as usize);
+            img[*va as usize..*va as usize + b.len()].copy_from_slice(&b);
+        }
+        let data: Vec<(usize, usize)> = pe.data.clone();
+        let l = layout_from_image(&img, pe.base as usize, &data, &t).unwrap();
+        eprintln!("symbol layout: site {:#x} slots {}", l.site, l.slots.len());
+        if let Ok(o) = crate::title_offsets::load_for(TITLE_EXE) {
+            let j = layout(&o).unwrap();
+            assert_eq!((l.site, l.browse, l.ctor, l.ctor_call_site, l.dtor, l.vcall_site), (j.site, j.browse, j.ctor, j.ctor_call_site, j.dtor, j.vcall_site));
+            assert_eq!((l.original, l.patched, &l.vcall), (j.original, j.patched, &j.vcall));
+            let mut a = l.slots.clone();
+            let mut b = j.slots.clone();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b);
+        }
     }
 }

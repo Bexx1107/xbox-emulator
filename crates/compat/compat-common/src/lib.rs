@@ -45,6 +45,7 @@ pub mod partition_heap;
 pub mod headless;
 pub mod iat;
 pub mod title_offsets;
+pub mod title_symbols;
 
 #[global_allocator]
 static TB_ALLOC: private_heap::PrivateHeap = private_heap::PrivateHeap;
