@@ -755,6 +755,12 @@ fn boost_prewarm(key: u64) {
     }
 }
 
+const GAME_PS_RTFMTS: [[u8; 8]; 3] = [[0x80, 0, 0, 0, 0, 0, 0, 0], [0x02, 0, 0, 0, 0, 0, 0, 0], [0x82, 0, 0, 0, 0, 0, 0, 0]];
+
+fn is_pixel(blob: &[u8]) -> bool {
+    std::panic::catch_unwind(|| tombox_xshader::extract(blob).map(|e| matches!(e.stage, tombox_xshader::Stage::Pixel)).unwrap_or(false)).unwrap_or(false)
+}
+
 fn prewarm_order<T>(known: Vec<T>, from_game: Vec<T>) -> Vec<T> {
     let mut v: Vec<T> = from_game.into_iter().rev().collect();
     v.extend(known.into_iter().rev());
@@ -800,7 +806,8 @@ pub fn start_prewarm() {
             }
         }
         let known = todo.len();
-        if let Ok(rd) = std::fs::read_dir(&game) {
+        let game_on = std::env::var("TOMBOX_GAME_SCAN_PREWARM").map(|v| v.trim() == "1").unwrap_or(false);
+        if let Some(rd) = game_on.then(|| std::fs::read_dir(&game).ok()).flatten() {
             let mut names: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
             names.sort();
             for name in names {
@@ -819,8 +826,11 @@ pub fn start_prewarm() {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let workers = prewarm_workers(cores, extra);
         let queue = Arc::new(Mutex::new(todo));
+        let seen_rt = Arc::new(Mutex::new(seen));
         for _ in 0..workers {
             let q = queue.clone();
+            let seen_rt = seen_rt.clone();
+            let game_dir = game.clone();
             let _ = std::thread::Builder::new().name("tombox-shader-prewarm".into()).spawn(move || {
                 unsafe { SetThreadPriority(GetCurrentThread(), PREWARM_PRIORITY) };
                 let me = unsafe { OpenThread(THREAD_SET_QUERY, 0, GetCurrentThreadId()) } as usize;
@@ -833,6 +843,14 @@ pub fn start_prewarm() {
                     if fnv1a(&blob) != h {
                         let _ = std::fs::remove_file(&p);
                         continue;
+                    }
+                    if rt == [0u8; 8] && p.starts_with(&game_dir) && is_pixel(&blob) {
+                        let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+                        for v in GAME_PS_RTFMTS {
+                            if seen_rt.lock().unwrap_or_else(|e| e.into_inner()).insert((h, v)) {
+                                g.insert(0, (p.clone(), h, v));
+                            }
+                        }
                     }
                     let key = cache_key(h, &rt);
                     let c = cell(key);

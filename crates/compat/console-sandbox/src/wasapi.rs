@@ -1084,24 +1084,40 @@ impl Spatial {
         let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32>(self.0 .0, 6)(self.0 .0, &mut e);
         if hr < 0 { Err(hr) } else { Ok(Com(e)) }
     }
+    pub fn format_enumerator(&self) -> Result<FormatEnumerator, i32> {
+        unsafe { self.formats().map(FormatEnumerator) }
+    }
     pub fn format_count(&self) -> Result<u32, i32> {
+        self.format_enumerator()?.count()
+    }
+    pub fn format_at(&self, index: u32) -> Result<Vec<u8>, i32> {
+        self.format_enumerator()?.get(index)
+    }
+}
+
+pub struct FormatEnumerator(Com);
+
+unsafe impl Send for FormatEnumerator {}
+
+impl FormatEnumerator {
+    pub fn count(&self) -> Result<u32, i32> {
         unsafe {
-            let e = self.formats()?;
             let mut n = 0u32;
-            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(e.0, 3)(e.0, &mut n);
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(self.0 .0, 3)(self.0 .0, &mut n);
             if hr < 0 { Err(hr) } else { Ok(n) }
         }
     }
-    pub fn format_at(&self, index: u32) -> Result<Vec<u8>, i32> {
+    pub fn get(&self, index: u32) -> Result<Vec<u8>, i32> {
         unsafe {
-            let e = self.formats()?;
             let mut f: *mut u8 = core::ptr::null_mut();
-            let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, *mut *mut u8) -> i32>(e.0, 4)(e.0, index, &mut f);
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, *mut *mut u8) -> i32>(self.0 .0, 4)(self.0 .0, index, &mut f);
             if hr < 0 || f.is_null() {
-                return Err(hr);
+                return Err(if hr < 0 { hr } else { 0x8000_4003u32 as i32 });
             }
             let head = core::slice::from_raw_parts(f, 0x12);
-            Ok(core::slice::from_raw_parts(f, format_len(head)).to_vec())
+            let out = core::slice::from_raw_parts(f, format_len(head)).to_vec();
+            CoTaskMemFree(f as *mut c_void);
+            Ok(out)
         }
     }
 }

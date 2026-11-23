@@ -1029,6 +1029,33 @@ elease`, the log shows one install and every interface is emulated.
       - The host forwards the exact console params, and the test checks that the host returns the PC error unchanged.
       - If a PC with a metadata format activates it, the host returns E_NOTIMPL. Both of these come from the audio engine, which is not in any dump: the DCAS metadata bytes per object (feac0 params +0x1c) and the reply qword at p+0x2e4 (the 7th out argument of 127208, filled through 126718).
     - OPEN, type 4 (125980 -> 124574). It ignores the args and creates a 0x28-byte object (vtable 14da50) around a 0x30-byte inner object (28a30 / 28ab8), then queries it for IID de889ace-f1ef-48b9-b599-1a9bf1541cc5. That IID is not registered on the PC and its ids are not decoded, so type 4 still falls through to the generic object.
+  - Round 14 (2026-11-22, type 4 and HRTF dirty bit 0x20). Code: crossvm::format_enum / FORMAT_ENUM_TYPE, wasapi::FormatEnumerator.
+    - DONE type 4 = IAudioFormatEnumerator, child of the spatial client.
+      - The spatial client's child-creator table (31a0 -> map 1ac4f0) maps 0xf -> 124e00, 0x10 -> 125160, 4 -> 125980, 0x16 -> 1255d0. Its own id map (3030 -> 1ac4e0) is 0x30-0x35, 0x85, 0x86.
+      - 125980 -> 124574 allocates the 0x28-byte object (vtable 14da50) and builds its inner object at +0x20 through 12617c -> 28a30 / 28ab8 (0x30 bytes, vtables 14b160 / 14b118). It then queries the result for de889ace-f1ef-48b9-b599-1a9bf1541cc5.
+      - de889ace is the generic cross-VM message-target interface. It has 31 users in AudioSes, and every created object implements it.
+        - Slots: 3 = 90260 (stores the 4th argument at +0x10), 4 = E_NOTIMPL, 5 = the dispatcher (125e00 for type 4), 6 = no-op, 7 = the scalar deleting destructor.
+        - The dispatcher looks the call id up in a per-class std::map. A missing id gives E_NOTIMPL, and the HRESULT is written to envelope +4.
+        - This interface is the host's own object model (the crossvm Object table plus dispatch). It is not a PC interface.
+      - The type 4 map 1ac4d0 (built by 2fb0) holds only 0x3a -> 125a10 and 0x3b -> 125a90.
+        - 0x3a: validator 123874. It calls inner slot 3 (2a3f0, which always writes 1) to fill R+0 with the count.
+        - 0x3b: validator 1238bc requires cbSize at A+0x14 + 0x12 <= 0x48, else E_INVALIDARG. It then calls inner slot 4 (299c0) with the index from A+0.
+          - Index 0 gives WAVE_FORMAT_IEEE_FLOAT, mono, 48000 Hz, 32-bit. Any other index gives E_BOUNDS.
+          - The handler copies 0x12 bytes to R+4 and frees the format with CoTaskMemFree.
+      - The host now uses the PC equivalent.
+        - Creating type 4 calls ISpatialAudioClient::GetSupportedAudioObjectFormatEnumerator on the parent's endpoint and returns the PC error if that fails.
+        - 0x3a and 0x3b go to the PC IAudioFormatEnumerator GetCount and GetFormat. An index at or past the count returns E_BOUNDS, and the cbSize check matches the console.
+        - Only type 4 serves 0x3a / 0x3b, and type 4 serves nothing else.
+      - On this PC the enumerator gives count 1 and float mono 48000 Hz, which matches the console's fixed answer. Tested in the endpoint step of verify_crossvm.
+      - No type 4 method is left without a PC equivalent.
+    - no PC setter | HRTF dirty bit 0x20 with byte +0x74 = 1. The writer is PC AudioSes 10f160, an internal object slot (vtable 139878), not a public API.
+      - It runs when an object's record is (re)initialised: cookie, type, flags 3 (|4 for dynamic), volume 1.0, position 0, environment reset to 0 (dirty 4) when the title has not set it, then dirty 0x20 and the byte at +0x74.
+      - The public ISpatialAudioObjectForHrtf setters (vtable 139888) cover the other bits:
+        - SetPosition (10e990): writes +0x10..+0x18 and record flag 4; fails with 0x88890104 on static objects.
+        - SetGain (10e7b0): bit 1.
+        - SetEnvironment (10e6d0): bit 4.
+        - SetOrientation / SetDistanceDecay / SetDirectivity: bits 2 / 8 / 0x10.
+      - No public setter writes 0x20. The PC object gets the same initialisation from its own ActivateSpatialAudioObject, which the host already calls. The host therefore counts the bit (hrtf_unknown) and does not forward it.
 - chad.dll XDspSubmitCommandWithEnvelope: the DSP microcode that consumes the envelope is not in any dump, so the per-partition gain is inferred from the GDK description. See the chad exports.txt note for the known differences from the console's 8-float snapshot.
 - xmem/acphal test race: gcxaudioext tests crash with 0xc0000005 when the first ApuAlloc (xmem.dll + acphal.dll) runs at the same time as MMDevice COM enumeration on another thread. Loading the DLLs alone does not crash. The suspected cause is xmem IAT patching (iat.rs write_slot sets PAGE_READWRITE) racing live modules. The gcxaudioext tests are serialized to avoid it, and the root cause is not fixed.
 

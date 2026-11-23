@@ -187,6 +187,10 @@ pub const SPATIAL_CATEGORY_AT: usize = 0x48;
 pub const SPATIAL_FRAMES_AT: usize = 0x4c;
 pub const SPATIAL_OFFLOAD_AT: usize = 0x50;
 pub const FORMAT_ENUM_AT: usize = 4;
+pub const FORMAT_ENUM_TYPE: u32 = 4;
+pub const FORMAT_ENUM_CB_AT: usize = 0x14;
+pub const FORMAT_ENUM_ROOM: usize = 0x48;
+const E_BOUNDS: i32 = 0x8000_000bu32 as i32;
 pub const PLAIN_FORMAT: usize = 0x12;
 
 pub struct InitLayout {
@@ -291,11 +295,12 @@ struct Object {
     pc_session: Option<Arc<wasapi::PcSession>>,
     media: Option<(wasapi::MediaManager, i64)>,
     spatial: Option<SpatialHost>,
+    formats: Option<wasapi::FormatEnumerator>,
 }
 
 impl Object {
     fn new(kind: u32, parent: u32, device: Option<String>) -> Self {
-        Object { kind, parent, device, stream: None, volumes: None, properties: None, notify: false, notify_id: 0, watch: None, list_cursor: 0, pc_sessions: Vec::new(), pc_session: None, media: None, spatial: None }
+        Object { kind, parent, device, stream: None, volumes: None, properties: None, notify: false, notify_id: 0, watch: None, list_cursor: 0, pc_sessions: Vec::new(), pc_session: None, media: None, spatial: None, formats: None }
     }
 }
 
@@ -534,6 +539,10 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
     if id != CREATE_OBJECT && id != RELEASE_OBJECT {
         if let Some(hr) = spatial_call(id, object, a) {
             return hr;
+        }
+        let enumerator = state().objects.get(&object).map(|o| o.kind == FORMAT_ENUM_TYPE).unwrap_or(false);
+        if enumerator || id == FORMAT_ENUM_COUNT || id == FORMAT_ENUM_GET {
+            return format_enum(id, object, a);
         }
     }
     match id {
@@ -847,7 +856,7 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
             }
         }
         PROPERTY_GET_VALUE => property_value(object, a, room),
-        SPATIAL_STATIC_POSITION | SPATIAL_NATIVE_MASK | SPATIAL_MAX_DYNAMIC | SPATIAL_MAX_FRAMES | SPATIAL_FORMAT_SUPPORTED | SPATIAL_STREAM_AVAILABLE | SPATIAL_OFFLOAD_CAPABLE | SPATIAL_MAX_FRAMES_FOR_CATEGORY | FORMAT_ENUM_COUNT | FORMAT_ENUM_GET => spatial(id, object, a),
+        SPATIAL_STATIC_POSITION | SPATIAL_NATIVE_MASK | SPATIAL_MAX_DYNAMIC | SPATIAL_MAX_FRAMES | SPATIAL_FORMAT_SUPPORTED | SPATIAL_STREAM_AVAILABLE | SPATIAL_OFFLOAD_CAPABLE | SPATIAL_MAX_FRAMES_FOR_CATEGORY => spatial(id, object, a),
         ENDPOINT_CHANNEL_COUNT => {
             wr(a, 0, endpoint_channels(&device_for(object)));
             S_OK
@@ -913,6 +922,17 @@ unsafe fn create_object(a: *mut u8, room: usize) -> i32 {
     };
     if let Some(hr) = spatial_stream_create(kind, method, parent, a, room) {
         return hr;
+    }
+    let mut formats = None;
+    if kind == FORMAT_ENUM_TYPE {
+        let pc = wasapi::spatial(device_for(parent).as_deref()).and_then(|sp| sp.format_enumerator());
+        match pc {
+            Ok(e) => formats = Some(e),
+            Err(hr) => {
+                compat_common::record_raw("crossvm-audio", "CreateObject", &format!("type 4 (125980 -> 124574, IAudioFormatEnumerator child of the spatial client) parent {parent:#x}: PC ISpatialAudioClient::GetSupportedAudioObjectFormatEnumerator -> {:#010x}", hr as u32));
+                return hr;
+            }
+        }
     }
     let mut sessions = Vec::new();
     let mut session = None;
@@ -990,6 +1010,7 @@ unsafe fn create_object(a: *mut u8, room: usize) -> i32 {
     o.pc_sessions = sessions;
     o.pc_session = session;
     o.media = media;
+    o.formats = formats;
     s.objects.insert(n, o);
     wr(a, 0xc, n);
     S_OK
@@ -2418,19 +2439,48 @@ unsafe fn spatial(id: u32, object: u32, a: *mut u8) -> i32 {
             let offload: u8 = rd(a, SPATIAL_OFFLOAD_AT);
             put(sp.max_frames_for_category(cat, offload != 0, &f), SPATIAL_FRAMES_AT)
         }
-        FORMAT_ENUM_COUNT => put(sp.format_count(), 0),
-        FORMAT_ENUM_GET => match sp.format_at(0) {
-            Ok(f) => {
-                let plain = plain_format(&f);
-                core::ptr::copy_nonoverlapping(plain.as_ptr(), a.add(FORMAT_ENUM_AT), PLAIN_FORMAT);
-                S_OK
-            }
-            Err(hr) => hr,
-        },
         _ => {
             let cat: u32 = rd(a, 0);
             put(sp.offload_capable(cat), 4)
         }
+    }
+}
+
+unsafe fn format_enum(id: u32, object: u32, a: *mut u8) -> i32 {
+    let s = state();
+    let Some(e) = s.objects.get(&object).filter(|o| o.kind == FORMAT_ENUM_TYPE).and_then(|o| o.formats.as_ref()) else {
+        compat_common::record_raw("crossvm-audio", "format-enum", &format!("call id {id:#x} on object {object:#x}: only the type 4 object (map 1ac4d0: 0x3a -> 125a10, 0x3b -> 125a90) serves 0x3a / 0x3b and it serves nothing else; 125e00 answers E_NOTIMPL"));
+        return E_NOTIMPL;
+    };
+    match id {
+        FORMAT_ENUM_COUNT => match e.count() {
+            Ok(n) => {
+                wr(a, 0, n);
+                S_OK
+            }
+            Err(hr) => hr,
+        },
+        FORMAT_ENUM_GET => {
+            let cb: u16 = rd(a, FORMAT_ENUM_CB_AT);
+            if cb as usize + PLAIN_FORMAT > FORMAT_ENUM_ROOM {
+                return E_INVALIDARG;
+            }
+            let index: u32 = rd(a, 0);
+            match e.count() {
+                Ok(n) if index >= n => return E_BOUNDS,
+                Err(hr) => return hr,
+                _ => {}
+            }
+            match e.get(index) {
+                Ok(f) => {
+                    let plain = plain_format(&f);
+                    core::ptr::copy_nonoverlapping(plain.as_ptr(), a.add(FORMAT_ENUM_AT), PLAIN_FORMAT);
+                    S_OK
+                }
+                Err(hr) => hr,
+            }
+        }
+        _ => E_NOTIMPL,
     }
 }
 

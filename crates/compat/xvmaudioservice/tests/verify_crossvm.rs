@@ -929,19 +929,32 @@ fn endpoint(_mix: &[u8]) {
     println!("0x2a offload {} (PC IAudioClient2::IsOffloadCapable over all categories {off})", u32_at(&e, 0x10));
     assert_eq!(u32_at(&e, 0x10), off);
 
-    let (hr, e) = create(4, 0, dev, 0, &[]);
-    assert_eq!(hr, 0);
-    let sc = u32_at(&e, 0x1c);
     let pc = match wasapi::spatial(Some(&id)) {
         Ok(p) => p,
         Err(hr) => {
-            let mut e = envelope(crossvm::SPATIAL_STATIC_POSITION, sc);
+            let (chr, _) = create(crossvm::FORMAT_ENUM_TYPE, 0, dev, 0, &[]);
+            assert_eq!(chr, hr, "no PC ISpatialAudioClient: type 4 creation returns the PC error");
+            let mut e = envelope(crossvm::SPATIAL_STATIC_POSITION, dev);
             assert_eq!(send(&mut e), hr, "no PC ISpatialAudioClient: the PC error is returned");
             println!("PC ISpatialAudioClient unavailable {hr:#010x}");
+            let mut e = envelope(crossvm::RELEASE_OBJECT, dev);
+            assert_eq!(send(&mut e), 0);
             return;
         }
     };
-    let mut e = envelope(crossvm::SPATIAL_STATIC_POSITION, sc);
+    let (hr, e) = create(crossvm::FORMAT_ENUM_TYPE, 0, dev, 0, &[]);
+    let direct = pc.format_enumerator();
+    let sc = match &direct {
+        Ok(_) => {
+            assert_eq!(hr, 0, "125980 -> 124574: type 4 wraps the PC IAudioFormatEnumerator");
+            u32_at(&e, 0x1c)
+        }
+        Err(pe) => {
+            assert_eq!(hr, *pe, "type 4 returns the PC GetSupportedAudioObjectFormatEnumerator error");
+            0
+        }
+    };
+    let mut e = envelope(crossvm::SPATIAL_STATIC_POSITION, dev);
     e[0x10..0x14].copy_from_slice(&2u32.to_le_bytes());
     let hr = send(&mut e);
     match pc.static_position(2) {
@@ -953,34 +966,36 @@ fn endpoint(_mix: &[u8]) {
         }
         Err(pe) => assert_eq!(hr, pe),
     }
-    let mut e = envelope(crossvm::FORMAT_ENUM_COUNT, sc);
-    let hr = send(&mut e);
-    match pc.format_count() {
-        Ok(n) => {
-            assert_eq!(hr, 0);
-            assert_eq!(u32_at(&e, 0x10), n);
-            println!("object format count {n}");
-        }
-        Err(pe) => assert_eq!(hr, pe),
+    let mut fmt = None;
+    if let Ok(en) = &direct {
+        let mut e = envelope(crossvm::SPATIAL_STATIC_POSITION, sc);
+        assert_eq!(send(&mut e), 0x8000_4001u32 as i32, "map 1ac4d0 has only 0x3a / 0x3b: 125e00 answers E_NOTIMPL for anything else");
+        let mut e = envelope(crossvm::FORMAT_ENUM_COUNT, dev);
+        assert_eq!(send(&mut e), 0x8000_4001u32 as i32, "0x3a is served only by the type 4 object");
+        let mut e = envelope(crossvm::FORMAT_ENUM_COUNT, sc);
+        let hr = send(&mut e);
+        let n = en.count().unwrap();
+        assert_eq!(hr, 0);
+        assert_eq!(u32_at(&e, 0x10), n, "125a10 -> IAudioFormatEnumerator::GetCount into R+0");
+        println!("object format count {n} (console 2a3f0 answers 1)");
+        let mut e = envelope(crossvm::FORMAT_ENUM_GET, sc);
+        let hr = send(&mut e);
+        let f = en.get(0).unwrap();
+        assert_eq!(hr, 0);
+        let plain = crossvm::plain_format(&f);
+        assert_eq!(&e[0x14..0x26], &plain[..], "WAVEFORMATEX (0x12 bytes) at R+4");
+        assert_eq!(u16::from_le_bytes([e[0x24], e[0x25]]), 0, "cbSize 0: the guest copies only 0x12 bytes");
+        println!("object format tag {:#x} {} Hz {} ch (console 299c0: float 48000 Hz mono)", u16::from_le_bytes([plain[0], plain[1]]), u32::from_le_bytes(plain[4..8].try_into().unwrap()), plain[2]);
+        let mut e = envelope(crossvm::FORMAT_ENUM_GET, sc);
+        e[0x10..0x14].copy_from_slice(&n.to_le_bytes());
+        assert_eq!(send(&mut e), 0x8000_000bu32 as i32, "299c0: an index past the count is E_BOUNDS");
+        let mut e = envelope(crossvm::FORMAT_ENUM_GET, sc);
+        e[0x24..0x26].copy_from_slice(&0x37u16.to_le_bytes());
+        assert_eq!(send(&mut e), -2147024809, "1238bc: cbSize + 0x12 above 0x48 is E_INVALIDARG");
+        fmt = Some(f);
     }
-    let mut e = envelope(crossvm::FORMAT_ENUM_GET, sc);
-    let hr = send(&mut e);
-    let fmt = match pc.format_at(0) {
-        Ok(f) => {
-            assert_eq!(hr, 0);
-            let plain = crossvm::plain_format(&f);
-            assert_eq!(&e[0x14..0x26], &plain[..], "WAVEFORMATEX (0x12 bytes) at R+4");
-            assert_eq!(u16::from_le_bytes([e[0x24], e[0x25]]), 0, "cbSize 0: the guest copies only 0x12 bytes");
-            println!("object format tag {:#x} {} Hz {} ch", u16::from_le_bytes([plain[0], plain[1]]), u32::from_le_bytes(plain[4..8].try_into().unwrap()), plain[2]);
-            Some(f)
-        }
-        Err(pe) => {
-            assert_eq!(hr, pe);
-            None
-        }
-    };
     if let Some(f) = fmt {
-        let mut e = envelope(crossvm::SPATIAL_MAX_FRAMES_FOR_CATEGORY, sc);
+        let mut e = envelope(crossvm::SPATIAL_MAX_FRAMES_FOR_CATEGORY, dev);
         e[0x10..0x10 + f.len()].copy_from_slice(&f);
         e[0x10 + crossvm::SPATIAL_CATEGORY_AT..0x14 + crossvm::SPATIAL_CATEGORY_AT].copy_from_slice(&6u32.to_le_bytes());
         let hr = send(&mut e);
@@ -994,6 +1009,9 @@ fn endpoint(_mix: &[u8]) {
         }
     }
     for o in [sc, dev, enumerator] {
+        if o == 0 {
+            continue;
+        }
         let mut e = envelope(crossvm::RELEASE_OBJECT, o);
         assert_eq!(send(&mut e), 0);
     }

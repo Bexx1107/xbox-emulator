@@ -152,7 +152,7 @@ pub fn compile_fma(hlsl: &str, profile: &str, fma: crate::shader_cache::Fma, ext
     if minor < 2 {
         return compile_bf(hlsl, bf.as_deref(), profile, &[], &with(true));
     }
-    let early = (profile.starts_with("cs_") && cs_parallel_enabled() && may_need_denorm_any(hlsl)).then(|| {
+    let early = (profile.starts_with("cs_") && cs_parallel_enabled() && speculative_allowed() && may_need_denorm_any(hlsl)).then(|| {
         let (h, b, p) = (hlsl.to_string(), bf.clone(), profile.to_string());
         let args: Vec<String> = with(true).into_iter().map(String::from).collect();
         std::thread::Builder::new()
@@ -171,6 +171,22 @@ pub fn compile_fma(hlsl: &str, profile: &str, fma: crate::shader_cache::Fma, ext
         return compile_bf(hlsl, bf.as_deref(), profile, &["-denorm", "any"], &with(true));
     }
     Ok(code)
+}
+
+thread_local! {
+    static BACKGROUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn set_background(on: bool) {
+    BACKGROUND.with(|b| b.set(on));
+}
+
+pub fn speculative_allowed() -> bool {
+    speculative_for(BACKGROUND.with(|b| b.get()), std::thread::current().name())
+}
+
+fn speculative_for(background: bool, thread_name: Option<&str>) -> bool {
+    !background && !thread_name.is_some_and(|n| n.starts_with("tombox"))
 }
 
 pub fn cs_parallel_enabled() -> bool {
@@ -378,6 +394,18 @@ pub fn cache_load(hlsl: &str, profile: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speculative_denorm_any_compile_runs_only_on_title_threads() {
+        assert!(speculative_for(false, None));
+        assert!(speculative_for(false, Some("main")));
+        assert!(!speculative_for(true, None));
+        assert!(!speculative_for(false, Some("tombox-shader-prewarm")));
+        assert!(!speculative_for(false, Some("tombox-pso-xrec")));
+        set_background(true);
+        assert!(!speculative_allowed());
+        set_background(false);
+    }
 
     const PRESERVE: &str = "\"fp32-denorm-mode\"=\"preserve\"";
 

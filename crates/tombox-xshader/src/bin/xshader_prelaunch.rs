@@ -401,6 +401,7 @@ fn run(o: &Opts, sh: &Shared, rep: &Mutex<Report>) {
     std::thread::scope(|s| {
         for _ in 0..o.jobs {
             s.spawn(|| loop {
+                dxc::set_background(true);
                 if sh.skip.load(Ordering::Relaxed) {
                     break;
                 }
