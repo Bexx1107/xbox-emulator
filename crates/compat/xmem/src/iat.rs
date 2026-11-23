@@ -68,6 +68,13 @@ pub fn copy_out(addr: usize, out: &mut [u8]) -> bool {
     unsafe { ReadProcessMemory(GetCurrentProcess(), addr as *const c_void, out.as_mut_ptr() as *mut c_void, out.len(), &mut n) != 0 && n == out.len() }
 }
 
+fn untouched_watched(base: usize) -> bool {
+    let mut a = [core::ptr::null_mut::<c_void>(); 1];
+    let mut c = 1usize;
+    let mut g = 0u32;
+    unsafe { GetWriteWatch(0, base as *mut c_void, 0x1000, a.as_mut_ptr(), &mut c, &mut g) == 0 && c == 0 }
+}
+
 pub fn image_size(base: usize) -> Option<usize> {
     let mut dos = [0u8; 0x40];
     if !copy_out(base, &mut dos) || dos[0] != b'M' || dos[1] != b'Z' {
@@ -279,7 +286,7 @@ pub fn title_modules() -> Vec<usize> {
             Some(m) => m,
             None => break,
         };
-        if m.state == MEM_COMMIT && m.kind == MEM_PRIVATE && m.base == m.alloc_base && m.protect & READABLE != 0 && m.protect & PAGE_GUARD == 0 && image_size(m.base).is_some() && !(crate::title_acct::enabled() && emulator_image(m.base)) {
+        if m.state == MEM_COMMIT && m.kind == MEM_PRIVATE && m.base == m.alloc_base && m.protect & READABLE != 0 && m.protect & PAGE_GUARD == 0 && !untouched_watched(m.base) && image_size(m.base).is_some() && !(crate::title_acct::enabled() && emulator_image(m.base)) {
             out.push(m.base);
         }
         let next = m.base + m.region_size;
@@ -301,6 +308,40 @@ mod tests {
 
     extern "system" {
         fn GetModuleHandleW(name: *const u16) -> usize;
+    }
+
+    #[test]
+    fn the_private_image_scan_never_touches_write_watched_memory() {
+        let n = 0x2_0000;
+        let p = unsafe { VirtualAlloc(core::ptr::null_mut(), n, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let _ = title_modules();
+        let mut a = [core::ptr::null_mut::<c_void>(); 0x20];
+        let mut c = a.len();
+        let mut g = 0u32;
+        assert_eq!(unsafe { GetWriteWatch(0, p as *mut c_void, n, a.as_mut_ptr(), &mut c, &mut g) }, 0);
+        let mut h = [0u8; 0x40];
+        let _ = copy_out(p, &mut h);
+        assert_eq!(c, 0, "dirty {:x?} bytes {:02x?}", a[..c].iter().map(|&x| x as usize - p).collect::<Vec<_>>(), &h[..16]);
+        unsafe { VirtualFree(p as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_written_image_in_watched_memory_is_still_found() {
+        let n = 0x2_0000;
+        let p = unsafe { VirtualAlloc(core::ptr::null_mut(), n, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        unsafe {
+            let b = p as *mut u8;
+            *b = b'M';
+            *b.add(1) = b'Z';
+            core::ptr::write_unaligned((p + 0x3c) as *mut u32, 0x80);
+            core::ptr::copy_nonoverlapping(b"PE\0\0".as_ptr(), b.add(0x80), 4);
+            core::ptr::write_unaligned((p + 0x80 + 24) as *mut u16, 0x20b);
+            core::ptr::write_unaligned((p + 0x80 + 24 + 56) as *mut u32, n as u32);
+        }
+        assert!(title_modules().contains(&p));
+        unsafe { VirtualFree(p as *mut c_void, 0, MEM_RELEASE) };
     }
 
     #[test]

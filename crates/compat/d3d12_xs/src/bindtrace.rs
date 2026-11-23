@@ -554,7 +554,16 @@ pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -
                 };
                 let aged = if it.age > 1 { format!(" (written {} frames ago)", it.age) } else { String::new() };
                 let st = crate::rtcap::state_of(res).or_else(|| Some(crate::gpu_va::state(res)).filter(|&x| x != 0)).map(|x| format!(" state={x:#x}")).unwrap_or_default();
-                out.push_str(&format!("    param[{}]+{} {kind} {what} | {view}{aged}{st}\n", it.param, it.slot));
+                let loc = if res == 0 {
+                    String::new()
+                } else if let Some(p) = crate::placed::lookup(res as *mut c_void) {
+                    format!(" placed title va={:#x} {}x{} dim={}", p.va, p.width(), p.height(), p.dim())
+                } else if let Some(v) = crate::gpu_va::texture_va(res) {
+                    format!(" texture va={v:#x}")
+                } else {
+                    " not placed".to_string()
+                };
+                out.push_str(&format!("    param[{}]+{} {kind} {what} | {view}{aged}{st}{loc}\n", it.param, it.slot));
             }
             Desc::Sampler { desc } => {
                 let u = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());

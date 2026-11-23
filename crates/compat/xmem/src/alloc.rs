@@ -142,6 +142,7 @@ pub fn default_free(address: *mut c_void, _attributes: u64) {
             account(ty, len, false);
             crate::epoch::bump_range(address as usize, address as usize + len);
             if !crate::pool::give(ty as usize, address as usize, len) {
+                crate::write_watch::forget(address as usize);
                 unsafe { VirtualFree(address, 0, MEM_RELEASE) };
             }
         }

@@ -190,7 +190,7 @@ pub struct HeapEntry {
     pub cb_overhead: u8,
     pub region_index: u8,
     pub flags: u16,
-    pub rest: [u64; 2],
+    pub rest: [u64; 3],
 }
 
 pub fn next_after(heap: usize, after: Option<usize>) -> Option<(usize, Block)> {
@@ -201,6 +201,8 @@ pub fn next_after(heap: usize, after: Option<usize>) -> Option<(usize, Block)> {
     };
     it.find(|(_, b)| b.heap == heap).map(|(p, b)| (*p, *b))
 }
+
+const _: () = assert!(core::mem::size_of::<HeapEntry>() == 40);
 
 pub unsafe fn walk(heap: usize, entry: *mut HeapEntry, real: impl FnOnce() -> i32) -> i32 {
     if entry.is_null() {
@@ -216,7 +218,7 @@ pub unsafe fn walk(heap: usize, entry: *mut HeapEntry, real: impl FnOnce() -> i3
     }
     match next_after(heap, if ours { Some(cur) } else { None }) {
         Some((p, b)) => {
-            *entry = HeapEntry { data: p, cb_data: b.size.min(u32::MAX as usize) as u32, cb_overhead: 0, region_index: 0, flags: PROCESS_HEAP_ENTRY_BUSY, rest: [0; 2] };
+            *entry = HeapEntry { data: p, cb_data: b.size.min(u32::MAX as usize) as u32, cb_overhead: 0, region_index: 0, flags: PROCESS_HEAP_ENTRY_BUSY, rest: [0; 3] };
             1
         }
         None => {

@@ -10,6 +10,7 @@ const H: usize = 64;
 
 extern "system" {
     fn VirtualAlloc(addr: *mut c_void, len: usize, ty: u32, protect: u32) -> *mut c_void;
+    fn VirtualFree(addr: *mut c_void, len: usize, ty: u32) -> i32;
 }
 
 fn wrapped() -> usize {
@@ -292,5 +293,187 @@ fn hw_unwatched_textures_get_exactly_the_write_watch_off_treatment() {
             assert_eq!(s1.uploaded_subs, s0.uploaded_subs, "with polling off, an unwatched texture must behave exactly as with TOMBOX_WRITE_WATCH=0: no hash rescans after the watch window");
         }
         call!(tex, 2, () -> u32);
+    }
+}
+
+#[test]
+#[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_ -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
+fn hw_a_texture_whose_backing_is_released_stops_being_polled_without_a_failure() {
+    unsafe {
+        let g = gpu();
+        let w = wrapped();
+        let desc = tdesc(LAYOUT_LINEAR);
+        let (total, _, _) = crate::upload::test_offsets(&desc).unwrap();
+        let n = ((total as usize) + 0xffff) & !0xffff;
+        let mem = VirtualAlloc(core::ptr::null_mut(), n, 0x3000 | 0x20_0000, 0x04) as usize;
+        assert_ne!(mem, 0);
+        crate::cpu_watch::register_test_region(mem, n);
+        for i in 0..total as usize {
+            *((mem + i) as *mut u8) = pattern(i, 0x19);
+        }
+        let mut tex: *mut c_void = core::ptr::null_mut();
+        let hr = call!(w, D_PLACED_X, (u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32, mem as u64, desc.as_ptr(), ST_COMMON, core::ptr::null(), &IID_RESOURCE, &mut tex);
+        assert!(hr >= 0 && !tex.is_null());
+        pump_until(g, "first upload", || crate::upload::test_ww(tex).sent);
+        if !crate::cpu_watch::enabled() {
+            call!(tex, 2, () -> u32);
+            return;
+        }
+        let s0 = crate::upload::test_ww(tex);
+        assert_eq!(VirtualFree(mem as *mut c_void, 0, 0x8000), 1);
+        pump_until(g, "the released backing to be noticed", || crate::upload::test_ww(tex).freed);
+        for _ in 0..50 {
+            crate::upload::pump(g.a as *mut c_void);
+        }
+        let s1 = crate::upload::test_ww(tex);
+        assert_eq!(s1.fallbacks, s0.fallbacks, "released backing is not a write-watch failure");
+        assert_eq!(s1.lost, s0.lost, "released backing is not a lost CPU write");
+        assert_eq!(s1.uploaded_subs, s0.uploaded_subs, "nothing is uploaded from released memory");
+        assert_eq!(s1.watched, Some(false));
+        call!(tex, 2, () -> u32);
+    }
+}
+
+#[test]
+#[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_ -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
+fn hw_a_freed_texture_whose_range_is_reallocated_uploads_the_new_bytes() {
+    unsafe {
+        let g = gpu();
+        let w = wrapped();
+        let desc = tdesc(LAYOUT_LINEAR);
+        let (total, bpe, offs) = crate::upload::test_offsets(&desc).unwrap();
+        let n = ((total as usize) + 0xffff) & !0xffff;
+        let mem = VirtualAlloc(core::ptr::null_mut(), n, 0x3000 | 0x20_0000, 0x04) as usize;
+        assert_ne!(mem, 0);
+        crate::cpu_watch::register_test_region(mem, n);
+        for i in 0..total as usize {
+            *((mem + i) as *mut u8) = pattern(i, 0x0d);
+        }
+        let mut tex: *mut c_void = core::ptr::null_mut();
+        let hr = call!(w, D_PLACED_X, (u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32, mem as u64, desc.as_ptr(), ST_COMMON, core::ptr::null(), &IID_RESOURCE, &mut tex);
+        assert!(hr >= 0 && !tex.is_null());
+        pump_until(g, "first upload", || crate::upload::test_ww(tex).sent);
+        if !crate::cpu_watch::enabled() {
+            call!(tex, 2, () -> u32);
+            return;
+        }
+        assert_eq!(VirtualFree(mem as *mut c_void, 0, 0x8000), 1);
+        pump_until(g, "the released backing to be noticed", || crate::upload::test_ww(tex).freed);
+        let mut base = VirtualAlloc((mem - 0x1_0000) as *mut c_void, n + 0x2_0000, 0x3000 | 0x20_0000, 0x04) as usize;
+        let mut len = n + 0x2_0000;
+        if base == 0 {
+            base = VirtualAlloc(mem as *mut c_void, n + 0x1_0000, 0x3000 | 0x20_0000, 0x04) as usize;
+            len = n + 0x1_0000;
+        }
+        assert!(base != 0 && base <= mem && mem + n <= base + len, "could not allocate a different-sized block over the freed range");
+        assert_ne!((base, len), (mem, n));
+        crate::cpu_watch::register_test_region(base, len);
+        crate::upload::TomboxNoteTitleMemory(base, len, 1);
+        for i in 0..total as usize {
+            *((mem + i) as *mut u8) = pattern(i, 0x6b);
+        }
+        let s0 = crate::upload::test_ww(tex);
+        crate::upload::pump(g.a as *mut c_void);
+        let s1 = crate::upload::test_ww(tex);
+        assert!(!s1.freed, "a new allocation over the range must bring the resource back at the next pump, not on a timer");
+        assert_eq!(s1.watched, Some(true), "the reborn resource must be write-watched on the new allocation");
+        pump_until(g, "the reborn upload", || crate::upload::test_ww(tex).uploaded_subs > s0.uploaded_subs);
+        let got = readback(g, tex);
+        assert_eq!(first_diff(&got, &expected(mem, &offs, bpe)), None, "the old resource must show the new allocation's bytes (x, y, got, want)");
+        for k in 0..32 {
+            *((mem + 0x2000 + k) as *mut u8) ^= 0x3c;
+        }
+        let s2 = crate::upload::test_ww(tex);
+        pump_until(g, "a later write into the new allocation", || crate::upload::test_ww(tex).uploaded_subs > s2.uploaded_subs);
+        let got = readback(g, tex);
+        assert_eq!(first_diff(&got, &expected(mem, &offs, bpe)), None, "writes into the new allocation keep reaching the GPU (x, y, got, want)");
+        call!(tex, 2, () -> u32);
+        VirtualFree(base as *mut c_void, 0, 0x8000);
+    }
+}
+
+static FAKE_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static FAKE_LOG: std::sync::Mutex<Vec<(u64, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "system" fn fake_epoch() -> u64 {
+    FAKE_SEQ.load(core::sync::atomic::Ordering::Acquire)
+}
+
+unsafe extern "system" fn fake_changed(seq: u64, lo: usize, hi: usize) -> i32 {
+    FAKE_LOG.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(s, a, b)| s >= seq && a < hi && lo < b) as i32
+}
+
+fn fake_bump(lo: usize, hi: usize) {
+    let mut g = FAKE_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let s = FAKE_SEQ.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    g.push((s, lo, hi));
+}
+
+#[test]
+#[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_ -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
+fn hw_a_freed_then_reallocated_region_is_rescanned_by_the_residency_cache() {
+    unsafe {
+        let g = gpu();
+        let w = wrapped();
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::upload::test_epoch_fns(None);
+            }
+        }
+        crate::upload::test_epoch_fns(Some((fake_epoch as *const () as usize, fake_changed as *const () as usize)));
+        let _off = Off;
+        let desc = tdesc(LAYOUT_LINEAR);
+        let (total, bpe, offs) = crate::upload::test_offsets(&desc).unwrap();
+        let n = ((total as usize) + 0xffff) & !0xffff;
+        let mem = VirtualAlloc(core::ptr::null_mut(), n, 0x3000 | 0x20_0000, 0x04) as usize;
+        assert_ne!(mem, 0);
+        crate::cpu_watch::register_test_region(mem, n);
+        for i in 0..total as usize {
+            *((mem + i) as *mut u8) = pattern(i, 0x21);
+        }
+        let mut tex: *mut c_void = core::ptr::null_mut();
+        let hr = call!(w, D_PLACED_X, (u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32, mem as u64, desc.as_ptr(), ST_COMMON, core::ptr::null(), &IID_RESOURCE, &mut tex);
+        assert!(hr >= 0 && !tex.is_null());
+        pump_until(g, "first upload", || crate::upload::test_ww(tex).sent);
+        let s0 = crate::upload::test_ww(tex);
+        if !s0.rcached {
+            call!(tex, 2, () -> u32);
+            VirtualFree(mem as *mut c_void, 0, 0x8000);
+            return;
+        }
+        fake_bump(mem + n + 0x10_0000, mem + n + 0x11_0000);
+        for k in 0..64 {
+            *((mem + 0x1000 + k) as *mut u8) ^= 0x5a;
+        }
+        crate::upload::TomboxNoteTitleMemory(mem + 0x1000, 0x1000, crate::upload::NOTE_WRITTEN);
+        pump_until(g, "an upload served from the cache", || crate::upload::test_ww(tex).uploaded_subs > s0.uploaded_subs);
+        let s1 = crate::upload::test_ww(tex);
+        assert!(s1.rcached, "a write and an unrelated address-space change keep the cached residency");
+        assert!(s1.rs[1] > s0.rs[1], "the scan after the write is a cache hit");
+        let got = readback(g, tex);
+        assert_eq!(first_diff(&got, &expected(mem, &offs, bpe)), None, "the cached residency still uploads the written bytes (x, y, got, want)");
+        assert_eq!(VirtualFree(mem as *mut c_void, 0, 0x8000), 1);
+        fake_bump(mem, mem + n);
+        let again = VirtualAlloc(mem as *mut c_void, n, 0x3000 | 0x20_0000, 0x04) as usize;
+        assert_eq!(again, mem, "could not reallocate the freed range at the same address");
+        crate::cpu_watch::register_test_region(mem, n);
+        for i in 0..total as usize {
+            *((mem + i) as *mut u8) = pattern(i, 0x5e);
+        }
+        if crate::cpu_watch::enabled() {
+            crate::upload::TomboxNoteTitleMemory(mem, n, crate::upload::NOTE_COMMITTED);
+        } else {
+            crate::upload::TomboxNoteTitleMemory(mem, n, crate::upload::NOTE_WRITTEN);
+        }
+        pump_until(g, "the upload from the reallocated memory", || crate::upload::test_ww(tex).uploaded_subs > s1.uploaded_subs);
+        let s2 = crate::upload::test_ww(tex);
+        assert!(s2.rs[3] > s1.rs[3], "the free must invalidate the cached residency");
+        assert!(s2.rs[2] > s1.rs[2] && s2.rs[0] > s1.rs[0], "the reallocated range must be queried again, not served from the old cache");
+        assert!(s2.rcached, "the rescanned residency is cached again");
+        let got = readback(g, tex);
+        assert_eq!(first_diff(&got, &expected(mem, &offs, bpe)), None, "the texture shows the reallocated memory's bytes (x, y, got, want)");
+        call!(tex, 2, () -> u32);
+        VirtualFree(mem as *mut c_void, 0, 0x8000);
     }
 }

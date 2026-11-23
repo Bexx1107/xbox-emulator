@@ -306,7 +306,8 @@ mod tests {
         assert_eq!(info.alloc_base, p as usize);
         assert_eq!(info.state, MEM_COMMIT);
         assert_eq!(info.region_size, 0x40_0000);
-        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        let vfree: unsafe extern "system" fn(usize, usize, u32) -> i32 = unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
+        unsafe { vfree(p as usize, 0, MEM_RELEASE) };
     }
 
     #[test]
@@ -448,6 +449,7 @@ mod tests {
         assert_eq!(unsafe { XMemResetWriteWatch(p, 0x4000) }, ERROR_CAN_NOT_COMPLETE);
         assert_eq!(XMemResumeWriteWatch(), 1);
         assert_eq!(unsafe { XMemResetWriteWatch(p, 0x4000) }, 0);
-        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        let vfree: unsafe extern "system" fn(usize, usize, u32) -> i32 = unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
+        unsafe { vfree(p as usize, 0, MEM_RELEASE) };
     }
 }

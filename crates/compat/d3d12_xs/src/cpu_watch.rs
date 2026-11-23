@@ -31,6 +31,55 @@ struct Mbi {
     pad1: u32,
 }
 
+pub fn watched_ranges(lo: usize, len: usize) -> Option<Vec<(usize, usize, usize)>> {
+    if !enabled() || len == 0 {
+        return None;
+    }
+    let hi = lo + len;
+    let mut out: Vec<(usize, usize, usize)> = Vec::new();
+    let mut a = lo;
+    while a < hi {
+        let mut m = Mbi::default();
+        if unsafe { VirtualQuery(a as *const c_void, &mut m, core::mem::size_of::<Mbi>()) } == 0 {
+            return None;
+        }
+        let mut end = (m.base + m.size).min(hi);
+        if end <= a {
+            return None;
+        }
+        if m.state == 0x1000 {
+            let (o, b, n) = owner(a);
+            if o != OWNER_EMULATOR {
+                return None;
+            }
+            end = end.min(b + n);
+            if end <= a {
+                return None;
+            }
+            let mut one: *mut c_void = core::ptr::null_mut();
+            let mut count = 1usize;
+            let mut gran = 0u32;
+            if unsafe { GetWriteWatch(0, (a & !(PAGE - 1)) as *mut c_void, PAGE, &mut one, &mut count, &mut gran) } != 0 {
+                return None;
+            }
+            match out.last_mut() {
+                Some(l) if l.1 == a && l.2 == b => l.1 = end,
+                _ => out.push((a, end, b)),
+            }
+        }
+        a = end;
+    }
+    Some(out)
+}
+
+pub fn committed(lo: usize, len: usize) -> bool {
+    let probe = |a: usize| {
+        let mut m = Mbi::default();
+        unsafe { VirtualQuery(a as *const c_void, &mut m, core::mem::size_of::<Mbi>()) != 0 && m.state == 0x1000 }
+    };
+    len > 0 && probe(lo) && probe(lo + len - 1)
+}
+
 pub fn region(addr: usize) -> String {
     let mut m = Mbi::default();
     let n = unsafe { VirtualQuery(addr as *const c_void, &mut m, core::mem::size_of::<Mbi>()) };
@@ -95,7 +144,9 @@ fn owner_fn() -> Option<OwnerFn> {
 }
 
 pub fn register_test_region(base: usize, len: usize) {
-    TEST_OWNER.lock().unwrap_or_else(|e| e.into_inner()).push((base, len));
+    let mut r = TEST_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+    r.retain(|&(b, n)| b + n <= base || base + len <= b);
+    r.push((base, len));
 }
 
 pub fn owner(addr: usize) -> (u32, usize, usize) {

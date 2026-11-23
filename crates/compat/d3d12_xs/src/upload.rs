@@ -81,6 +81,7 @@ fn scan(addr: usize, len: usize) -> Scan {
     let mut s = Scan { ok: Vec::new(), bad: None, bads: Vec::new() };
     while p < end {
         let mut m: Mbi = unsafe { core::mem::zeroed() };
+        rs_add(RS_QUERIES, 1);
         if unsafe { VirtualQuery(p as *const c_void, &mut m, core::mem::size_of::<Mbi>()) } == 0 {
             if s.bad.is_none() {
                 s.bad = Some((p, 0, 0, 0, 0, 0));
@@ -143,7 +144,94 @@ fn sub_range(t: &Tracked, sub: usize) -> Option<(usize, usize)> {
     Some((t.p.va as usize + map.lo, map.hi - map.lo))
 }
 
-fn scan_subs(t: &Tracked, subs: &[usize]) -> Option<Scan> {
+const RS_QUERIES: usize = 0;
+const RS_HITS: usize = 1;
+const RS_MISSES: usize = 2;
+const RS_DROPS: usize = 3;
+static RS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+static RS_TOTAL: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn rs_add(i: usize, n: u64) {
+    RS[i].fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+    RS_TOTAL[i].fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn take_rs() -> [u64; 4] {
+    core::array::from_fn(|i| RS[i].swap(0, core::sync::atomic::Ordering::Relaxed))
+}
+
+fn rs_total() -> [u64; 4] {
+    core::array::from_fn(|i| RS_TOTAL[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+
+type EpochFn = unsafe extern "system" fn() -> u64;
+type ChangedFn = unsafe extern "system" fn(u64, usize, usize) -> i32;
+static EPOCH_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static CHANGED_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static EPOCH_LAST_TRY_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn epoch_fns() -> Option<(EpochFn, ChangedFn)> {
+    use core::sync::atomic::Ordering;
+    let (e, c) = (EPOCH_FN.load(Ordering::Acquire), CHANGED_FN.load(Ordering::Acquire));
+    if e != 0 && c != 0 {
+        return Some(unsafe { (core::mem::transmute::<usize, EpochFn>(e), core::mem::transmute::<usize, ChangedFn>(c)) });
+    }
+    extern "system" {
+        fn GetTickCount64() -> u64;
+    }
+    let now = unsafe { GetTickCount64() };
+    let last = EPOCH_LAST_TRY_MS.load(Ordering::Relaxed);
+    if last == u64::MAX || (last != 0 && now.wrapping_sub(last) < 250) {
+        return None;
+    }
+    EPOCH_LAST_TRY_MS.store(now.max(1), Ordering::Relaxed);
+    let (e, c) = unsafe {
+        let m = GetModuleHandleA(b"xmem.dll\0".as_ptr());
+        if m.is_null() {
+            return None;
+        }
+        (GetProcAddress(m, b"TomboxAddressSpaceEpoch\0".as_ptr()) as usize, GetProcAddress(m, b"TomboxAddressSpaceChangedSince\0".as_ptr()) as usize)
+    };
+    if e == 0 || c == 0 {
+        return None;
+    }
+    EPOCH_FN.store(e, Ordering::Release);
+    CHANGED_FN.store(c, Ordering::Release);
+    Some(unsafe { (core::mem::transmute::<usize, EpochFn>(e), core::mem::transmute::<usize, ChangedFn>(c)) })
+}
+
+#[cfg(test)]
+pub(crate) fn test_epoch_fns(f: Option<(usize, usize)>) {
+    let (e, c) = f.unwrap_or((0, 0));
+    EPOCH_FN.store(e, core::sync::atomic::Ordering::Release);
+    CHANGED_FN.store(c, core::sync::atomic::Ordering::Release);
+    EPOCH_LAST_TRY_MS.store(if f.is_some() { 0 } else { u64::MAX }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn residency_cache_sw() -> bool {
+    static SW: crate::live_sw::Sw = crate::live_sw::Sw::new("TOMBOX_RESIDENCY_CACHE", "residency_cache", true);
+    SW.on()
+}
+
+fn residency_cache_state() -> &'static str {
+    if !residency_cache_sw() {
+        "off (TOMBOX_RESIDENCY_CACHE=0)"
+    } else if poll_mode() {
+        "off (poll mode rescans every visit)"
+    } else if EPOCH_FN.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        "off (xmem.dll address-space change log not found)"
+    } else {
+        "on"
+    }
+}
+
+fn drop_rcache(t: &mut Tracked) {
+    if t.rcache.take().is_some() {
+        rs_add(RS_DROPS, 1);
+    }
+}
+
+fn scan_subs(t: &mut Tracked, subs: &[usize]) -> Option<Scan> {
     let mut lo = usize::MAX;
     let mut hi = 0usize;
     for &sub in subs {
@@ -155,7 +243,33 @@ fn scan_subs(t: &Tracked, subs: &[usize]) -> Option<Scan> {
     if lo >= hi {
         return None;
     }
-    Some(scan(lo, hi - lo))
+    let (va, total) = (t.p.va as usize, t.layout.total as usize);
+    let fns = if residency_cache_sw() && !poll_mode() && lo >= va && hi <= va + total { epoch_fns() } else { None };
+    let Some((epoch, changed)) = fns else {
+        drop_rcache(t);
+        rs_add(RS_MISSES, 1);
+        return Some(scan(lo, hi - lo));
+    };
+    let now = unsafe { epoch() };
+    let hit = match t.rcache.as_mut() {
+        Some((c, seq)) if *seq == now || unsafe { changed(*seq, va, va + total) } == 0 => {
+            *seq = now;
+            Some(c.clip(lo, hi - lo))
+        }
+        _ => None,
+    };
+    if let Some(h) = hit {
+        rs_add(RS_HITS, 1);
+        return Some(h);
+    }
+    drop_rcache(t);
+    rs_add(RS_MISSES, 1);
+    let c = scan(va, total);
+    let out = c.clip(lo, hi - lo);
+    if c.bad.is_none() {
+        t.rcache = Some((c, now));
+    }
+    Some(out)
 }
 
 fn sparse_zero_enabled() -> bool {
@@ -386,9 +500,11 @@ struct Tracked {
     pend: Vec<u64>,
     hot: u64,
     ww: bool,
-    ww_region: usize,
+    ww_ranges: Vec<(usize, usize, usize)>,
     cpu_dirty: Vec<Vec<(usize, usize)>>,
     sent: Vec<bool>,
+    freed: bool,
+    rcache: Option<(Scan, u64)>,
 }
 
 struct Uploader {
@@ -480,6 +596,8 @@ struct WwStats {
     dirty_pages: u64,
     dirty_subs: u64,
     unchanged: u64,
+    backing_freed: u64,
+    backing_back: u64,
     band_uploads: u64,
     band_bytes: u64,
     whole_uploads: u64,
@@ -603,6 +721,12 @@ fn apply_notes(up: &mut Uploader, notes: &[(usize, usize, u32)]) {
         }
         for idx in hits {
             let t = &mut up.tracked[idx];
+            if kind != NOTE_WRITTEN {
+                drop_rcache(t);
+            }
+            if t.freed && kind != NOTE_WRITTEN {
+                rebirth(t, &mut up.ww, a, n);
+            }
             for sub in 0..t.hashes.len() {
                 let Some((lo, len)) = sub_range(t, sub) else { continue };
                 if lo >= b || lo + len <= a {
@@ -622,6 +746,51 @@ fn apply_notes(up: &mut Uploader, notes: &[(usize, usize, u32)]) {
     }
 }
 
+fn any_committed(lo: usize, len: usize) -> bool {
+    let mut a = lo & !(crate::cpu_watch::PAGE - 1);
+    while a < lo + len {
+        if crate::cpu_watch::committed(a, 1) {
+            return true;
+        }
+        a += crate::cpu_watch::PAGE;
+    }
+    false
+}
+
+fn rebirth(t: &mut Tracked, w: &mut WwStats, a: usize, n: usize) {
+    let (va, total) = (t.p.va as usize, t.layout.total as usize);
+    t.freed = false;
+    drop_rcache(t);
+    t.hashes.iter_mut().for_each(|h| *h = None);
+    t.zero.iter_mut().for_each(|z| *z = false);
+    t.cpu_dirty.iter_mut().for_each(|d| d.clear());
+    w.backing_back += 1;
+    let how = match crate::cpu_watch::watched_ranges(va, total) {
+        Some(r) if !r.is_empty() => {
+            t.ww = true;
+            for sub in 0..t.hashes.len() {
+                let Some((lo, len)) = sub_range(t, sub) else { continue };
+                for &(x, y, _) in &r {
+                    let (p, q) = (x.max(lo), y.min(lo + len));
+                    if p < q {
+                        t.cpu_dirty[sub].push((p, q));
+                    }
+                }
+            }
+            let s = r.iter().map(|&(x, y, g)| format!("{x:#x}..{y:#x} (region {g:#x})")).collect::<Vec<_>>().join(", ");
+            t.ww_ranges = r;
+            format!("write-watched again over {s}; every overlapping subresource is uploaded now")
+        }
+        _ => {
+            t.ww = false;
+            t.ww_ranges.clear();
+            "the new memory has no emulator write watch, so it takes the hash path".to_string()
+        }
+    };
+    let (res, d) = (t.res, res_desc(&t.p));
+    w.once(res, 8, || format!("backing reborn: placed resource res={res:#x} va={va:#x}+{total:#x} {d} overlaps a new title allocation at {a:#x}+{n:#x}; {how} | at va: {}", crate::cpu_watch::region(va)));
+}
+
 fn ww_sync(up: &mut Uploader) {
     if !crate::cpu_watch::enabled() {
         return;
@@ -632,8 +801,9 @@ fn ww_sync(up: &mut Uploader) {
     let mut by_region: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
     for t in &up.tracked {
         if t.ww {
-            let lo = t.p.va as usize;
-            by_region.entry(t.ww_region).or_default().push((lo, lo + t.layout.total as usize));
+            for &(a, b, r) in &t.ww_ranges {
+                by_region.entry(r).or_default().push((a, b));
+            }
         }
     }
     if by_region.is_empty() {
@@ -658,7 +828,24 @@ fn ww_sync(up: &mut Uploader) {
             if !t.ww {
                 continue;
             }
+            let now_ranges = crate::cpu_watch::watched_ranges(t.p.va as usize, t.layout.total as usize);
+            if let Some(r) = now_ranges.as_ref().filter(|r| !r.is_empty()) {
+                if *r != t.ww_ranges {
+                    t.ww_ranges = r.clone();
+                    drop_rcache(t);
+                    continue;
+                }
+            }
             t.ww = false;
+            drop_rcache(t);
+            t.cpu_dirty.iter_mut().for_each(|d| d.clear());
+            if now_ranges.as_ref().is_some_and(|r| r.is_empty()) || !any_committed(t.p.va as usize, t.layout.total as usize) {
+                t.freed = true;
+                up.ww.backing_freed += 1;
+                let (res, va, d, total) = (t.res, t.p.va, res_desc(&t.p), t.layout.total);
+                up.ww.once(res, 3, || format!("backing freed: placed resource res={res:#x} va={va:#x}+{total:#x} {d} is still alive but the title released its memory; it is no longer polled or uploaded (GPU keeps the last uploaded texels) until that memory is committed again | at va: {}", crate::cpu_watch::region(va as usize)));
+                continue;
+            }
             t.hashes.iter_mut().for_each(|h| *h = None);
             up.ww.fallbacks += 1;
             let (res, va, d, total) = (t.res, t.p.va, res_desc(&t.p), t.layout.total);
@@ -805,6 +992,8 @@ pub unsafe fn submit_hook(queue: *mut c_void) {
     }
     up.sb.hooks += 1;
     adopt_backlog(up, ADOPT_BUDGET_US / 4);
+    let notes = take_notes();
+    apply_notes(up, &notes);
     ww_sync(up);
     let dirty: Vec<usize> = (0..up.tracked.len()).filter(|&i| up.tracked[i].ww && up.tracked[i].cpu_dirty.iter().any(|d| !d.is_empty())).collect();
     if dirty.is_empty() {
@@ -959,10 +1148,10 @@ unsafe fn adopt(up: &mut Uploader, res: *mut c_void, p: Placed) -> Result<Tracke
         let w0 = u32::from_le_bytes(f0.raw[12..16].try_into().unwrap());
         up.ww.once(res as usize, 7, || {
             let (o, ob, on) = crate::cpu_watch::owner(va);
-            let need = va + xt.max(ft);
+            let need = va + xt;
             let end = if on > 0 { ob + on } else { 0 };
             let fit = if end == 0 { "no xmem region".to_string() } else if need > end { format!("OVERRUNS the xmem region end {end:#x} by {:#x}", need - end) } else { format!("fits in the xmem region (end {end:#x}, {:#x} spare)", end - need) };
-            format!("linear (layout 264) placed resource res={:#x} va={va:#x} {d} desc-align={align:#x} | XG layout.total={xt:#x} | PC footprint sub0: {w0}x{h0} RowPitch={} NumRows={} RowSizeInBytes={} TotalBytes(all subs)={ft:#x} | va+max={need:#x} {fit} (owner={o} region={ob:#x}+{on:#x}) | at va: {} | at va+max-1: {}",
+            format!("linear (layout 264) placed resource res={:#x} va={va:#x} {d} desc-align={align:#x} | XG layout.total={xt:#x} | PC footprint sub0: {w0}x{h0} RowPitch={} NumRows={} RowSizeInBytes={} TotalBytes(all subs)={ft:#x} | va+XG total={need:#x} {fit} (owner={o} region={ob:#x}+{on:#x}) | at va: {} | at va+XG total-1: {}",
                 res as usize, f0.row_pitch(), f0.rows, f0.row_size, crate::cpu_watch::region(va), crate::cpu_watch::region(need - 1))
         });
     }
@@ -976,12 +1165,12 @@ unsafe fn adopt(up: &mut Uploader, res: *mut c_void, p: Placed) -> Result<Tracke
         let d = res_desc(&p);
         up.ww.once(res as usize, 0, || format!("placed resource res={:#x} va={va:#x}+{total:#x} {d} keeps the hash fallback (exactly the TOMBOX_WRITE_WATCH=0 treatment): {why} | {}", res as usize, crate::cpu_watch::region(va as usize)));
     }
-    let ww_region = if ww { crate::cpu_watch::owner(p.va as usize).1 } else { 0 };
+    let ww_ranges = if ww { vec![(p.va as usize, p.va as usize + layout.total as usize, crate::cpu_watch::owner(p.va as usize).1)] } else { Vec::new() };
     if ww {
         let (va, total, d) = (p.va, layout.total, res_desc(&p));
         up.ww.once(res as usize, 6, || format!("placed resource res={:#x} va={va:#x}+{total:#x} {d} is write-watched", res as usize));
     }
-    Ok(Tracked { res: res as usize, p, layout, fps, total_bytes: total, hashes: vec![None; nsubs as usize], partial: vec![0; nsubs as usize], zero: vec![false; nsubs as usize], watch: vec![0; nsubs as usize], pend: vec![up.pumps + PENDING_PUMPS; nsubs as usize], hot: up.pumps + PENDING_PUMPS, ww, ww_region, cpu_dirty: vec![Vec::new(); nsubs as usize], sent: vec![false; nsubs as usize] })
+    Ok(Tracked { res: res as usize, p, layout, fps, total_bytes: total, hashes: vec![None; nsubs as usize], partial: vec![0; nsubs as usize], zero: vec![false; nsubs as usize], watch: vec![0; nsubs as usize], pend: vec![up.pumps + PENDING_PUMPS; nsubs as usize], hot: up.pumps + PENDING_PUMPS, ww, ww_ranges, cpu_dirty: vec![Vec::new(); nsubs as usize], sent: vec![false; nsubs as usize], freed: false, rcache: None })
 }
 
 struct Staged {
@@ -1318,7 +1507,7 @@ fn watch_pending(up: &mut Uploader) -> (u64, u64) {
         let idx = (up.zero_cursor + k) % nt;
         k += 1;
         let t = &mut up.tracked[idx];
-        if t.ww {
+        if t.ww || t.freed {
             continue;
         }
         let poll = polls(t, poll_all);
@@ -1385,12 +1574,13 @@ impl PumpPhases {
         static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let total = self.t0.elapsed().as_micros() as u64;
         let st = take_stage_times();
+        let rs = take_rs();
         if total < 20_000 || N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 60 {
             return;
         }
         let parts: Vec<String> = self.parts.iter().map(|(w, us)| format!("{w}={:.1}ms", *us as f64 / 1000.0)).collect();
-        record("d3d12_xs", "upload", &format!("slow pump {pump}: {:.1} ms on the present thread: {}; fresh visits={fresh_visits} staged={staged} hashed={} MB; inside check: residency-scan={:.1}ms submap={:.1}ms hash={:.1}ms upload-buffer-create+map={:.1}ms ({} MB) detile+unmap={:.1}ms{}",
-            total as f64 / 1000.0, parts.join(" "), bytes >> 20, st[0] as f64 / 1000.0, st[1] as f64 / 1000.0, st[2] as f64 / 1000.0, st[3] as f64 / 1000.0, st[5] >> 20, st[4] as f64 / 1000.0,
+        record("d3d12_xs", "upload", &format!("slow pump {pump}: {:.1} ms on the present thread: {}; fresh visits={fresh_visits} staged={staged} hashed={} MB; inside check: residency-scan={:.1}ms (regions queried={} cache hits={} misses={} invalidated={}, cache {}) submap={:.1}ms hash={:.1}ms upload-buffer-create+map={:.1}ms ({} MB) detile+unmap={:.1}ms{}",
+            total as f64 / 1000.0, parts.join(" "), bytes >> 20, st[0] as f64 / 1000.0, rs[RS_QUERIES], rs[RS_HITS], rs[RS_MISSES], rs[RS_DROPS], residency_cache_state(), st[1] as f64 / 1000.0, st[2] as f64 / 1000.0, st[3] as f64 / 1000.0, st[5] >> 20, st[4] as f64 / 1000.0,
             if note.is_empty() { String::new() } else { format!(" ({note})") }));
     }
 }
@@ -1501,6 +1691,14 @@ unsafe fn pump_inner(queue: *mut c_void) {
     apply_notes(up, &notes);
     ph.mark("notes");
     ww_sync(up);
+    if up.pumps % 120 == 0 {
+        for t in up.tracked.iter_mut().filter(|t| t.freed) {
+            let (va, total) = (t.p.va as usize, t.layout.total as usize);
+            if any_committed(va, total) {
+                rebirth(t, &mut up.ww, va, total);
+            }
+        }
+    }
     ph.mark("write-watch");
 
     // The single upload list/allocator can be reused only once the previous copy is done.
@@ -1523,7 +1721,7 @@ unsafe fn pump_inner(queue: *mut c_void) {
         let idx = (up.partial_cursor + k) % nt;
         k += 1;
         let t = &mut up.tracked[idx];
-        if !polls(t, poll) {
+        if t.freed || !polls(t, poll) {
             continue;
         }
         let subs: Vec<usize> = (0..t.partial.len()).filter(|&s| t.partial[s] != 0 && t.hashes[s].is_some()).collect();
@@ -1563,6 +1761,9 @@ unsafe fn pump_inner(queue: *mut c_void) {
             break;
         }
         last = idx + 1;
+        if up.tracked[idx].freed {
+            continue;
+        }
         if up.tracked[idx].hashes.iter().any(|h| h.is_none()) || (up.tracked[idx].ww && up.tracked[idx].cpu_dirty.iter().any(|d| !d.is_empty())) {
             fresh_visits += 1;
             if let Some(s) = check(up, idx, &mut hashed, true) {
@@ -1579,7 +1780,7 @@ unsafe fn pump_inner(queue: *mut c_void) {
         let idx = up.cursor % n;
         up.cursor = (up.cursor + 1) % n;
         visited += 1;
-        if up.tracked[idx].ww {
+        if up.tracked[idx].ww || up.tracked[idx].freed {
             continue;
         }
         if let Some(s) = check(up, idx, &mut rehashed, false) {
@@ -1624,8 +1825,8 @@ unsafe fn pump_inner(queue: *mut c_void) {
             }
         }
         record("d3d12_xs", "upload", &format!(
-            "residency pump {}: subresources={subs_total} with-data={uploaded_now} still-zero={zero_pending} ({} MB) partly-unmapped={partial_subs} | zero->data detected={} re-written after upload={}",
-            up.pumps, zero_bytes >> 20, up.zero_filled, up.watch_changed));
+            "residency pump {}: subresources={subs_total} with-data={uploaded_now} still-zero={zero_pending} ({} MB) partly-unmapped={partial_subs} | zero->data detected={} re-written after upload={} | residency cache {}: cached resources={} regions queried={} cache hits={} misses={} invalidated={} (totals)",
+            up.pumps, zero_bytes >> 20, up.zero_filled, up.watch_changed, residency_cache_state(), up.tracked.iter().filter(|t| t.rcache.is_some()).count(), rs_total()[RS_QUERIES], rs_total()[RS_HITS], rs_total()[RS_MISSES], rs_total()[RS_DROPS]));
         let avg = if up.cost_n == 0 { 0 } else { up.cost_sum_us / up.cost_n };
         let e = &up.ev;
         record("d3d12_xs", "upload", &format!(
@@ -1648,8 +1849,8 @@ unsafe fn pump_inner(queue: *mut c_void) {
         let mut why: Vec<String> = w.classes.iter().map(|(k, v)| format!("{k}: {} ({} MB)", v.0, v.1 >> 20)).collect();
         why.sort();
         record("d3d12_xs", "upload", &format!(
-            "write-watch pump {} (TOMBOX_WRITE_WATCH={}): tracked watched={wn} ({} MB) hash-fallback={un} ({} MB) | queries={} cost={}us total | dirty pages={} -> subresources={} (bytes unchanged, upload skipped={}) | uploads: row-band={} ({} MB) whole={} | CPU-written but NOT uploaded={} (resources {}) | CPU writes into GPU-copy destinations={} | runtime fallbacks={} | submit hook (TOMBOX_WW_SUBMIT={}): calls={} fast-path={} uploads={} subresources={} cross-queue waits={} ring waits={} cpu total={}us avg={}us max={}us | classes at adoption: [{}]",
-            up.pumps, if crate::cpu_watch::enabled() { "on" } else { "0" }, wb >> 20, ub >> 20, w.queries, w.query_us, w.dirty_pages, w.dirty_subs, w.unchanged, w.band_uploads, w.band_bytes >> 20, w.whole_uploads, w.lost, w.lost_res, w.gpu_owned_writes, w.fallbacks,
+            "write-watch pump {} (TOMBOX_WRITE_WATCH={}): tracked watched={wn} ({} MB) hash-fallback={un} ({} MB) | queries={} cost={}us total | dirty pages={} -> subresources={} (bytes unchanged, upload skipped={}) | uploads: row-band={} ({} MB) whole={} | CPU-written but NOT uploaded={} (resources {}) | CPU writes into GPU-copy destinations={} | runtime fallbacks={} backing freed={} (recommitted {}) | submit hook (TOMBOX_WW_SUBMIT={}): calls={} fast-path={} uploads={} subresources={} cross-queue waits={} ring waits={} cpu total={}us avg={}us max={}us | classes at adoption: [{}]",
+            up.pumps, if crate::cpu_watch::enabled() { "on" } else { "0" }, wb >> 20, ub >> 20, w.queries, w.query_us, w.dirty_pages, w.dirty_subs, w.unchanged, w.band_uploads, w.band_bytes >> 20, w.whole_uploads, w.lost, w.lost_res, w.gpu_owned_writes, w.fallbacks, w.backing_freed, w.backing_back,
             if submit_hook_enabled() { "on" } else { "0" }, up.sb.hooks, up.sb.fast, up.sb.uploads, up.sb.subs, up.sb.cross_queue, up.sb.ring_waits, up.sb.us_total, up.sb.us_total / up.sb.hooks.max(1), up.sb.us_max,
             why.join("; ")));
         record("d3d12_xs", "upload", &format!(
@@ -1677,14 +1878,18 @@ pub(crate) struct TestWw {
     pub dirty_subs: u64,
     pub uploaded_subs: u64,
     pub unchanged: u64,
+    pub freed: bool,
+    pub fallbacks: u64,
+    pub rcached: bool,
+    pub rs: [u64; 4],
 }
 
 #[cfg(test)]
 pub(crate) fn test_ww(res: *mut c_void) -> TestWw {
     let g = UP.lock().unwrap();
-    let Some(up) = g.as_ref() else { return TestWw { watched: None, sent: false, band_uploads: 0, lost: 0, dirty_subs: 0, uploaded_subs: 0, unchanged: 0 } };
+    let Some(up) = g.as_ref() else { return TestWw { watched: None, sent: false, band_uploads: 0, lost: 0, dirty_subs: 0, uploaded_subs: 0, unchanged: 0, freed: false, fallbacks: 0, rcached: false, rs: rs_total() } };
     let t = up.tracked.iter().find(|t| t.res == res as usize);
-    TestWw { watched: t.map(|t| t.ww), sent: t.map_or(false, |t| t.sent.iter().all(|&x| x)), band_uploads: up.ww.band_uploads, lost: up.ww.lost, dirty_subs: up.ww.dirty_subs, uploaded_subs: up.uploaded_subs, unchanged: up.ww.unchanged }
+    TestWw { watched: t.map(|t| t.ww), sent: t.map_or(false, |t| t.sent.iter().all(|&x| x)), band_uploads: up.ww.band_uploads, lost: up.ww.lost, dirty_subs: up.ww.dirty_subs, uploaded_subs: up.uploaded_subs, unchanged: up.ww.unchanged, freed: t.map_or(false, |t| t.freed), fallbacks: up.ww.fallbacks, rcached: t.is_some_and(|t| t.rcache.is_some()), rs: rs_total() }
 }
 
 #[cfg(test)]

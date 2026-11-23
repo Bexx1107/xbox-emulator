@@ -358,6 +358,9 @@ unsafe fn report(s: &mut State) {
     for seq in &s.done {
         for w in seq.windows(2) {
             let (t0, t1) = (ts(w[0].slot), ts(w[1].slot));
+            if t0 != 0 && t1 >= t0 && w[0].kind <= 1 && !w[0].label.compute && crate::passcap::ps_ms_target() == Some(w[0].label.b) {
+                crate::passcap::note_slow_call(w[0].label.b, (t1 - t0) as f64 * tick_ms, w[0].frame);
+            }
             if t0 == 0 || t1 < t0 || t1 - t0 > max_ticks {
                 bad += 1;
                 continue;

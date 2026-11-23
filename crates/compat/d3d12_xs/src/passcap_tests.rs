@@ -22,6 +22,30 @@ fn passcap_parse_selector() {
 }
 
 #[test]
+fn passcap_ps_ms_trigger_logic() {
+    let s = parse("ps_ms:ba37366c685cb01e:10,n:4").unwrap();
+    assert_eq!(s.ps_ms, Some((0xba37366c685cb01e, 10.0)));
+    assert_eq!(s.frames, 4);
+    assert!(s.secs.is_empty() && !s.file && s.unknown.is_empty());
+    assert_eq!(parse("ps_ms:0xba37366c685cb01e:2.5").unwrap().ps_ms, Some((0xba37366c685cb01e, 2.5)));
+    for bad in ["ps_ms:zz:10", "ps_ms:ba37366c685cb01e:0", "ps_ms:ba37366c685cb01e", "ps_ms:ba37366c685cb01e:-1", "ps_ms"] {
+        let s = parse(bad).unwrap();
+        assert_eq!(s.ps_ms, None, "{bad}");
+        assert_eq!(s.unknown.len(), 1, "{bad}");
+    }
+    let t = Some((0xba37366c685cb01e, 10.0));
+    assert!(slow_call(0xba37366c685cb01e, 622.0, t));
+    assert!(!slow_call(0xba37366c685cb01e, 10.0, t));
+    assert!(!slow_call(0xba37366c685cb01e, 3.0, t));
+    assert!(!slow_call(0x985ca0d088a1901a, 622.0, t));
+    assert!(!slow_call(0xba37366c685cb01e, 622.0, None));
+    assert!(slow_due(true, true, 0, SLOW_MAX_SHOTS));
+    assert!(!slow_due(true, false, 0, SLOW_MAX_SHOTS));
+    assert!(!slow_due(false, true, 0, SLOW_MAX_SHOTS));
+    assert!(!slow_due(true, true, SLOW_MAX_SHOTS, SLOW_MAX_SHOTS));
+}
+
+#[test]
 fn passcap_take_due_fires_once_per_entry() {
     let l = [8.0, 38.0, 44.0];
     let mut i = 0;

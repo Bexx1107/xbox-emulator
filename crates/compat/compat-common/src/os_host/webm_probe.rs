@@ -14,34 +14,26 @@ extern "system" {
 }
 
 pub const VAR: &str = "TOMBOX_WEBM_PROBE";
-pub const TITLE_EXE: &str = "GbxGame.exe";
+pub const KEYS: [&str; 8] = ["webm.init_count", "webm.thread_handle", "webm.quit_flag", "webm.affinity_mask", "webm.decoders", "webm.decoder_count", "webm.round_robin", "webm.wake_time"];
+pub const DECODER_FIELDS: &str = "webm.decoder";
 
-pub const INIT_COUNT: usize = 0x292fec0;
-pub const THREAD_HANDLE: usize = 0x292ff50;
-pub const QUIT_FLAG: usize = 0x292ff58;
-pub const AFFINITY_MASK: usize = 0x28e9538;
-pub const DECODERS: usize = 0x292fd90;
-pub const DECODER_COUNT: usize = 0x292fd98;
-pub const ROUND_ROBIN: usize = 0x292fec4;
-pub const WAKE_TIME: usize = 0x292fec8;
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Globals {
+    pub init_count: usize,
+    pub thread_handle: usize,
+    pub quit_flag: usize,
+    pub affinity_mask: usize,
+    pub decoders: usize,
+    pub decoder_count: usize,
+    pub round_robin: usize,
+    pub wake_time: usize,
+}
 
-pub const FIELDS: &[(&str, usize, usize)] = &[
-    ("frames", 0xb28, 4),
-    ("req", 0xb30, 4),
-    ("target", 0xb34, 4),
-    ("late", 0xb38, 4),
-    ("block", 0x48, 8),
-    ("block_next", 0x78, 8),
-    ("now", 0x60, 4),
-    ("s64", 0x64, 4),
-    ("t90", 0x90, 4),
-    ("s94", 0x94, 4),
-    ("cur_state", 0x38 + 0x2c, 4),
-    ("next_state", 0x68 + 0x2c, 4),
-    ("cues", 0x670, 4),
-    ("stream", 0x0, 8),
-    ("vpx_y", 0x148, 8),
-];
+pub fn layout(o: &crate::title_offsets::Offsets) -> Result<(Globals, Vec<(String, usize, usize)>), String> {
+    let v = o.require(&KEYS)?;
+    let g = Globals { init_count: v[0], thread_handle: v[1], quit_flag: v[2], affinity_mask: v[3], decoders: v[4], decoder_count: v[5], round_robin: v[6], wake_time: v[7] };
+    Ok((g, o.fields(DECODER_FIELDS).to_vec()))
+}
 
 pub const MAX_DECODERS: usize = 8;
 
@@ -78,25 +70,25 @@ fn thread_line(h: usize) -> (String, u64) {
     (format!("thread h={h:#x} tid={tid} name='{name}' {exit} cycle_query={}", if cyc_ok { "ok" } else { "failed" }), cyc)
 }
 
-fn snapshot(base: usize) -> (String, Vec<String>, u64) {
+fn snapshot(base: usize, l: &Globals, fields: &[(String, usize, usize)]) -> (String, Vec<String>, u64) {
     let g = |rva: usize, len: usize| read(base + rva, len).unwrap_or(u64::MAX);
-    let h = g(THREAD_HANDLE, 8) as usize;
-    let mask = g(AFFINITY_MASK, 4);
+    let h = g(l.thread_handle, 8) as usize;
+    let mask = g(l.affinity_mask, 4);
     let topo = super::affinity::topology();
     let host = topo.to_host(mask, super::affinity::process_console_mask());
     let (tl, cycles) = thread_line(if h == usize::MAX { 0 } else { h });
     let head = format!(
         "init={} quit={} mask={mask:#x} host={} count={} rr={} wake={} {}",
-        g(INIT_COUNT, 4),
-        g(QUIT_FLAG, 4),
+        g(l.init_count, 4),
+        g(l.quit_flag, 4),
         host.map(|v| format!("{v:#x}")).unwrap_or_else(|| "REJECTED".into()),
-        g(DECODER_COUNT, 4),
-        g(ROUND_ROBIN, 4),
-        g(WAKE_TIME, 4),
+        g(l.decoder_count, 4),
+        g(l.round_robin, 4),
+        g(l.wake_time, 4),
         tl
     );
-    let arr = g(DECODERS, 8) as usize;
-    let n = (g(DECODER_COUNT, 4) as usize).min(MAX_DECODERS);
+    let arr = g(l.decoders, 8) as usize;
+    let n = (g(l.decoder_count, 4) as usize).min(MAX_DECODERS);
     let mut decs = Vec::new();
     for i in 0..n {
         let d = read(arr + i * 8, 8).unwrap_or(0) as usize;
@@ -104,7 +96,7 @@ fn snapshot(base: usize) -> (String, Vec<String>, u64) {
             decs.push(format!("dec[{i}]=0"));
             continue;
         }
-        let parts: Vec<String> = FIELDS.iter().map(|(k, off, len)| match read(d + off, *len) {
+        let parts: Vec<String> = fields.iter().map(|(k, off, len)| match read(d + off, *len) {
             Some(v) => format!("{k}={v:#x}"),
             None => format!("{k}=?"),
         }).collect();
@@ -121,17 +113,29 @@ pub fn start() {
     if !enabled() {
         return;
     }
-    let is_title = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case(TITLE_EXE))).unwrap_or(false);
-    if !is_title {
-        return;
-    }
     let base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
     if base == 0 {
         return;
     }
+    let Some(o) = crate::title_offsets::for_this_title() else {
+        crate::record_raw("webm_probe", "inert", &crate::title_offsets::status_for_this_title());
+        return;
+    };
+    let (l, fields) = match layout(o) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::record_raw("webm_probe", "inert", &e);
+            return;
+        }
+    };
+    let stamp = unsafe { crate::title_offsets::image_timestamp(base as *const u8) };
+    if !o.matches_image(stamp) {
+        crate::record_raw("webm_probe", "inert", &format!("{} was made for another build (image timestamp {stamp:#x})", o.source));
+        return;
+    }
     let period = std::env::var(VAR).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| *v >= 100).unwrap_or(1000);
     let _ = std::thread::Builder::new().name("tombox-webm-probe".into()).spawn(move || {
-        crate::record_raw("webm_probe", "start", &format!("base={base:#x} period={period}ms"));
+        crate::record_raw("webm_probe", "start", &format!("base={base:#x} period={period}ms offsets={}", o.source));
         let mut last_head = String::new();
         let mut last_decs: Vec<String> = Vec::new();
         let mut last_cycles = 0u64;
@@ -139,7 +143,7 @@ pub fn start() {
         let mut lines = 0u32;
         for tick in 0..(240_000 / period) {
             std::thread::sleep(std::time::Duration::from_millis(period));
-            let (head, decs, cycles) = snapshot(base);
+            let (head, decs, cycles) = snapshot(base, &l, &fields);
             let ran = if last_cycles == 0 { 0 } else { cycles.saturating_sub(last_cycles) };
             let running = ran > 0;
             if head != last_head || (last_cycles != 0 && last_running != Some(running)) {
@@ -164,4 +168,31 @@ pub fn start() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_layout_comes_from_the_offsets_file() {
+        let o = crate::title_offsets::parse(r#"{"exe":"T.exe","values":{"webm.init_count":1,"webm.thread_handle":2,"webm.quit_flag":3,"webm.affinity_mask":4,"webm.decoders":5,"webm.decoder_count":6,"webm.round_robin":7,"webm.wake_time":8},"fields":{"webm.decoder":[["frames","0x10",4]]}}"#, "t").unwrap();
+        let (g, f) = layout(&o).unwrap();
+        assert_eq!((g.init_count, g.wake_time, g.decoders), (1, 8, 5));
+        assert_eq!(f, vec![("frames".to_string(), 0x10, 4)]);
+        let partial = crate::title_offsets::parse(r#"{"exe":"T.exe","values":{"webm.init_count":1}}"#, "t").unwrap();
+        assert!(layout(&partial).unwrap_err().contains("webm.wake_time"));
+    }
+
+    #[test]
+    fn a_snapshot_reads_through_the_layout() {
+        let mut img = vec![0u8; 0x100];
+        img[0x10..0x14].copy_from_slice(&7u32.to_le_bytes());
+        img[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+        let base = img.as_ptr() as usize;
+        let l = Globals { init_count: 0x10, thread_handle: 0x18, quit_flag: 0x20, affinity_mask: 0x24, decoders: 0x28, decoder_count: 0x30, round_robin: 0x34, wake_time: 0x38 };
+        let (head, decs, _) = snapshot(base, &l, &[]);
+        assert!(head.starts_with("init=7 quit=0"), "{head}");
+        assert!(decs.is_empty());
+    }
 }

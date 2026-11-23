@@ -93,6 +93,7 @@ pub fn set_hysteresis(index: usize, bytes: usize) {
         while p.free.len() as u64 > p.hysteresis as u64 {
             let c = p.free.pop().unwrap();
             crate::epoch::bump_range(c, c + (1usize << sh));
+            crate::write_watch::forget(c);
             unsafe { VirtualFree(c as *mut c_void, 0, MEM_RELEASE) };
             p.released = p.released.wrapping_add(1);
         }

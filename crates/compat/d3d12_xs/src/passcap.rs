@@ -53,6 +53,44 @@ pub struct Sel {
     pub all: bool,
     pub raw: bool,
     pub unknown: Vec<String>,
+    pub ps_ms: Option<(u64, f64)>,
+}
+
+pub fn parse_ps_ms(v: &str) -> Option<(u64, f64)> {
+    let (h, m) = v.split_once(':')?;
+    let h = h.trim();
+    let h = u64::from_str_radix(h.strip_prefix("0x").unwrap_or(h), 16).ok().filter(|x| *x != 0)?;
+    let m = m.trim().parse::<f64>().ok().filter(|f| f.is_finite() && *f > 0.0)?;
+    Some((h, m))
+}
+
+pub fn slow_call(ps: u64, ms: f64, target: Option<(u64, f64)>) -> bool {
+    target.is_some_and(|(t, thr)| ps == t && ms > thr)
+}
+
+pub fn slow_due(hit: bool, seen: bool, done: u32, max: u32) -> bool {
+    hit && seen && done < max
+}
+
+pub const SLOW_MAX_SHOTS: u32 = 4;
+static SLOW_HIT: AtomicBool = AtomicBool::new(false);
+static SLOW_SHOTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SLOW_LAST: Mutex<Option<(f64, u32)>> = Mutex::new(None);
+
+pub fn ps_ms_target() -> Option<u64> {
+    sel().and_then(|s| s.ps_ms).map(|x| x.0)
+}
+
+pub fn note_slow_call(ps: u64, ms: f64, frame: u32) -> bool {
+    let target = sel().and_then(|s| s.ps_ms);
+    if !slow_call(ps, ms, target) || SLOW_SHOTS.load(Ordering::Relaxed) >= SLOW_MAX_SHOTS {
+        return false;
+    }
+    *SLOW_LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((ms, frame));
+    if !SLOW_HIT.swap(true, Ordering::Relaxed) {
+        record("d3d12_xs", "passcap", &format!("ps_ms trigger: PS {ps:016x} took {ms:.2} ms in one call (gpuprof window frame {frame}) > {:.2} ms; the next frame that draws this PS arms a shot", target.map_or(0.0, |t| t.1)));
+    }
+    true
 }
 
 pub fn parse(v: &str) -> Option<Sel> {
@@ -60,7 +98,7 @@ pub fn parse(v: &str) -> Option<Sel> {
     if v.is_empty() || v == "0" {
         return None;
     }
-    let mut s = Sel { secs: Vec::new(), presents: Vec::new(), file: false, frames: 1, budget_mb: 1200, max_caps: 400, chain_every: 600, all: false, raw: false, unknown: Vec::new() };
+    let mut s = Sel { secs: Vec::new(), presents: Vec::new(), file: false, frames: 1, budget_mb: 1200, max_caps: 400, chain_every: 600, all: false, raw: false, unknown: Vec::new(), ps_ms: None };
     for tok in v.split([',', ';', ' ']).map(str::trim).filter(|t| !t.is_empty()) {
         let (k, val) = match tok.find([':', '=']) {
             Some(i) => (tok[..i].to_ascii_lowercase(), Some(tok[i + 1..].trim())),
@@ -83,6 +121,7 @@ pub fn parse(v: &str) -> Option<Sel> {
                 s.all = true;
                 true
             }
+            ("ps_ms" | "psms", Some(v)) => parse_ps_ms(v).map(|x| s.ps_ms = Some(x)).is_some(),
             ("raw", None) => {
                 s.raw = true;
                 true
@@ -564,6 +603,8 @@ struct G {
     next_id: u32,
     device: usize,
     own: Option<(usize, usize, usize, u64)>,
+    slow_seen: bool,
+    slow_cache: HashMap<usize, u64>,
 }
 
 static STATE: Mutex<Option<G>> = Mutex::new(None);
@@ -616,12 +657,16 @@ fn ps_hash(shot: &mut Shot, pso: usize) -> u64 {
     if pso == 0 {
         return 0;
     }
-    *shot.ps_cache.entry(pso).or_insert_with(|| {
+    *shot.ps_cache.entry(pso).or_insert_with(|| ps_of(pso))
+}
+
+fn ps_of(pso: usize) -> u64 {
+    {
         let real = crate::pso_async::real_of(pso);
         let sum = crate::device_wrap::pso_summary(pso).or_else(|| if real != 0 { crate::device_wrap::pso_summary(real) } else { None });
         let missing = if sum.is_none() { 1 } else { 2 };
         sum.and_then(|(_, p, _)| if p == 0 { None } else { crate::shader_xlat::origin_hash(p) }).unwrap_or(missing)
-    })
+    }
 }
 
 fn bound_state(st: &LState, res: usize, depth: bool) -> (u32, &'static str) {
@@ -741,7 +786,7 @@ pub fn probe_hashes() -> &'static [u64] {
 
 unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
     let Some(st) = g.lists.get(&k) else { return };
-    if st.probe_notes.len() >= 4 {
+    if st.probe_notes.iter().filter(|x| x.starts_with("probe PS ")).count() >= 8 {
         return;
     }
     let mut cbv: Vec<(u32, u64)> = st.cbv.iter().map(|(a, b)| (*a, *b)).collect();
@@ -1114,6 +1159,14 @@ fn note_draw(this: *mut c_void, kind: u8) {
             }
             for r in rts.iter().filter(|r| **r != 0) {
                 *g.fc.per_rt.entry(*r).or_default() += 1;
+            }
+        }
+        if !active && kind != 2 && pso != 0 && SLOW_HIT.load(Ordering::Relaxed) {
+            if let Some(t) = ps_ms_target() {
+                let h = *g.slow_cache.entry(pso).or_insert_with(|| ps_of(pso));
+                if h == t {
+                    g.slow_seen = true;
+                }
             }
         }
         if active && kind != 2 {
@@ -1582,8 +1635,15 @@ pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32,
                 }
             }
         }
+        let seen = core::mem::take(&mut g.slow_seen);
         if g.shot.is_none() && !ACTIVE.load(Ordering::Relaxed) {
             let mut why = None;
+            if slow_due(SLOW_HIT.load(Ordering::Relaxed), seen, SLOW_SHOTS.load(Ordering::Relaxed), SLOW_MAX_SHOTS) {
+                SLOW_HIT.store(false, Ordering::Relaxed);
+                let n = SLOW_SHOTS.fetch_add(1, Ordering::Relaxed) + 1;
+                let last = *SLOW_LAST.lock().unwrap_or_else(|e| e.into_inner());
+                why = Some(format!("ps_ms trigger {n}/{SLOW_MAX_SHOTS}: PS {:016x} drawn in the frame just presented after a {} call", ps_ms_target().unwrap_or(0), last.map_or("?".to_string(), |(ms, f)| format!("{ms:.2} ms (gpuprof frame {f})"))));
+            }
             if take_due(&s.secs, &mut g.sec_idx, t) {
                 why = Some(format!("t>={:.1}s after first present", s.secs[g.sec_idx - 1]));
             }

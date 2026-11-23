@@ -1966,7 +1966,7 @@ unsafe extern "system" fn create_placed_resource_x(
     };
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    if hr < 0 || n < 12 {
+    if hr < 0 || n < 12 || (crate::passcap::tables_on() && n < 20000) {
         let how = match &made {
             Some(m) => format!("aliased {:?} heap {:#x}+{:#x}", m.kind, m.heap, m.offset),
             None => "separate committed resource".to_string(),

@@ -15,6 +15,7 @@ mod virt;
 mod write_note;
 mod write_watch;
 mod ww_heap;
+mod ww_valloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
