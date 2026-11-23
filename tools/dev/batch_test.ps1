@@ -11,7 +11,7 @@ param(
   [int]$TerrariaSeconds = 600,
   [int]$MinecraftSeconds = 600,
   [int]$CaptureEvery = 60,
-  [switch]$Headless,
+  [switch]$Visible,
   [int]$IdleSeconds = 120,
   [string]$PadScript = '',
   [string]$MinecraftGameArgs = '',
@@ -568,7 +568,7 @@ function Set-BatchEnv {
   $env:TOMBOX_NET_BACKEND = 'builtin'
   $env:TOMBOX_HOST_PAD = '0'
   $env:TOMBOX_TEST_RUN = '1'
-  if ($Headless) { $env:TOMBOX_HEADLESS = '1' } else { Remove-Item Env:TOMBOX_HEADLESS -ErrorAction SilentlyContinue }
+  if (-not $Visible) { $env:TOMBOX_HEADLESS = '1' } else { Remove-Item Env:TOMBOX_HEADLESS -ErrorAction SilentlyContinue }
   $env:TOMBOX_HOST_KBM = '0'
   $env:TOMBOX_PRELAUNCH_UI = '0'
   $env:TOMBOX_FN_GAMESERVER = '127.0.0.1:7777'
@@ -884,7 +884,7 @@ W "- Run folder: ``$RunRoot`` (all copied logs, stage plans, dumps)"
 W "- Build ($Profile): $(ConvertTo-MdText $build)"
 W "- Network: forced offline/private (TOMBOX_NET_REDIRECT=127.0.0.1, TOMBOX_NET_BACKEND=builtin, TOMBOX_ALLOW_NETWORK removed, Fortnite game server 127.0.0.1:7777); enforced in-process by compat-common net_guard"
 W "- D3D12 debug layer: $(if ($DbgLayer) { "ON via Agility SDK $AgilityVersion ($Agility); FPS is measured with the layer on" } else { 'off (-NoD3d12Debug)' }). DRED: not enabled by any compat crate; only device-removal log lines are captured"
-W "- Audio: each title's WASAPI session is muted from the batch (polled every 0.1 s for the first 2 min, then 0.5 s; each session's prior mute state is restored after the title exits); input: none injected; windows: $(if (-not $Headless) { 'shown by the title (default; -Headless cloaks)' } else { 'headless: TOMBOX_HEADLESS=1 cloaks every title window (tool window, no activation, never composed onto the desktop); frames are read back from the presented title back buffer (TOMBOX_CAPTURE_DIR request files), scaled to the window client size' })"
+W "- Audio: each title's WASAPI session is muted from the batch (polled every 0.1 s for the first 2 min, then 0.5 s; each session's prior mute state is restored after the title exits); input: none injected; windows: $(if ($Visible) { 'shown by the title (-Visible)' } else { 'headless: TOMBOX_HEADLESS=1 cloaks every title window (tool window, no activation, never composed onto the desktop); frames are read back from the presented title back buffer (TOMBOX_CAPTURE_DIR request files), scaled to the window client size' })"
 foreach ($p in $pre) { W "- **Preflight problem:** $(ConvertTo-MdText $p)" }
 W
 W "- Build: $($BuildStamp.Stamp)"

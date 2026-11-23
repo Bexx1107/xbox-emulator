@@ -547,6 +547,7 @@ struct Replay {
     roots: Mutex<HashMap<(u32, u64), usize>>,
     t0: std::time::Instant,
     workers_left: AtomicUsize,
+    workers: usize,
 }
 
 static REPLAY: OnceLock<Replay> = OnceLock::new();
@@ -578,7 +579,7 @@ pub fn start(wrapper: *mut c_void, dir: &std::path::Path) {
     if n == 0 {
         return;
     }
-    let rp = Replay { recs, blobs, next: AtomicUsize::new(0), wrapper: wrapper as usize, roots: Mutex::new(HashMap::new()), t0: std::time::Instant::now(), workers_left: AtomicUsize::new(workers) };
+    let rp = Replay { recs, blobs, next: AtomicUsize::new(0), wrapper: wrapper as usize, roots: Mutex::new(HashMap::new()), t0: std::time::Instant::now(), workers_left: AtomicUsize::new(workers), workers };
     if REPLAY.set(rp).is_err() {
         return;
     }
@@ -651,6 +652,7 @@ fn replay_worker() {
         };
         let hr = match root.and_then(|ro| build(r, &rp.blobs, ro)) {
             Some(b) => {
+                let _slot = crate::shader_xlat::bg_slot(rp.workers);
                 let mut out = 0usize;
                 let hr = unsafe { crate::device_wrap::replay_create(rp.wrapper as *mut c_void, r.kind == GFX, b.desc.as_ptr(), &IID_PSO, &mut out) };
                 if hr >= 0 && out != 0 {

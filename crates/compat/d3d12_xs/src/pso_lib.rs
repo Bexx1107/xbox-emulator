@@ -6,8 +6,8 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use crate::device_wrap::Guid;
 
 const MAGIC: &[u8; 4] = b"TBPL";
-const FILE_VERSION: u32 = 1;
-const KEY_VERSION: &[u8] = b"pso-lib-key v1";
+const FILE_VERSION: u32 = 2;
+const KEY_VERSION: &[u8] = b"pso-lib-key v2 final-root";
 const GFX_DESC: usize = 0x290;
 const CS_DESC: usize = 0x38;
 const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
@@ -265,9 +265,34 @@ fn roots() -> &'static Mutex<HashMap<usize, RootInfo>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn real_roots() -> &'static Mutex<HashMap<usize, u64>> {
+    static R: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn combine_root(given: u64, real: u64) -> u64 {
+    if real == 0 {
+        given
+    } else {
+        given ^ real.rotate_left(29).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+}
+
+pub fn note_real_root(rs: usize, blob: &[u8]) {
+    if rs == 0 {
+        return;
+    }
+    real_roots().lock().unwrap_or_else(|e| e.into_inner()).insert(rs, fnv64(blob) | 1);
+    roots().lock().unwrap_or_else(|e| e.into_inner()).remove(&rs);
+}
+
+pub fn root_real(rs: usize) -> u64 {
+    real_roots().lock().unwrap_or_else(|e| e.into_inner()).get(&rs).copied().unwrap_or(0)
+}
+
 pub fn note_root(rs: usize, mask: u32, blob: &[u8], via_real: bool) {
     if rs != 0 {
-        let hash = fnv64(blob) ^ mask as u64;
+        let hash = combine_root(fnv64(blob) ^ mask as u64, root_real(rs));
         roots().lock().unwrap_or_else(|e| e.into_inner()).insert(rs, RootInfo { hash, mask, blob: std::sync::Arc::from(blob), via_real });
     }
 }
@@ -280,7 +305,17 @@ fn root_hash(rs: u64) -> Option<u64> {
     if rs == 0 {
         return Some(0);
     }
-    roots().lock().unwrap_or_else(|e| e.into_inner()).get(&(rs as usize)).map(|r| r.hash)
+    if let Some(h) = roots().lock().unwrap_or_else(|e| e.into_inner()).get(&(rs as usize)).map(|r| r.hash) {
+        return Some(h);
+    }
+    match root_real(rs as usize) {
+        0 => None,
+        real => Some(combine_root(0, real)),
+    }
+}
+
+pub fn root_key_hash(rs: usize) -> Option<u64> {
+    root_hash(rs as u64)
 }
 
 unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, blob: *const u8, len: usize, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
@@ -985,5 +1020,28 @@ mod removed_gate {
         let e = super::save(false).unwrap_err();
         crate::dred::clear_removed_for_test();
         assert!(e.contains("device removed"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod final_root_key {
+    #[test]
+    fn the_key_follows_the_root_signature_the_driver_receives() {
+        let title = b"title-root-signature".to_vec();
+        let (a, b, c) = (0x7a11_0000usize, 0x7a12_0000usize, 0x7a13_0000usize);
+        super::note_real_root(a, b"final-root-with-aliases");
+        super::note_root(a, 0, &title, false);
+        super::note_real_root(b, b"final-root-without-aliases");
+        super::note_root(b, 0, &title, false);
+        let (ha, hb) = (super::root_key_hash(a).unwrap(), super::root_key_hash(b).unwrap());
+        assert_ne!(ha, hb, "one title blob patched two ways must give two keys");
+        super::note_real_root(c, b"final-root-with-aliases");
+        super::note_root(c, 0, &title, false);
+        assert_eq!(super::root_key_hash(c), Some(ha), "the same final blob keys the same");
+        super::note_root(0x7a14_0000, 0, &title, false);
+        assert_ne!(super::root_key_hash(0x7a14_0000), Some(ha));
+        super::note_real_root(a, b"a-new-object-at-a-reused-address");
+        assert_ne!(super::root_key_hash(a), Some(ha), "a stale title entry never outlives a new root signature at the same address");
+        assert!(super::root_info(a).is_none());
     }
 }

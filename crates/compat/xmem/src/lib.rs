@@ -1,4 +1,5 @@
 mod alloc;
+mod crt_hooks;
 pub mod epoch;
 mod heap;
 mod heap_acct;
@@ -9,6 +10,9 @@ mod pool;
 mod range_hooks;
 mod stats;
 mod sys;
+mod title_acct;
+#[cfg(test)]
+mod test_veh;
 mod virt;
 mod write_note;
 
@@ -90,6 +94,11 @@ pub unsafe extern "system" fn XMemRegisterGraphicsMemoryConfiguration(cfg: *cons
         *g = Some(*cfg);
         record(M, "XMemRegisterGraphicsMemoryConfiguration", &format!("{:?}", *cfg));
     }
+}
+
+#[no_mangle]
+pub extern "system" fn TomboxTitleGpuCharge(bytes: u64, release: u32) -> u64 {
+    title_acct::gpu_charge(bytes, release != 0)
 }
 
 pub fn graphics_configuration() -> Option<GraphicsMemoryConfiguration> {

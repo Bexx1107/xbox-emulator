@@ -262,6 +262,13 @@ struct SubMap {
     offs: Vec<u32>,
     lo: usize,
     hi: usize, // exclusive
+    rows: std::sync::OnceLock<Vec<(u32, u32)>>,
+}
+
+impl SubMap {
+    fn row_extents(&self, bpe: usize) -> &[(u32, u32)] {
+        self.rows.get_or_init(|| crate::cpu_watch::row_extents(&self.offs, self.w_e as usize, self.h_e as usize, bpe))
+    }
 }
 
 struct TexLayout {
@@ -333,7 +340,7 @@ impl TexLayout {
                 offs.push(o as u32);
             }
         }
-        let v = if ok { Some(Arc::new(SubMap { w_e, h_e, offs, lo, hi })) } else { None };
+        let v = if ok { Some(Arc::new(SubMap { w_e, h_e, offs, lo, hi, rows: std::sync::OnceLock::new() })) } else { None };
         g.insert(sub, v.clone());
         v
     }
@@ -378,6 +385,10 @@ struct Tracked {
     watch: Vec<u64>,
     pend: Vec<u64>,
     hot: u64,
+    ww: bool,
+    ww_region: usize,
+    cpu_dirty: Vec<Vec<(usize, usize)>>,
+    sent: Vec<bool>,
 }
 
 struct Uploader {
@@ -410,8 +421,37 @@ struct Uploader {
     cost_max_us: u64,
     cost_n: u64,
     reaper: crate::reaper::Reaper,
+    ww: WwStats,
 }
 unsafe impl Send for Uploader {}
+
+#[derive(Default)]
+struct WwStats {
+    buf: Vec<usize>,
+    classes: HashMap<&'static str, (u64, u64)>,
+    logged: std::collections::HashSet<usize>,
+    log_lines: u64,
+    queries: u64,
+    query_us: u64,
+    dirty_pages: u64,
+    dirty_subs: u64,
+    band_uploads: u64,
+    band_bytes: u64,
+    whole_uploads: u64,
+    lost: u64,
+    lost_res: u64,
+    gpu_owned_writes: u64,
+    fallbacks: u64,
+}
+
+impl WwStats {
+    fn once(&mut self, res: usize, kind: u8, msg: impl FnOnce() -> String) {
+        if self.logged.insert(res ^ ((kind as usize) << 56)) && self.log_lines < 200 {
+            self.log_lines += 1;
+            record("d3d12_xs", "upload", &msg());
+        }
+    }
+}
 
 #[derive(Default)]
 struct EventStats {
@@ -528,6 +568,76 @@ fn apply_notes(up: &mut Uploader, notes: &[(usize, usize, u32)]) {
     }
 }
 
+fn ww_sync(up: &mut Uploader) {
+    if !crate::cpu_watch::enabled() {
+        return;
+    }
+    if up.index_stale {
+        rebuild_index(up);
+    }
+    let mut by_region: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for t in &up.tracked {
+        if t.ww {
+            let lo = t.p.va as usize;
+            by_region.entry(t.ww_region).or_default().push((lo, lo + t.layout.total as usize));
+        }
+    }
+    if by_region.is_empty() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let mut failed: Vec<(usize, usize, u32)> = Vec::new();
+    let mut dirty: Vec<(usize, usize)> = Vec::new();
+    for (_, ext) in by_region {
+        for (a, b) in crate::cpu_watch::merge_extents(ext) {
+            up.ww.queries += 1;
+            match crate::cpu_watch::take_dirty(a, b, &mut up.ww.buf) {
+                Ok(r) => dirty.extend(r),
+                Err(e) => failed.push((a, b, e)),
+            }
+        }
+    }
+    up.ww.query_us += t0.elapsed().as_micros() as u64;
+    for (a, b, e) in failed {
+        for idx in overlapping(&up.index, a, b) {
+            let t = &mut up.tracked[idx];
+            if !t.ww {
+                continue;
+            }
+            t.ww = false;
+            t.hashes.iter_mut().for_each(|h| *h = None);
+            up.ww.fallbacks += 1;
+            let (res, va) = (t.res, t.p.va);
+            up.ww.once(res, 3, || format!("GetWriteWatch over {a:#x}..{b:#x} failed (error {e}); placed resource res={res:#x} va={va:#x} falls back to the hash path"));
+        }
+    }
+    for (a, b) in dirty {
+        up.ww.dirty_pages += ((b - a) / crate::cpu_watch::PAGE) as u64;
+        for idx in overlapping(&up.index, a, b) {
+            let t = &mut up.tracked[idx];
+            if !t.ww {
+                continue;
+            }
+            for sub in 0..t.hashes.len() {
+                let Some((lo, len)) = sub_range(t, sub) else { continue };
+                if lo >= b || lo + len <= a {
+                    continue;
+                }
+                let d = &mut t.cpu_dirty[sub];
+                d.push((a.max(lo), b.min(lo + len)));
+                if d.len() > 64 {
+                    let (x, y) = (d.iter().map(|r| r.0).min().unwrap(), d.iter().map(|r| r.1).max().unwrap());
+                    d.clear();
+                    d.push((x, y));
+                }
+                t.hashes[sub] = None;
+                t.zero[sub] = false;
+                up.ww.dirty_subs += 1;
+            }
+        }
+    }
+}
+
 unsafe fn init(queue: *mut c_void) -> Result<Uploader, String> {
     let mut device: *mut c_void = core::ptr::null_mut();
     let hr = vcall!(queue, 7, fn(*const Guid, *mut *mut c_void) -> i32, &IID_DEVICE, &mut device);
@@ -564,6 +674,7 @@ unsafe fn init(queue: *mut c_void) -> Result<Uploader, String> {
         pumps: 0, uploaded_subs: 0, uploaded_bytes: 0, unreadable: 0, rejected: 0, recommitted: 0,
         zero_cursor: 0, zero_filled: 0, watch_changed: 0,
         index: Vec::new(), index_stale: true, ev: EventStats::default(), cost_sum_us: 0, cost_max_us: 0, cost_n: 0,
+        ww: WwStats::default(),
     })
 }
 
@@ -608,7 +719,17 @@ unsafe fn adopt(up: &mut Uploader, res: *mut c_void, p: Placed) -> Result<Tracke
     if fps.iter().any(|f| f.row_size % layout.bpe as u64 != 0) {
         return Err(format!("row size not a multiple of bytes-per-element {}", layout.bpe));
     }
-    Ok(Tracked { res: res as usize, p, layout, fps, total_bytes: total, hashes: vec![None; nsubs as usize], partial: vec![0; nsubs as usize], zero: vec![false; nsubs as usize], watch: vec![0; nsubs as usize], pend: vec![up.pumps + PENDING_PUMPS; nsubs as usize], hot: up.pumps + PENDING_PUMPS })
+    let class = crate::cpu_watch::classify(p.va as usize, layout.total as usize);
+    let e = up.ww.classes.entry(class.why()).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += layout.total;
+    let ww = class == crate::cpu_watch::Class::Watched;
+    if !ww {
+        let (va, total, why) = (p.va, layout.total, class.why());
+        up.ww.once(res as usize, 0, || format!("placed resource res={:#x} va={va:#x}+{total:#x} keeps the hash fallback: {why}", res as usize));
+    }
+    let ww_region = if ww { crate::cpu_watch::owner(p.va as usize).1 } else { 0 };
+    Ok(Tracked { res: res as usize, p, layout, fps, total_bytes: total, hashes: vec![None; nsubs as usize], partial: vec![0; nsubs as usize], zero: vec![false; nsubs as usize], watch: vec![0; nsubs as usize], pend: vec![up.pumps + PENDING_PUMPS; nsubs as usize], hot: up.pumps + PENDING_PUMPS, ww, ww_region, cpu_dirty: vec![Vec::new(); nsubs as usize], sent: vec![false; nsubs as usize] })
 }
 
 struct Staged {
@@ -616,7 +737,7 @@ struct Staged {
     state: u32,
     buf: *mut c_void,
     size: u64,
-    subs: Vec<(u32, Footprint)>,
+    subs: Vec<(u32, Footprint, Option<Vec<[u32; 6]>>)>,
 }
 
 /// Check one tracked texture; stage an upload for every changed, readable subresource.
@@ -629,7 +750,7 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
     let now = up.pumps;
     let t = &mut up.tracked[idx];
     let bpe = t.layout.bpe as usize;
-    let mut changed: Vec<(u32, Arc<SubMap>, u64, Option<Arc<Vec<u8>>>)> = Vec::new();
+    let mut changed: Vec<(u32, Arc<SubMap>, u64, Option<Arc<Vec<u8>>>, Option<Vec<[u32; 6]>>)> = Vec::new();
     let mut unreadable = 0;
     let want: Vec<usize> = (0..t.fps.len()).filter(|&s| fresh_only != t.hashes[s].is_some()).collect();
     if want.is_empty() {
@@ -666,6 +787,16 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             if !sparse_zero_enabled() {
                 t.partial[sub as usize] = mark;
                 unreadable += 1;
+                if !t.cpu_dirty[sub as usize].is_empty() {
+                    t.cpu_dirty[sub as usize].clear();
+                    up.ww.lost += 1;
+                    let (res, va) = (t.res, t.p.va);
+                    let before = up.ww.logged.len();
+                    up.ww.once(res, 2, || format!("CPU-written placed resource res={res:#x} va={va:#x} sub={sub} NOT uploaded: part of its memory is unreadable and TOMBOX_SPARSE_ZERO is off"));
+                    if up.ww.logged.len() > before {
+                        up.ww.lost_res += 1;
+                    }
+                }
                 continue;
             }
             let mut v = vec![0u8; len];
@@ -684,14 +815,16 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             None => core::slice::from_raw_parts(lo as *const u8, len),
         };
         let ck = std::time::Instant::now();
-        let need_zero_test = t.hashes[sub as usize].is_none() && !gpu_owned;
-        let Some((h, all_zero)) = hash_title(mem.as_ptr() as usize, mem.len(), need_zero_test) else {
+        let dirty = !t.cpu_dirty[sub as usize].is_empty();
+        let need_zero_test = t.hashes[sub as usize].is_none() && !gpu_owned && !dirty;
+        let hashed_now = if t.ww && dirty { Some((0u64, false)) } else { hash_title(mem.as_ptr() as usize, mem.len(), need_zero_test) };
+        let Some((h, all_zero)) = hashed_now else {
             unreadable += 1;
             continue;
         };
         stage_time(2, ck);
         *hashed += mem.len() as u64;
-        if t.hashes[sub as usize].is_none() && (gpu_owned || all_zero) {
+        if t.hashes[sub as usize].is_none() && (gpu_owned || all_zero) && !dirty {
             // Never written by the title (fresh committed pages are zero). Do not upload:
             // the title may instead fill this subresource with a GPU copy
             // (CopyTextureRegion), which an upload of zeros could overwrite.
@@ -700,8 +833,29 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             continue;
         }
         t.zero[sub as usize] = false;
-        if t.hashes[sub as usize] != Some(h) {
-            changed.push((sub, map, h, snap));
+        if dirty && gpu_owned {
+            up.ww.gpu_owned_writes += 1;
+            let (res, va) = (t.res, t.p.va);
+            up.ww.once(res, 1, || format!("placed resource res={res:#x} va={va:#x} is a GPU copy destination and the CPU also wrote it; only the CPU-written row bands are uploaded, GPU-written texels elsewhere are kept"));
+        }
+        let mut boxes = None;
+        if t.ww && dirty && t.sent[sub as usize] {
+            let fh = u32::from_le_bytes(fp.raw[16..20].try_into().unwrap());
+            let fw = u32::from_le_bytes(fp.raw[12..16].try_into().unwrap());
+            let fd = u32::from_le_bytes(fp.raw[20..24].try_into().unwrap()).max(1);
+            if fp.rows > 0 && fh % fp.rows == 0 {
+                let bh = fh / fp.rows;
+                let bands = crate::cpu_watch::dirty_bands(map.row_extents(bpe), t.p.va as usize, &t.cpu_dirty[sub as usize], 8);
+                if bands.is_empty() {
+                    t.cpu_dirty[sub as usize].clear();
+                    t.hashes[sub as usize] = Some(h);
+                    continue;
+                }
+                boxes = Some(bands.iter().map(|&(y0, y1)| [0, y0 as u32 * bh, 0, fw, (y1 as u32 * bh).min(fh), fd]).collect::<Vec<[u32; 6]>>());
+            }
+        }
+        if dirty || t.hashes[sub as usize] != Some(h) {
+            changed.push((sub, map, h, snap, boxes));
         }
     }
     up.unreadable += unreadable;
@@ -745,21 +899,59 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
     let ck = std::time::Instant::now();
     let base = t.p.va as *const u8;
     let mut subs = Vec::with_capacity(changed.len());
-    for (sub, map, h, snap) in changed {
+    for (sub, map, h, snap, boxes) in changed {
         let fp = t.fps[sub as usize];
         let dst0 = data.add(fp.offset() as usize);
         let pitch = fp.row_pitch() as usize;
         let src0 = match &snap { Some(v) => v.as_ptr().wrapping_sub(map.lo), None => base };
-        if !detile_rows(dst0, pitch, src0, (src0 as usize).wrapping_add(map.lo), map.hi - map.lo, &map.offs, map.w_e as usize, map.h_e as usize, bpe) {
+        let (title_lo, title_len) = ((src0 as usize).wrapping_add(map.lo), map.hi - map.lo);
+        let bh = if fp.rows == 0 { 1 } else { (u32::from_le_bytes(fp.raw[16..20].try_into().unwrap()) / fp.rows).max(1) };
+        let ok = match &boxes {
+            Some(bx) => bx.iter().all(|b| {
+                let (y0, y1) = ((b[1] / bh) as usize, (b[4].div_ceil(bh) as usize).min(map.h_e as usize));
+                detile_guarded(title_lo, title_len, &DetileJob { dst0: dst0 as usize, pitch, src0: src0 as usize, offs: map.offs.as_ptr(), offs_len: map.offs.len(), w_e: map.w_e as usize, y0, y1, bpe })
+            }),
+            None => detile_rows(dst0, pitch, src0, title_lo, title_len, &map.offs, map.w_e as usize, map.h_e as usize, bpe),
+        };
+        let was_dirty = !t.cpu_dirty[sub as usize].is_empty();
+        if !ok {
             up.unreadable += 1;
+            if was_dirty {
+                t.cpu_dirty[sub as usize].clear();
+                up.ww.lost += 1;
+                let (res, va) = (t.res, t.p.va);
+                let before = up.ww.logged.len();
+                up.ww.once(res, 2, || format!("CPU-written placed resource res={res:#x} va={va:#x} sub={sub} NOT uploaded: its memory faulted while being read"));
+                if up.ww.logged.len() > before {
+                    up.ww.lost_res += 1;
+                }
+            }
             continue;
         }
         t.hashes[sub as usize] = Some(h);
-        t.watch[sub as usize] = now + WATCH_PUMPS;
-        t.hot = t.hot.max(now + WATCH_PUMPS);
+        if t.ww {
+            t.watch[sub as usize] = 0;
+        } else {
+            t.watch[sub as usize] = now + WATCH_PUMPS;
+            t.hot = t.hot.max(now + WATCH_PUMPS);
+        }
+        t.sent[sub as usize] = true;
+        t.cpu_dirty[sub as usize].clear();
         up.uploaded_subs += 1;
-        up.uploaded_bytes += (map.w_e as u64) * (map.h_e as u64) * bpe as u64;
-        subs.push((sub, fp));
+        let bytes = match &boxes {
+            Some(bx) => bx.iter().map(|b| ((b[4] - b[1]).div_ceil(bh)) as u64 * map.w_e as u64 * bpe as u64).sum::<u64>(),
+            None => (map.w_e as u64) * (map.h_e as u64) * bpe as u64,
+        };
+        up.uploaded_bytes += bytes;
+        if was_dirty {
+            if boxes.is_some() {
+                up.ww.band_uploads += 1;
+                up.ww.band_bytes += bytes;
+            } else {
+                up.ww.whole_uploads += 1;
+            }
+        }
+        subs.push((sub, fp, boxes));
     }
     vcall!(buf, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
     stage_time(4, ck);
@@ -868,7 +1060,7 @@ fn watch_pending(up: &mut Uploader) -> (u64, u64) {
         let idx = (up.zero_cursor + k) % nt;
         k += 1;
         let t = &mut up.tracked[idx];
-        if !poll && t.hot <= now {
+        if t.ww || (!poll && t.hot <= now) {
             continue;
         }
         let subs: Vec<usize> = (0..t.hashes.len()).filter(|&s| t.hashes[s].is_some() && ((t.zero[s] && (poll || t.pend[s] > now)) || t.watch[s] > now)).collect();
@@ -1056,6 +1248,8 @@ unsafe fn pump_inner(queue: *mut c_void) {
     let notes = take_notes();
     apply_notes(up, &notes);
     ph.mark("notes");
+    ww_sync(up);
+    ph.mark("write-watch");
 
     // The single upload list/allocator can be reused only once the previous copy is done.
     if done < up.fence_value {
@@ -1129,6 +1323,9 @@ unsafe fn pump_inner(queue: *mut c_void) {
         let idx = up.cursor % n;
         up.cursor = (up.cursor + 1) % n;
         visited += 1;
+        if up.tracked[idx].ww {
+            continue;
+        }
         if let Some(s) = check(up, idx, &mut rehashed, false) {
             staged.push(s);
         }
@@ -1145,7 +1342,7 @@ unsafe fn pump_inner(queue: *mut c_void) {
                 let b = [barrier(s.res, s.state, COPY_DEST)];
                 vcall!(up.list, 26, fn(u32, *const [u64; 4]) -> (), 1, b.as_ptr());
             }
-            for (sub, fp) in &s.subs {
+            for (sub, fp, boxes) in &s.subs {
                 // D3D12_TEXTURE_COPY_LOCATION { pResource; Type; union { PlacedFootprint | SubresourceIndex } }
                 let mut dst = [0u8; 48];
                 dst[0..8].copy_from_slice(&(s.res as u64).to_le_bytes());
@@ -1154,8 +1351,16 @@ unsafe fn pump_inner(queue: *mut c_void) {
                 src[0..8].copy_from_slice(&(s.buf as u64).to_le_bytes());
                 src[8..12].copy_from_slice(&1u32.to_le_bytes()); // Type 1 = PLACED_FOOTPRINT
                 src[16..48].copy_from_slice(&fp.raw);
-                vcall!(up.list, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (),
-                    dst.as_ptr(), 0, 0, 0, src.as_ptr(), core::ptr::null());
+                match boxes {
+                    Some(bx) => {
+                        for b in bx {
+                            vcall!(up.list, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (),
+                                dst.as_ptr(), 0, b[1], 0, src.as_ptr(), b.as_ptr() as *const c_void);
+                        }
+                    }
+                    None => vcall!(up.list, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (),
+                        dst.as_ptr(), 0, 0, 0, src.as_ptr(), core::ptr::null()),
+                }
             }
             if s.state != COPY_DEST {
                 let b = [barrier(s.res, COPY_DEST, s.state)];
@@ -1206,6 +1411,22 @@ unsafe fn pump_inner(queue: *mut c_void) {
         up.cost_sum_us = 0;
         up.cost_max_us = 0;
         up.cost_n = 0;
+        let (mut wn, mut wb, mut un, mut ub) = (0u64, 0u64, 0u64, 0u64);
+        for t in &up.tracked {
+            if t.ww {
+                wn += 1;
+                wb += t.layout.total;
+            } else {
+                un += 1;
+                ub += t.layout.total;
+            }
+        }
+        let w = &up.ww;
+        let mut why: Vec<String> = w.classes.iter().map(|(k, v)| format!("{k}: {} ({} MB)", v.0, v.1 >> 20)).collect();
+        why.sort();
+        record("d3d12_xs", "upload", &format!(
+            "write-watch pump {} (TOMBOX_WRITE_WATCH={}): tracked watched={wn} ({} MB) hash-fallback={un} ({} MB) | queries={} cost={}us total | dirty pages={} -> subresources={} | uploads: row-band={} ({} MB) whole={} | CPU-written but NOT uploaded={} (resources {}) | CPU writes into GPU-copy destinations={} | runtime fallbacks={} | classes at adoption: [{}]",
+            up.pumps, if crate::cpu_watch::enabled() { "on" } else { "0" }, wb >> 20, ub >> 20, w.queries, w.query_us, w.dirty_pages, w.dirty_subs, w.band_uploads, w.band_bytes >> 20, w.whole_uploads, w.lost, w.lost_res, w.gpu_owned_writes, w.fallbacks, why.join("; ")));
         record("d3d12_xs", "upload", &format!(
             "pump {}: staged {} textures; tracked={} total uploaded {} subresources / {} bytes; unreadable-skips={} not-mirrored={} gpu-copy-dest hits={gh} textures={gn} inserted-slot-calls={} texcache-flushes={} recommit-rechecks={}; reaper pending={} freed={} worst-release={:.1}ms",
             up.pumps, staged.len(), up.tracked.len(), up.uploaded_subs, up.uploaded_bytes, up.unreadable, up.rejected, crate::cmdlist_wrap::inserted_hits(), crate::cmdlist_wrap::flush_hits(), up.recommitted,

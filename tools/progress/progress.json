@@ -888,40 +888,55 @@
   ],
   "verified_milestones": [
     {
-      "name": "Boots (process starts, GDK runtime services up)",
+      "name": "Fortnite: Boots (process starts, GDK runtime services up)",
       "evidence": "%TEMP%\\tombox\\run.txt:1-4"
     },
     {
-      "name": "First frames (PresentX into the title window)",
+      "name": "Fortnite: First frames (PresentX into the title window)",
       "evidence": "%TEMP%\\tombox\\tombox_compat.log:14540"
     },
     {
-      "name": "Window clamped to the primary monitor",
+      "name": "Fortnite: Window clamped to the primary monitor",
       "evidence": "%TEMP%\\tombox\\tombox_compat.log:12987"
     },
     {
-      "name": "Login complete (HandleLoginRequestComplete Result=2)",
+      "name": "Fortnite: Login complete (HandleLoginRequestComplete Result=2)",
       "evidence": "%TEMP%\\tombox\\run.txt:5962"
     },
     {
-      "name": "Hotfix check UpdateSuccess",
+      "name": "Fortnite: Hotfix check UpdateSuccess",
       "evidence": "%TEMP%\\tombox\\run.txt:3401,6094"
     },
     {
-      "name": "Game-mode select (UI.State.Startup.SubgameSelect)",
+      "name": "Fortnite: Game-mode select (UI.State.Startup.SubgameSelect)",
       "evidence": "%TEMP%\\tombox\\run.txt:6249"
     },
     {
-      "name": "Battle Royale lobby (UI.State.Athena.Frontend)",
+      "name": "Fortnite: Battle Royale lobby (UI.State.Athena.Frontend)",
       "evidence": "%TEMP%\\tombox\\run.txt:6496"
+    },
+    {
+      "name": "Trackmania: keyboard / controller input (host pad and keyboard drive the menus to the campaign map; user session 2026-11-22)",
+      "evidence": "TomBox tools/dev/batch_runs/user_play_r32b/run.txt (init challenge 'Training - 01', 'Training - 02', 'Spring 2024 - 01')"
+    },
+    {
+      "name": "Trackmania: gameplay (drives Training - 01 at ~60 fps avg, loads campaign Spring 2024 - 01)",
+      "evidence": "TomBox tools/dev/batch_runs/fast_20261122_223736_trackmania_r32_batch_control_warm2/result.json; TomBox tools/dev/batch_runs/user_play_r32b/run.txt"
+    },
+    {
+      "name": "Second title running: Trackmania and Terraria (Terraria reaches its world at 60 fps)",
+      "evidence": "TomBox tools/dev/batch_runs/fast_20261122_201135_terraria_tr_default_copy2/result.json"
     }
   ],
   "open_milestones": [
-    "3D scene correct",
-    "Keyboard / controller input",
-    "Audio",
-    "Gameplay",
-    "A second title running"
+    {
+      "name": "3D scene correct",
+      "state": "not reached: Trackmania renders its races, but video and streamed textures stay black (CPU writes into GPU memory are not mirrored yet) and the stencil-tested lighting passes are dark"
+    },
+    {
+      "name": "Audio",
+      "state": "in progress: XAudio2 engine creation and XMA2 source-voice wrapping verified 2026-11-22 (Trackmania); audible output not verified since test runs are muted"
+    }
   ],
   "emulator": {
     "ConnectedStorageService.ProxyStub.dll": {

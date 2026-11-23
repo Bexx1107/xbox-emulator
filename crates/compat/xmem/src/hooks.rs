@@ -181,10 +181,11 @@ fn heap_known() -> &'static Vec<(usize, Kind)> {
     })
 }
 
-fn is_ours(v: usize) -> bool {
+pub(crate) fn is_ours(v: usize) -> bool {
     [Kind::Alloc, Kind::Realloc, Kind::Free].iter().any(|&k| wrappers(k).contains(&v))
         || winhttp_wrappers().contains(&v)
-        || [vfree_w as *const () as usize, valloc_w as *const () as usize, valloc2_w as *const () as usize, map3_w as *const () as usize].contains(&v)
+        || [vfree_w as *const () as usize, valloc_w as *const () as usize, valloc2_w as *const () as usize, map3_w as *const () as usize, vallocex_w as *const () as usize, vfreeex_w as *const () as usize].contains(&v)
+        || crate::crt_hooks::wrappers().contains(&v)
 }
 
 pub fn heap_rule(_dll: &[u8], name: Option<&[u8]>, value: usize) -> Option<usize> {
@@ -294,7 +295,7 @@ static MAP3_ORIG: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn vfree_w(addr: usize, size: usize, kind: u32) -> i32 {
     let (lo, hi) = crate::epoch::bump_free(addr, size);
-    let r = vfree_inner(addr, size, kind);
+    let r = crate::title_acct::track_free(addr, size, kind, || vfree_inner(addr, size, kind));
     crate::epoch::bump_range(lo, hi);
     r
 }
@@ -321,6 +322,10 @@ unsafe fn vfree_inner(addr: usize, size: usize, kind: u32) -> i32 {
 static VALLOC_ORIG: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn valloc_w(addr: usize, size: usize, kind: u32, protect: u32) -> usize {
+    crate::title_acct::track_alloc(addr, size, kind, || valloc_inner(addr, size, kind, protect))
+}
+
+unsafe fn valloc_inner(addr: usize, size: usize, kind: u32, protect: u32) -> usize {
     if addr != 0 && kind & MEM_COMMIT != 0 {
         if let Some(r) = crate::phys::commit_owned(addr, size, protect) {
             crate::write_note::committed(r, size);
@@ -358,10 +363,72 @@ fn strip_partition(params: usize, count: u32) -> Vec<[u64; 2]> {
     out
 }
 
+fn is_self(process: usize) -> bool {
+    process == usize::MAX || process == 0 || unsafe { GetProcessId(process) == GetCurrentProcessId() }
+}
+
 unsafe extern "system" fn valloc2_w(process: usize, base: usize, size: usize, kind: u32, protect: u32, params: usize, count: u32) -> usize {
     let v = strip_partition(params, count);
     let (pp, pc) = if v.is_empty() { (0, 0) } else { (v.as_ptr() as usize, v.len() as u32) };
-    core::mem::transmute::<usize, unsafe extern "system" fn(usize, usize, usize, u32, u32, usize, u32) -> usize>(VALLOC2_ORIG.load(Ordering::Acquire))(process, base, size, kind, protect, pp, pc)
+    let call = || core::mem::transmute::<usize, unsafe extern "system" fn(usize, usize, usize, u32, u32, usize, u32) -> usize>(VALLOC2_ORIG.load(Ordering::Acquire))(process, base, size, kind, protect, pp, pc);
+    if is_self(process) {
+        crate::title_acct::track_alloc(base, size, kind, call)
+    } else {
+        call()
+    }
+}
+
+static VALLOCEX_ORIG: AtomicUsize = AtomicUsize::new(0);
+static VFREEEX_ORIG: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn vallocex_w(process: usize, addr: usize, size: usize, kind: u32, protect: u32) -> usize {
+    let call = || core::mem::transmute::<usize, unsafe extern "system" fn(usize, usize, usize, u32, u32) -> usize>(VALLOCEX_ORIG.load(Ordering::Acquire))(process, addr, size, kind, protect);
+    if is_self(process) {
+        crate::title_acct::track_alloc(addr, size, kind, call)
+    } else {
+        call()
+    }
+}
+
+unsafe extern "system" fn vfreeex_w(process: usize, addr: usize, size: usize, kind: u32) -> i32 {
+    let call = || core::mem::transmute::<usize, unsafe extern "system" fn(usize, usize, usize, u32) -> i32>(VFREEEX_ORIG.load(Ordering::Acquire))(process, addr, size, kind);
+    if is_self(process) {
+        crate::title_acct::track_free(addr, size, kind, call)
+    } else {
+        call()
+    }
+}
+
+pub fn vex_rule(_dll: &[u8], name: Option<&[u8]>, value: usize) -> Option<usize> {
+    single_rule(&[b"VirtualAllocEx"], &VALLOCEX_ORIG, vallocex_w as *const () as usize, name, value)
+        .or_else(|| single_rule(&[b"VirtualFreeEx"], &VFREEEX_ORIG, vfreeex_w as *const () as usize, name, value))
+}
+
+#[cfg(test)]
+pub fn ex_wrappers_for_test() -> (usize, usize) {
+    vex_rule(b"KERNEL32.dll", Some(b"VirtualAllocEx"), VirtualAllocEx as *const () as usize);
+    vex_rule(b"KERNEL32.dll", Some(b"VirtualFreeEx"), VirtualFreeEx as *const () as usize);
+    (vallocex_w as *const () as usize, vfreeex_w as *const () as usize)
+}
+
+#[cfg(test)]
+pub fn partition_wrappers_for_test() -> (usize, usize) {
+    extern "system" {
+        fn GetModuleHandleA(name: *const u8) -> usize;
+        fn GetProcAddress(h: usize, name: *const u8) -> usize;
+    }
+    let kb = unsafe { GetModuleHandleA(b"kernelbase.dll\0".as_ptr()) };
+    partition_rule(b"api-ms-win-core-memory-l1-1-6.dll", Some(b"VirtualAlloc2"), unsafe { GetProcAddress(kb, b"VirtualAlloc2\0".as_ptr()) });
+    partition_rule(b"api-ms-win-core-memory-l1-1-6.dll", Some(b"MapViewOfFile3"), unsafe { GetProcAddress(kb, b"MapViewOfFile3\0".as_ptr()) });
+    assert!(VALLOC2_ORIG.load(Ordering::Acquire) != 0 && MAP3_ORIG.load(Ordering::Acquire) != 0);
+    (valloc2_w as *const () as usize, map3_w as *const () as usize)
+}
+
+#[cfg(test)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn VirtualAllocEx(process: usize, addr: usize, size: usize, kind: u32, protect: u32) -> usize;
+    fn VirtualFreeEx(process: usize, addr: usize, size: usize, kind: u32) -> i32;
 }
 
 unsafe extern "system" fn map3_w(file: usize, process: usize, base: usize, offset: u64, size: usize, kind: u32, protect: u32, params: usize, count: u32) -> usize {

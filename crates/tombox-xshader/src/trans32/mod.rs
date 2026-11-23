@@ -268,8 +268,8 @@ int64_t tb_t32_internal(uint row, int64_t t, int64_t ext, int64_t lext, uint sb,
     int64_t hh = c2 + q2 * tb_t32_rne(m3 * (th + 1), dn << kh);
     int64_t v = hh * s;
     int64_t vm = v < 0 ? -v : v;
-    uint sh = 24u;
-    [loop] while (vm >= (((int64_t)1) << (sh + 24u))) sh += 1u;
+    uint bw = tb_a_bw64((uint64_t)vm);
+    uint sh = bw > 48u ? bw - 24u : 24u;
     return coarse + (tb_t32_rne(v, ((int64_t)1) << sh) << (sh - 24u));
 }
 uint tb_t32_pack(uint s, int e, int64_t a, uint rb, int64_t shift) {
@@ -283,32 +283,6 @@ uint tb_t32_pack(uint s, int e, int64_t a, uint rb, int64_t shift) {
     if (y >= (((int64_t)1) << 24)) { y >>= 1; e += 1; }
     if (e > 127) return s | 0x7f800000u;
     return s | ((uint)(e + 127) << 23) | ((uint)y & 0x7fffffu);
-}
-uint tb_t32(uint op, uint x) {
-    if (op >= 4u) return tb_t32_amd(op, x);
-    uint s = x & 0x80000000u, ex = (x >> 23) & 0xffu;
-    uint mn = ex == 0u ? 0u : (x & 0x7fffffu);
-    if (ex == 255u && mn != 0u) return x;
-    bool zero = ex == 0u, inf = ex == 255u;
-    int e = (int)ex - 127;
-    if (op <= 1u) {
-        if (zero) return s | 0x7f800000u;
-        if (inf) return s;
-        int64_t a = mn == 0u ? (((int64_t)1) << 35) : tb_t32_internal(mn >> 18, (int64_t)(mn & 0x3ffffu), 0, 0, 18u, 1u, 64, 32, 64, 29u, 6u, 2u);
-        return tb_t32_pack(s, -e - 1, a, 11u, (mn >> 18) == 0u ? 0 : -256);
-    }
-    if (zero) return op == 2u ? (s | 0x7f800000u) : s;
-    if (s != 0u) return 0xffc00000u;
-    int par = e & 1;
-    int eh = (e - par) / 2;
-    if (op == 2u) {
-        if (inf) return 0u;
-        int64_t a = (mn == 0u && par == 0) ? (((int64_t)1) << 36) : tb_t32_internal(32u + 32u * (uint)par + (mn >> 18), (int64_t)(mn & 0x3ffffu), 0, 0, 18u, 1u, 128, 32, 64, 29u, 6u, 2u);
-        return tb_t32_pack(0u, -eh - 1, a, 12u, (mn >> 18) == 0u ? 0 : -512);
-    }
-    if (inf) return 0x7f800000u;
-    int64_t a = tb_t32_internal(96u + 16u * (uint)par + (mn >> 19), (int64_t)(mn & 0x7ffffu), 0, 0, 19u, 2u, 64, 64, 128, 30u, 5u, 1u);
-    return tb_t32_pack(0u, eh, a, 12u, (mn >> 19) == 15u ? 0 : -512);
 }
 uint64_t tb_t64_make(uint64_t s, int64_t a, int p) {
     uint64_t au = (uint64_t)a;
@@ -373,6 +347,33 @@ uint2 tb_t64(uint op, uint lo, uint hi) {
 }
 "#;
 
+const T32_SPECIALIZED: &str = r#"uint tb_t32_OPK(uint x) {
+    uint s = x & 0x80000000u, ex = (x >> 23) & 0xffu;
+    uint mn = ex == 0u ? 0u : (x & 0x7fffffu);
+    if (ex == 255u && mn != 0u) return x;
+    bool zero = ex == 0u, inf = ex == 255u;
+    int e = (int)ex - 127;
+    if (OPVu <= 1u) {
+        if (zero) return s | 0x7f800000u;
+        if (inf) return s;
+        int64_t a = mn == 0u ? (((int64_t)1) << 35) : tb_t32_internal(mn >> 18, (int64_t)(mn & 0x3ffffu), 0, 0, 18u, 1u, 64, 32, 64, 29u, 6u, 2u);
+        return tb_t32_pack(s, -e - 1, a, 11u, (mn >> 18) == 0u ? 0 : -256);
+    }
+    if (zero) return OPVu == 2u ? (s | 0x7f800000u) : s;
+    if (s != 0u) return 0xffc00000u;
+    int par = e & 1;
+    int eh = (e - par) / 2;
+    if (OPVu == 2u) {
+        if (inf) return 0u;
+        int64_t a = (mn == 0u && par == 0) ? (((int64_t)1) << 36) : tb_t32_internal(32u + 32u * (uint)par + (mn >> 18), (int64_t)(mn & 0x3ffffu), 0, 0, 18u, 1u, 128, 32, 64, 29u, 6u, 2u);
+        return tb_t32_pack(0u, -eh - 1, a, 12u, (mn >> 18) == 0u ? 0 : -512);
+    }
+    if (inf) return 0x7f800000u;
+    int64_t a = tb_t32_internal(96u + 16u * (uint)par + (mn >> 19), (int64_t)(mn & 0x7ffffu), 0, 0, 19u, 2u, 64, 64, 128, 30u, 5u, 1u);
+    return tb_t32_pack(0u, eh, a, 12u, (mn >> 19) == 15u ? 0 : -512);
+}
+"#;
+
 pub fn hlsl() -> String {
     let rows: Vec<&[i64; 6]> = RCP.iter().chain(RSQ0.iter()).chain(RSQ1.iter()).chain(SQRT0.iter()).chain(SQRT1.iter()).collect();
     let vals: Vec<String> = rows.iter().flat_map(|r| r.iter()).map(|v| format!("{v}")).collect();
@@ -380,6 +381,13 @@ pub fn hlsl() -> String {
     let _ = writeln!(h, "static const int64_t TB_T32_TAB[{}] = {{ {} }};", vals.len(), vals.join(", "));
     h.push_str(&amd::hlsl());
     h.push_str(HLSL_BODY);
+    for k in 0..OPS.len() {
+        if k < 4 {
+            h.push_str(&T32_SPECIALIZED.replace("OPK", &k.to_string()).replace("OPV", &k.to_string()));
+        } else {
+            let _ = writeln!(h, "uint tb_t32_{k}(uint x) {{ return tb_t32_amd({k}u, x); }}");
+        }
+    }
     h
 }
 

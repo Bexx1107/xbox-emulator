@@ -9,7 +9,7 @@ pub const GFX: u8 = 0;
 pub const CS: u8 = 1;
 const GFX_DESC: usize = 0x290;
 const CS_DESC: usize = 0x38;
-const PAYLOAD_VERSION: u32 = 1;
+const PAYLOAD_VERSION: u32 = 2;
 pub const MAX_RECORDS: usize = 4096;
 pub const MAX_BYTES: usize = 192 << 20;
 pub const IDLE_RELEASE_SECS: u64 = 180;
@@ -58,6 +58,7 @@ pub struct Root {
     pub mask: u32,
     pub blob: u64,
     pub via_real: bool,
+    pub real: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,7 +109,7 @@ unsafe fn cstr<'a>(p: u64) -> Option<&'a [u8]> {
     None
 }
 
-pub unsafe fn capture(kind: u8, desc: &[u8], key: u128, root: Option<(u32, &[u8], bool)>) -> Option<(Rec, Vec<(u64, Arc<[u8]>)>)> {
+pub unsafe fn capture(kind: u8, desc: &[u8], key: u128, root: Option<(u32, &[u8], bool, u64)>) -> Option<(Rec, Vec<(u64, Arc<[u8]>)>)> {
     let mut blobs: Vec<(u64, Arc<[u8]>)> = Vec::new();
     let mut keep = |b: &[u8]| -> u64 {
         let id = blob_id(b);
@@ -120,7 +121,7 @@ pub unsafe fn capture(kind: u8, desc: &[u8], key: u128, root: Option<(u32, &[u8]
     let root = match (rd64(desc, 0), root) {
         (0, _) => None,
         (_, None) => return None,
-        (_, Some((mask, b, via_real))) => Some(Root { mask, blob: keep(b), via_real }),
+        (_, Some((mask, b, via_real, real))) => Some(Root { mask, blob: keep(b), via_real, real }),
     };
     let mut r = Rec { kind, key, seq: 0, desc: Vec::new(), shaders: Vec::new(), so: Vec::new(), strides: Vec::new(), il: Vec::new(), root };
     if kind == GFX {
@@ -247,7 +248,7 @@ pub fn build(r: &Rec, blobs: &Blobs) -> Option<Built> {
 }
 
 pub fn root_hash(r: &Root, blobs: &Blobs) -> Option<u64> {
-    blobs.get(&r.blob).map(|b| crate::pso_lib::fnv64(b) ^ r.mask as u64)
+    blobs.get(&r.blob).map(|b| crate::pso_lib::combine_root(crate::pso_lib::fnv64(b) ^ r.mask as u64, r.real))
 }
 
 pub fn key_of(r: &Rec, b: &Built, blobs: &Blobs, mode: &str) -> Option<u128> {
@@ -417,6 +418,7 @@ impl Journal {
                     w.u8(1 + rt.via_real as u8);
                     w.u32(rt.mask);
                     w.u64(rt.blob);
+                    w.u64(rt.real);
                 }
             }
         }
@@ -464,7 +466,7 @@ impl Journal {
             }
             let root = match rd.u8()? {
                 0 => None,
-                t @ (1 | 2) => Some(Root { via_real: t == 2, mask: rd.u32()?, blob: rd.u64()? }),
+                t @ (1 | 2) => Some(Root { via_real: t == 2, mask: rd.u32()?, blob: rd.u64()?, real: rd.u64()? }),
                 _ => return None,
             };
             let [so, il] = lists;
@@ -784,10 +786,19 @@ unsafe fn root_sig(pw: &Pw, rt: &Root) -> Option<usize> {
     Some(rs as usize)
 }
 
+static STALE_ROOT: AtomicU64 = AtomicU64::new(0);
+
 unsafe fn make(pw: &Pw, r: &Rec) -> Option<usize> {
     let mut b = build(r, &pw.blobs)?;
     if let Some(rt) = &r.root {
         let rs = unsafe { root_sig(pw, rt) }?;
+        if crate::pso_lib::root_key_hash(rs) != root_hash(rt, &pw.blobs) {
+            let n = STALE_ROOT.fetch_add(1, Relaxed);
+            if n < 4 {
+                record("d3d12_xs", "pso_prewarm", &format!("record {:032x}: its root signature now reaches the driver as a different blob than when it was recorded; skipped so the library never stores it under the old key (#{})", r.key, n + 1));
+            }
+            return None;
+        }
         wr64(&mut b.desc, 0, rs as u64);
     }
     let (pso, from_lib) = unsafe { crate::pso_lib::prebuild(pw.real as *mut c_void, r.kind, r.key, &b.desc) };
@@ -872,7 +883,7 @@ pub unsafe fn note(kind: u8, k: u128, desc: &[u8]) {
     if rs != 0 && info.is_none() {
         return;
     }
-    let Some((r, blobs)) = (unsafe { capture(kind, desc, k, info.as_ref().map(|(m, b, v)| (*m, &b[..], *v))) }) else { return };
+    let Some((r, blobs)) = (unsafe { capture(kind, desc, k, info.as_ref().map(|(m, b, v)| (*m, &b[..], *v, crate::pso_lib::root_real(rs as usize)))) }) else { return };
     if !journal().lock().unwrap_or_else(|e| e.into_inner()).add(r, blobs) {
         let n = REFUSED.fetch_add(1, Relaxed);
         if n == 0 {
@@ -1001,7 +1012,7 @@ mod tests {
         let rb = root_blob();
         let root = crate::pso_lib::fnv64(&rb) ^ 3;
         let k = unsafe { crate::pso_lib::gfx_key(&s.desc, root, mode) }.unwrap();
-        let (r, b) = unsafe { capture(GFX, &s.desc, k, Some((3, &rb, false))) }.unwrap();
+        let (r, b) = unsafe { capture(GFX, &s.desc, k, Some((3, &rb, false, 0))) }.unwrap();
         (r, b, k)
     }
 
@@ -1182,7 +1193,7 @@ void main() { o.Store(0, 5u); }
             wr64(&mut desc, 16, code.len() as u64);
             let root = crate::pso_lib::fnv64(&rs_src);
             let k = crate::pso_lib::compute_key(&desc, root, "cbraw=0").unwrap();
-            let (r, b) = capture(CS, &desc, k, Some((0, &rs_src, true))).unwrap();
+            let (r, b) = capture(CS, &desc, k, Some((0, &rs_src, true, 0))).unwrap();
             let mut j = Journal::new(MAX_RECORDS, MAX_BYTES);
             assert!(j.add(r, b));
             let back = Journal::decode(&j.encode(), MAX_RECORDS, MAX_BYTES).unwrap();

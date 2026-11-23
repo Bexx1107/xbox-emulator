@@ -16,6 +16,41 @@ extern "system" {
     fn ResetEvent(h: isize) -> i32;
     fn QueryPerformanceCounter(v: *mut i64) -> i32;
     fn QueryPerformanceFrequency(v: *mut i64) -> i32;
+    fn VirtualQuery(p: *const c_void, b: *mut Mbi, n: usize) -> usize;
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct Mbi {
+    base: usize,
+    alloc: usize,
+    alloc_protect: u32,
+    partition: u32,
+    size: usize,
+    state: u32,
+    protect: u32,
+    kind: u32,
+    pad: u32,
+}
+
+fn pc_dcas_blocks() -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut a = 0usize;
+    let mut m = Mbi::default();
+    while unsafe { VirtualQuery(a as *const c_void, &mut m, core::mem::size_of::<Mbi>()) } != 0 {
+        let readable = matches!(m.protect & 0xff, 0x02 | 0x04 | 0x08 | 0x20 | 0x40) && m.protect & 0x100 == 0;
+        if m.state == 0x1000 && m.kind == 0x40000 && readable && m.size >= 0x340 {
+            let head = unsafe { core::slice::from_raw_parts(m.base as *const u8, 8) };
+            if head == [0x26, 0x03, 0, 0, b'D', b'C', b'A', b'S'] {
+                out.push(m.base);
+            }
+        }
+        a = m.base + m.size;
+        if m.size == 0 || a >= 0x7fff_ffff_0000 {
+            break;
+        }
+    }
+    out
 }
 
 fn qpc_100ns() -> i64 {
@@ -78,7 +113,10 @@ fn create(kind: u32, flag: u32, parent: u32, method: u32, args: &[u8]) -> (i32, 
     (hr, e)
 }
 
+static PC_AUDIO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run_step(step: &str) {
+    let _pc = PC_AUDIO.lock().unwrap_or_else(|e| e.into_inner());
     if console().is_none() {
         eprintln!("no console XVMAudioService.dll, skipped");
         return;
@@ -1655,8 +1693,11 @@ fn spatial_pump() {
     let (ps, pr) = dcas::parse(dcas_bytes).unwrap();
     assert_eq!((ps, pr), (shape, regions), "fd780 recomputes the shape");
     let frames = u32_at(dcas_bytes, dcas::FRAMES);
-    let pc_frames = console_sandbox::wasapi::spatial(None).unwrap().max_frames(&packed[0x10..0x22]).unwrap();
-    assert_eq!((frames, u32_at(dcas_bytes, dcas::STATIC_OBJECTS), u32_at(dcas_bytes, dcas::DYNAMIC_OBJECTS), shape.properties), (pc_frames, 2, 0, 0x20), "the DCAS shape follows the PC: max frame count, popcount(mask) static objects, 0x20-byte records");
+    let pc_max = console_sandbox::wasapi::spatial(None).unwrap().max_frames(&packed[0x10..0x22]).unwrap();
+    let mix = console_sandbox::wasapi::sample_rate(&console_sandbox::wasapi::device_info_for(None).unwrap().mix);
+    let pc_frames = crossvm::engine_frames(pc_max, 48000, mix);
+    assert_eq!((frames, u32_at(dcas_bytes, dcas::STATIC_OBJECTS), u32_at(dcas_bytes, dcas::DYNAMIC_OBJECTS), shape.properties), (pc_frames, 2, 0, 0x20), "the DCAS shape follows the PC engine: trunc(1.1f * (max frame count + SRC priming)), popcount(mask) static objects, 0x20-byte records");
+    assert_eq!(u32_at(dcas_bytes, pingpong::FRAMES_PER_PACKET), pc_max.min(u32_at(dcas_bytes, pingpong::FRAMES_PER_PACKET)), "+0x34 stays the per-pass packet, at most the PC max frame count");
     let ctl = unsafe { pingpong::Control::at(base as *mut u8) };
     assert_eq!((ctl.state(), ctl.flags()), (6, pingpong::FLAG_VALID), "state 6, flags valid");
     let mut ev = envelope(crossvm::SPATIAL_RESET, o);
@@ -1990,6 +2031,52 @@ fn spatial_variants() {
 #[test]
 fn crossvm_audio_hrtf_and_metadata_streams_forward_the_console_params_to_the_pc() {
     run_step("spatial_variants");
+}
+
+#[test]
+fn crossvm_audio_dcas_frames_match_the_live_pc_dcas_on_every_render_endpoint() {
+    use console_sandbox::wasapi;
+    unsafe { wasapi::com_init() };
+    let mut fmt = vec![0u8; 0x12];
+    fmt[0..2].copy_from_slice(&3u16.to_le_bytes());
+    fmt[2..4].copy_from_slice(&1u16.to_le_bytes());
+    fmt[4..8].copy_from_slice(&48000u32.to_le_bytes());
+    fmt[8..12].copy_from_slice(&192000u32.to_le_bytes());
+    fmt[12..14].copy_from_slice(&4u16.to_le_bytes());
+    fmt[14..16].copy_from_slice(&32u16.to_le_bytes());
+    let _pc = PC_AUDIO.lock().unwrap_or_else(|e| e.into_inner());
+    let mut checked = Vec::new();
+    for (id, _) in wasapi::endpoints(0, 1).unwrap() {
+        let Ok(sp) = wasapi::spatial(Some(&id)) else { continue };
+        let Ok(max) = sp.max_frames(&fmt) else { continue };
+        let mix = wasapi::sample_rate(&wasapi::device_info_for(Some(&id)).unwrap().mix);
+        let before = pc_dcas_blocks();
+        let params = wasapi::SpatialStreamParams { format: fmt.clone(), mask: 2, min: 0, max: 0, category: 6, options: 0, extra: wasapi::SpatialExtra::Plain };
+        let Ok(stream) = sp.activate_stream(&params) else { continue };
+        let fresh: Vec<usize> = pc_dcas_blocks().into_iter().filter(|b| !before.contains(b)).collect();
+        assert_eq!(fresh.len(), 1, "one new PC DCAS per activation on {id}");
+        let dcas = unsafe { core::slice::from_raw_parts(fresh[0] as *const u8, 0x340) };
+        let pc = u32_at(dcas, crossvm::dcas::FRAMES);
+        let host = crossvm::engine_frames(max, 48000, mix);
+        println!("endpoint mix {mix} Hz: PC max frames {max}, PC DCAS +0x204 {pc}, host {host}, PC +0x34 {}", u32_at(dcas, crossvm::pingpong::FRAMES_PER_PACKET));
+        assert_eq!(host, pc, "the host DCAS frame count equals the PC engine's for a {mix} Hz endpoint");
+        let available = u32_at(dcas, crossvm::pingpong::FRAMES_PER_PACKET);
+        assert!(available >= max && available <= pc, "PC +0x34 at activation {available} lies between the max frame count {max} and the DCAS frame count {pc}");
+        drop(stream);
+        checked.push(mix);
+    }
+    assert!(!checked.is_empty(), "at least one render endpoint activates a PC spatial stream");
+}
+
+#[test]
+fn crossvm_audio_stream_status_errors_are_the_42a00_class() {
+    for hr in [crossvm::SPTLAUDCLNT_E_DESTROYED, crossvm::AUDCLNT_E_DEVICE_INVALIDATED, crossvm::AUDCLNT_E_RESOURCES_INVALIDATED] {
+        assert!(crossvm::stream_status_error(hr));
+    }
+    for hr in [0, 1, 0x8889_010au32 as i32, 0x887c_0061u32 as i32, 0x8007_0057u32 as i32] {
+        assert!(!crossvm::stream_status_error(hr));
+    }
+    assert_eq!((crossvm::engine_frames(480, 48000, 48000), crossvm::engine_frames(480, 48000, 96000)), (528, 535), "PC oracle: 48 kHz endpoints 528, 96 kHz endpoints 535");
 }
 
 #[test]

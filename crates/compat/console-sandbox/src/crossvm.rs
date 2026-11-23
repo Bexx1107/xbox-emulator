@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::gcdcom::Guid;
@@ -1121,10 +1121,11 @@ unsafe fn spatial_stream_create(kind: u32, method: u32, parent: u32, a: *mut u8,
         Ok(f) => f,
         Err(hr) => return Some(hr),
     };
-    let packet = match wasapi::device_info_for(dev.as_deref()) {
-        Ok(d) => ((d.default_period * rate as i64 / HNS) as u32).min(frames),
+    let (packet, mix_rate) = match wasapi::device_info_for(dev.as_deref()) {
+        Ok(d) => (((d.default_period * rate as i64 / HNS) as u32).min(frames), wasapi::sample_rate(&d.mix)),
         Err(hr) => return Some(hr),
     };
+    let frames = engine_frames(frames, rate, mix_rate);
     let statics = (params.mask & !AUDIO_OBJECT_DYNAMIC).count_ones();
     let dynamic = params.max;
     let total = match dcas::total(frames, statics, dynamic, props, 0) {
@@ -1179,6 +1180,7 @@ unsafe fn spatial_stream_create(kind: u32, method: u32, parent: u32, a: *mut u8,
         running: AtomicBool::new(false),
         quit: AtomicBool::new(false),
         counters: Arc::new(SpatialCounters::default()),
+        status: AtomicI32::new(0),
     });
     let worker = pump.clone();
     let thread = match std::thread::Builder::new().name("tombox-spatial".into()).spawn(move || worker.run()) {
@@ -1245,6 +1247,20 @@ pub const HRTF_DIRTY_DECAY: u32 = 8;
 pub const HRTF_DIRTY_DIRECTIVITY: u32 = 0x10;
 pub const HRTF_DIRTY_UNKNOWN: u32 = 0x20;
 const SPTLAUDCLNT_E_STREAM_NOT_STOPPED: i32 = 0x8889_010au32 as i32;
+pub const SPTLAUDCLNT_E_DESTROYED: i32 = 0x8889_0100u32 as i32;
+pub const AUDCLNT_E_DEVICE_INVALIDATED: i32 = 0x8889_0004u32 as i32;
+pub const AUDCLNT_E_RESOURCES_INVALIDATED: i32 = 0x8889_0026u32 as i32;
+pub const ENGINE_HEADROOM: f32 = 1.1;
+pub const SRC_PRIMING_FRAMES: u32 = 7;
+
+pub fn engine_frames(max: u32, stream_rate: u32, mix_rate: u32) -> u32 {
+    let n = max + if stream_rate != mix_rate { SRC_PRIMING_FRAMES } else { 0 };
+    (n as f32 * ENGINE_HEADROOM) as u32
+}
+
+pub fn stream_status_error(hr: i32) -> bool {
+    matches!(hr, SPTLAUDCLNT_E_DESTROYED | AUDCLNT_E_DEVICE_INVALIDATED | AUDCLNT_E_RESOURCES_INVALIDATED)
+}
 
 #[derive(Default)]
 pub struct SpatialCounters {
@@ -1276,6 +1292,7 @@ struct SpatialPump {
     running: AtomicBool,
     quit: AtomicBool,
     counters: Arc<SpatialCounters>,
+    status: AtomicI32,
 }
 
 unsafe impl Send for SpatialPump {}
@@ -1326,6 +1343,13 @@ impl SpatialPump {
     fn fail(&self, hr: i32) {
         self.counters.errors.fetch_add(1, Ordering::SeqCst);
         self.counters.last_error.store(hr as u32, Ordering::SeqCst);
+        if stream_status_error(hr) {
+            let _ = self.status.compare_exchange(0, hr, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
+    fn status(&self) -> i32 {
+        self.status.load(Ordering::SeqCst)
     }
 
     unsafe fn pass(&self) {
@@ -1502,6 +1526,9 @@ unsafe fn spatial_call(id: u32, object: u32, a: *mut u8) -> Option<i32> {
         }
         SPATIAL_PRE_START => {
             wr(a, 0, 0u8);
+            if pump.status() < 0 {
+                return Some(pump.status());
+            }
             if h.started {
                 return Some(SPTLAUDCLNT_E_STREAM_NOT_STOPPED);
             }
@@ -1515,6 +1542,7 @@ unsafe fn spatial_call(id: u32, object: u32, a: *mut u8) -> Option<i32> {
             drop(s);
             let hr = pump.stream.start();
             if hr < 0 {
+                pump.fail(hr);
                 return Some(hr);
             }
             pump.running.store(true, Ordering::SeqCst);
@@ -1532,6 +1560,7 @@ unsafe fn spatial_call(id: u32, object: u32, a: *mut u8) -> Option<i32> {
             drop(s);
             let hr = pump.stream.stop();
             if hr < 0 {
+                pump.fail(hr);
                 return Some(hr);
             }
             if hr != S_FALSE {
@@ -1540,12 +1569,15 @@ unsafe fn spatial_call(id: u32, object: u32, a: *mut u8) -> Option<i32> {
             hr
         }
         SPATIAL_RESET => {
-            if h.started {
+            if pump.status() < 0 {
+                pump.status()
+            } else if h.started {
                 SPTLAUDCLNT_E_STREAM_NOT_STOPPED
             } else {
                 S_OK
             }
         }
+
         _ => return None,
     })
 }

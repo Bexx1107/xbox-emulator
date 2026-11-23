@@ -117,6 +117,10 @@ pub fn on() -> bool {
     sel().is_some()
 }
 
+pub fn tables_on() -> bool {
+    on() && !probe_hashes().is_empty()
+}
+
 pub fn typed_format(fmt: u32) -> u32 {
     match fmt {
         1 => 2,
@@ -472,9 +476,13 @@ struct LState {
     cbv: HashMap<u32, u64>,
     groot: usize,
     rc: HashMap<u32, Vec<Option<u32>>>,
+    sref: Option<u32>,
+    stencil_notes: Vec<String>,
+    stencil_seen: Vec<(usize, Option<u32>)>,
     probe_caps: Vec<usize>,
     probe_notes: Vec<String>,
     probe_q: usize,
+    probe_oq: usize,
 }
 
 struct ProbeBuf {
@@ -670,7 +678,7 @@ unsafe fn boundary(g: &mut G, list: *mut c_void, end: &str) {
     let want = st.dirty || all;
     let (rts, dsv) = (st.rts.clone(), st.dsv);
     let mut pass = Pass { list: list as usize, key: k, order: 0, seq: st.seq, end: end.to_string(), draws: st.draws, dispatches: st.dispatches, indirect: st.indirect,
-        clears: st.clears.clone(), ps: st.ps.clone(), targets: Vec::new(), caps: st.probe_caps.clone(), notes: st.probe_notes.clone(), writes_src: false };
+        clears: st.clears.clone(), ps: st.ps.clone(), targets: Vec::new(), caps: st.probe_caps.clone(), notes: st.probe_notes.iter().chain(st.stencil_notes.iter()).cloned().collect(), writes_src: false };
     if st.pso_dirty && st.draws + st.indirect == 0 {
         pass.notes.push("SetPipelineState with targets bound but no hooked draw: captured anyway; draw count is a lower bound (the title may draw through an unhooked slot)".into());
     }
@@ -719,6 +727,8 @@ fn reset_pass(st: &mut LState) {
     st.pso_dirty = false;
     st.probe_caps.clear();
     st.probe_notes.clear();
+    st.stencil_notes.clear();
+    st.stencil_seen.clear();
     st.seq += 1;
 }
 
@@ -752,6 +762,21 @@ unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
     let ds_l = if dsv == 0 { "-".to_string() } else { cached_label(g, dsv) };
     notes.push(format!("  bound RTs [{}] DSV {ds_l}", rt_l.join(" | ")));
     notes.push(format!("  PSO {pso:#x}: {}", crate::device_wrap::pso_desc_text(pso).unwrap_or_else(|| "no PSO desc recorded".into())));
+    for param in 0..crate::bindtrace::table_count(list as usize, false).min(32) as u32 {
+        let mut d3 = Vec::new();
+        let mut n = 0usize;
+        for slot in 0..256u32 {
+            let Some((res, fmt, dim, map)) = crate::bindtrace::table_srv_fmt(list as usize, false, param, slot) else { continue };
+            n += 1;
+            if dim == 8 {
+                let uint = matches!(fmt, 3 | 7 | 13 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62);
+                d3.push(format!("[{slot}] res={res:#x} pc_fmt={fmt} map={map:#x}{}", if uint { " UINT ok for Texture3D<uint4>" } else { " NOT a UINT format: a Texture3D<uint4> Load of it is undefined (MISMATCH if the shader declares uint)" }));
+            }
+        }
+        if !d3.is_empty() {
+            notes.push(format!("  table param {param}: {n} SRVs resolved, Texture3D views: {}", d3.join("; ")));
+        }
+    }
     notes.push(format!("  translation: {}", crate::fmask_check::translation_text(h)));
     let b = crate::bindtrace::dump(list as usize, false, &|r| format!("res {r:#x}"));
     notes.extend(b.lines().map(|l| format!("  {l}")));
@@ -799,10 +824,24 @@ unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
             notes.push(format!("  pipeline-statistics query heap creation failed hr={hr:#x}"));
         }
     }
+    let mut oq = 0usize;
+    if qh != 0 {
+        let qd: [u32; 3] = [0, 1, 0];
+        let mut q: *mut c_void = core::ptr::null_mut();
+        let hr = call!(g.device, 39, fn(*const u32, *const Guid, *mut *mut c_void) -> i32, qd.as_ptr(), &IID_QUERY_HEAP, &mut q);
+        if hr >= 0 && !q.is_null() {
+            oq = q as usize;
+            let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, 52));
+            f(list, q, 0, 0);
+        } else {
+            notes.push(format!("  occlusion query heap creation failed hr={hr:#x}"));
+        }
+    }
     if let Some(st) = g.lists.get_mut(&k) {
         st.probe_caps.extend(caps);
         st.probe_notes.extend(notes);
         st.probe_q = qh;
+        st.probe_oq = oq;
     }
 }
 
@@ -823,8 +862,23 @@ unsafe fn probe_after(this: *mut c_void) {
         let dev = g.device;
         let list = this as usize;
         let mut out: Vec<ProbeBuf> = Vec::new();
+        let oq = core::mem::take(&mut st.probe_oq);
         let end: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(this, 53));
         end(this, qh as *mut c_void, 3, 0);
+        if oq != 0 {
+            end(this, oq as *mut c_void, 0, 0);
+            match committed(dev, 3, &buffer_desc(256), 0x400) {
+                Ok(rb) => {
+                    let rs: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(this, 54));
+                    rs(this, oq as *mut c_void, 0, 0, 1, rb as *mut c_void, 0);
+                    out.push(ProbeBuf { rb, qh: oq, n: 8, kind: 3, label: format!("list {list:#x} pass seq {seq} draw occlusion query (samples that survived discard and passed the depth and stencil tests; for a stencil-writing draw with pass=REPLACE this is the number of samples whose stencil was written)") });
+                }
+                Err(hr) => {
+                    call!(oq, 2, fn() -> u32);
+                    out.push(ProbeBuf { rb: 0, qh: 0, n: 0, kind: 2, label: format!("list {list:#x} pass seq {seq}: occlusion readback buffer failed hr={hr:#x}") });
+                }
+            }
+        }
         match committed(dev, 3, &buffer_desc(256), 0x400) {
             Ok(rb) => {
                 let rs: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(this, 54));
@@ -883,6 +937,11 @@ unsafe fn probe_text(p: &ProbeBuf) -> String {
     let bytes = core::slice::from_raw_parts(ptr, p.n).to_vec();
     let empty = [0usize, 0usize];
     call!(p.rb, 9, fn(u32, *const usize) -> (), 0, empty.as_ptr());
+    if p.kind == 3 {
+        t.push_str(&format!("  samples passed = {}
+", u64::from_le_bytes(bytes[0..8].try_into().unwrap())));
+        return t;
+    }
     if p.kind == 0 {
         let q = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
         t.push_str(&format!("  IAVertices={} IAPrimitives={} VSInvocations={} GSInvocations={} GSPrimitives={} CInvocations={} CPrimitives={} PSInvocations={} HS={} DS={} CS={}\n", q(0), q(1), q(2), q(3), q(4), q(5), q(6), q(7), q(8), q(9), q(10)));
@@ -912,6 +971,12 @@ fn note_rc(this: *mut c_void, i: u32, off: u32, vals: &[u32]) {
     });
 }
 
+unsafe extern "system" fn set_stencil_ref(this: *mut c_void, r: u32) {
+    with(|g| g.lists.entry(key(this)).or_default().sref = Some(r));
+    let f: unsafe extern "system" fn(*mut c_void, u32) = core::mem::transmute(prev(24));
+    f(this, r)
+}
+
 unsafe extern "system" fn set_graphics_root_c1(this: *mut c_void, i: u32, v: u32, off: u32) {
     note_rc(this, i, off, &[v]);
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(prev(38));
@@ -938,6 +1003,14 @@ unsafe extern "system" fn set_graphics_root_sig(this: *mut c_void, rs: *mut c_vo
     });
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(prev(34));
     f(this, rs)
+}
+
+unsafe extern "system" fn set_graphics_table(this: *mut c_void, i: u32, h: u64) {
+    if !crate::rtcap::enabled() && tables_on() {
+        crate::bindtrace::set_table(this as usize, false, i, h);
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(prev(36));
+    f(this, i, h)
 }
 
 unsafe extern "system" fn set_graphics_root_cbv(this: *mut c_void, i: u32, va: u64) {
@@ -1017,8 +1090,24 @@ fn note_draw(this: *mut c_void, kind: u8) {
             if let Some(shot) = g.shot.as_mut() {
                 let h = ps_hash(shot, pso);
                 let st = g.lists.get_mut(&k).unwrap();
-                if !st.ps.contains(&h) && st.ps.len() < 12 {
+                if !st.ps.contains(&h) && st.ps.len() < 160 {
                     st.ps.push(h);
+                }
+                if st.dsv != 0 {
+                    let sref = st.sref;
+                    if !st.stencil_seen.contains(&(pso, sref)) && st.stencil_notes.len() < 32 {
+                        st.stencil_seen.push((pso, sref));
+                        if let Some((d, _)) = crate::device_wrap::gfx_pso_desc(crate::pso_async::real_of(pso)).or_else(|| crate::device_wrap::gfx_pso_desc(pso)) {
+                            let u = |o: usize| d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+                            if u(0x1fc) != 0 {
+                                let r = sref.map_or("never set in this list".to_string(), |v| format!("{v:#x}"));
+                                st.stencil_notes.push(format!("stencil draw ps={h:016x} pso={pso:#x} OMSetStencilRef={r} rm={:#x} wm={:#x} front fail/dfail/pass/func={}/{}/{}/{} back={}/{}/{}/{} depth(en={} write={} func={})",
+                                    d.get(0x200).copied().unwrap_or(0), d.get(0x201).copied().unwrap_or(0), u(0x204), u(0x208), u(0x20c), u(0x210), u(0x214), u(0x218), u(0x21c), u(0x220), u(0x1f0), u(0x1f4), u(0x1f8)));
+                            }
+                        } else {
+                            st.stencil_notes.push(format!("stencil state UNKNOWN for draw ps={h:016x} pso={pso:#x}: PSO desc not in the registry (stream or derived PSO)"));
+                        }
+                    }
                 }
                 if probe_hashes().contains(&h) {
                     unsafe { probe_draw(g, this, k, h) };
@@ -1259,8 +1348,8 @@ pub fn install(vt: &[AtomicUsize]) {
     if !on() {
         return;
     }
-    let hooks: [(usize, usize); 23] = [
-        (42, set_graphics_root_cbv as *const () as usize), (34, set_graphics_root_sig as *const () as usize), (38, set_graphics_root_c1 as *const () as usize), (40, set_graphics_root_cn as *const () as usize),
+    let hooks: [(usize, usize); 25] = [
+        (36, set_graphics_table as *const () as usize), (24, set_stencil_ref as *const () as usize), (42, set_graphics_root_cbv as *const () as usize), (34, set_graphics_root_sig as *const () as usize), (38, set_graphics_root_c1 as *const () as usize), (40, set_graphics_root_cn as *const () as usize),
         (9, close as *const () as usize), (10, reset as *const () as usize), (12, draw as *const () as usize), (13, draw_indexed as *const () as usize), (14, dispatch as *const () as usize),
         (16, copy_region as *const () as usize), (17, copy_resource as *const () as usize), (19, resolve as *const () as usize), (25, set_pso as *const () as usize), (26, barrier as *const () as usize),
         (50, om_set_targets as *const () as usize), (51, clear_dsv as *const () as usize), (52, clear_rtv as *const () as usize), (59, indirect as *const () as usize), (83, copy_region_x as *const () as usize),
@@ -1279,7 +1368,7 @@ pub fn install(vt: &[AtomicUsize]) {
     }
     let s = sel().unwrap();
     record("d3d12_xs", "passcap", &format!(
-        "TOMBOX_PASSCAP armed: shots at t={:?} s after first present, presents={:?}, file trigger={} ({}\\now or %TEMP%\\tombox_passcap_now), frames/shot={}, budget {} MB / {} captures, chain log every {} presents, output {}; hooks chained on Xbox slots 9,10,12,13,14,16,17,19,25,26,34,38,40,42,50,51,52,59,81,83,84,98,127; probe PS {:x?}{}{} (draws are never skipped or changed; captures add barrier+copy commands only on capture frames)",
+        "TOMBOX_PASSCAP armed: shots at t={:?} s after first present, presents={:?}, file trigger={} ({}\\now or %TEMP%\\tombox_passcap_now), frames/shot={}, budget {} MB / {} captures, chain log every {} presents, output {}; hooks chained on Xbox slots 9,10,12,13,14,16,17,19,24,25,26,34,36,38,40,42,50,51,52,59,81,83,84,98,127; probe PS {:x?}{}{} (draws are never skipped or changed; captures add barrier+copy commands only on capture frames)",
         s.secs, s.presents, s.file, out_root().display(), s.frames, s.budget_mb, s.max_caps, s.chain_every, out_root().display(), probe_hashes(),
         if missing.is_empty() { String::new() } else { format!("; empty slots left alone: {missing:?}") },
         if s.unknown.is_empty() { String::new() } else { format!("; ignored tokens {:?}", s.unknown) }));

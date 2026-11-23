@@ -44,6 +44,8 @@ pub(crate) mod d3d;
 pub mod fma_probe;
 #[cfg(test)]
 mod sm5_helpers_tests;
+#[cfg(test)]
+mod xdat_layout_tests;
 #[cfg(all(test, windows))]
 mod fma16_tests;
 
@@ -223,6 +225,9 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     let bitcode_stripped = bc == b"NOBC";
 
     let xdat = body.get(24..).ok_or("DXIL chunk too small for XDAT")?;
+    if is_bitcode_at(xdat, 0) {
+        return Err(bitcode_only_error(dxbc, "DXIL+24 is LLVM DXIL bitcode with no XDAT section"));
+    }
     if fourcc_at(xdat, 0)? != *b"XDAT" {
         return Err(format!(
             "expected XDAT at DXIL+24, found {:?}",
@@ -243,7 +248,13 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     if let Some(blob) = gcn::find_durango(xdat) {
         return gcn::extract_durango(dxbc, &container, stage, sm, bitcode_stripped, &blob);
     }
-    let variants = find_and_inflate_fssm(xdat)?;
+    let variants = match find_and_inflate_fssm(xdat) {
+        Ok(v) => v,
+        Err(_) if xdat_bitcode_section(xdat).is_some() => {
+            return Err(bitcode_only_error(dxbc, "XDAT holds an LLVM DXIL bitcode section and no compressed GPU program"));
+        }
+        Err(e) => return Err(e),
+    };
     let mut chosen = None;
     let mut last_err = String::from("no FSSM program found");
     for v in variants {
@@ -317,6 +328,31 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         gs_info,
         root_sig: chunk_body(b"RTS0").and_then(|b| meta::parse_rts0(b).ok()),
     })
+}
+
+const XDAT_BITCODE_SECTION: u32 = 7;
+
+fn is_bitcode_at(b: &[u8], off: usize) -> bool {
+    b.get(off..off + 4) == Some(b"BC\xC0\xDE")
+}
+
+fn xdat_bitcode_section(xdat: &[u8]) -> Option<(usize, usize)> {
+    let table = u32_at(xdat, 8).ok()? as usize;
+    if table % 12 != 0 || 12 + table > xdat.len() {
+        return None;
+    }
+    (0..table / 12).find_map(|e| {
+        let at = 12 + e * 12;
+        let (kind, off, size) = (u32_at(xdat, at).ok()?, u32_at(xdat, at + 4).ok()? as usize, u32_at(xdat, at + 8).ok()? as usize);
+        (kind == XDAT_BITCODE_SECTION && off.checked_add(size)? <= xdat.len() && is_bitcode_at(xdat, off)).then_some((off, size))
+    })
+}
+
+fn bitcode_only_error(dxbc: &[u8], layout: &str) -> String {
+    let dis = dxil_disassembly(dxbc).unwrap_or_default();
+    let triple = dis.lines().find_map(|l| l.trim().strip_prefix("target triple = ")).map(|t| t.trim_matches('"').to_string()).unwrap_or_else(|| "unknown".into());
+    let jit = if dis.contains("__XBOX_DISABLE_PRECOMPILE") { ", built with __XBOX_DISABLE_PRECOMPILE" } else { "" };
+    format!("{layout} (runtime-JIT DXIL, triple {triple}{jit}): the console compiles it when the PSO is created; TomBox has no DXIL passthrough yet")
 }
 
 /// Scan a blob for zlib streams and return every one that inflates to an `FSSM` container

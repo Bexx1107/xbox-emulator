@@ -147,6 +147,15 @@ pub fn cached_count(index: usize) -> usize {
     with(index, |p, _| p.free.len())
 }
 
+pub fn total_cached_bytes() -> u64 {
+    let sh = SHIFT.load(Ordering::Acquire);
+    if sh == 0 {
+        return 0;
+    }
+    let g = POOLS.lock().unwrap_or_else(|p| p.into_inner());
+    g.iter().flatten().map(|p| (p.free.len() as u64) << sh).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

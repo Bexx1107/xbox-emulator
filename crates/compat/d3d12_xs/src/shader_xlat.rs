@@ -675,11 +675,64 @@ fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, _key: u6
     if let Ok(v) = &r {
         crate::dbcount::note_translated(v, blob, hash, rtfmt);
         let sp = src_path(hash, rtfmt);
-        if link.0.is_empty() && !sp.exists() {
+        if link.0.is_empty() && !GUESS.with(|g| g.get()) && !sp.exists() {
             write_atomic(&sp, blob);
         }
     }
     r
+}
+
+thread_local! {
+    static GUESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+const BG_RESERVE: u64 = 2 << 30;
+const BG_PER_JOB: u64 = 256 << 20;
+static BG_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static BG_THROTTLED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn bg_allowed(total: u64, used: u64, cap: usize) -> usize {
+    let head = total.saturating_sub(used).saturating_sub(BG_RESERVE);
+    ((head / BG_PER_JOB) as usize).min(cap)
+}
+
+pub struct BgSlot;
+
+impl Drop for BgSlot {
+    fn drop(&mut self) {
+        BG_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub fn bg_slot(cap: usize) -> BgSlot {
+    let mut waited = false;
+    loop {
+        let allowed = match compat_common::gdk::memstatus::title_view() {
+            Some(v) => bg_allowed(v.total, v.used, cap),
+            None => cap,
+        };
+        let cur = BG_ACTIVE.load(Ordering::Relaxed);
+        if cur < allowed && BG_ACTIVE.compare_exchange(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            return BgSlot;
+        }
+        if !waited {
+            waited = true;
+            let n = BG_THROTTLED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 4 || n % 100 == 0 {
+                let v = compat_common::gdk::memstatus::title_view();
+                record("d3d12_xs", "shader_xlat", &format!("background shader work paused for title memory (#{n}): {} of {cap} jobs allowed, title used {} MB of {} MB, {} MB reserved, {} MB per job", allowed, v.map(|v| v.used >> 20).unwrap_or(0), v.map(|v| v.total >> 20).unwrap_or(0), BG_RESERVE >> 20, BG_PER_JOB >> 20));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn drop_if_unclaimed(key: u64, c: &Arc<OnceLock<Cached>>) {
+    let Some(cache) = CACHE.get() else { return };
+    let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if m.get(&key).is_some_and(|e| Arc::ptr_eq(e, c)) && Arc::strong_count(c) == 2 {
+        m.remove(&key);
+    }
 }
 
 fn cell(key: u64) -> Arc<OnceLock<Cached>> {
@@ -852,9 +905,12 @@ pub fn start_prewarm() {
                             }
                         }
                     }
+                    let guess = p.starts_with(&game_dir);
                     let key = cache_key(h, &rt);
                     let c = cell(key);
                     let mut ran = false;
+                    let slot = (c.get().is_none()).then(|| bg_slot(workers));
+                    GUESS.with(|g| g.set(guess));
                     c.get_or_init(|| {
                         ran = true;
                         if me != 0 {
@@ -867,6 +923,11 @@ pub fn start_prewarm() {
                         }
                         r
                     });
+                    GUESS.with(|g| g.set(false));
+                    drop(slot);
+                    if guess {
+                        drop_if_unclaimed(key, &c);
+                    }
                     if ran {
                         done += 1;
                         PREWARMED.fetch_add(1, Ordering::Relaxed);
@@ -987,6 +1048,32 @@ pub fn counts() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_jobs_follow_title_memory_headroom() {
+        let gb = 1u64 << 30;
+        assert_eq!(bg_allowed(14 * gb, 4 * gb, 14), 14);
+        assert_eq!(bg_allowed(14 * gb, 11 * gb, 14), 4);
+        assert_eq!(bg_allowed(14 * gb, 12 * gb, 14), 0);
+        assert_eq!(bg_allowed(14 * gb, 20 * gb, 14), 0);
+        assert_eq!(bg_allowed(14 * gb, 0, 3), 3);
+    }
+
+    #[test]
+    fn guessed_variants_are_not_promoted_and_unclaimed_cells_are_dropped() {
+        GUESS.with(|g| g.set(true));
+        assert!(GUESS.with(|g| g.get()));
+        GUESS.with(|g| g.set(false));
+        let key = 0x7b5e_0000_0000_0001u64;
+        let c = cell(key);
+        let _ = c.set(Err(Arc::new("x".to_string())));
+        drop_if_unclaimed(key, &c);
+        assert!(!Arc::ptr_eq(&cell(key), &c));
+        let held = cell(key);
+        let c2 = cell(key);
+        drop_if_unclaimed(key, &c2);
+        assert!(Arc::ptr_eq(&cell(key), &held));
+    }
 
     #[test]
     fn prewarm_takes_known_variants_before_game_scan_ones_and_widens_only_for_a_game_scan() {

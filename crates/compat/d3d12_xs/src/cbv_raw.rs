@@ -715,9 +715,12 @@ void main() {
     fn copy_mode_aliases_unbounded_ranges_but_keeps_root_cbvs() {
         let body = rts0(2, &[[0, u32::MAX, 0, 0]], true);
         let container = crate::device_wrap::shader_root_container(&body, false);
-        let raw = patch_blob(&container).unwrap().unwrap().0;
-        let aliased = alias_blob(&container).unwrap().expect("an unbounded range gets aliases");
-        assert_eq!(root_cbv_params(&aliased), root_cbv_params(&container));
+        let console = crate::device_wrap::wrap_root_signature(&body);
+        let given = crate::rs_xbox::pc_blob(&console).unwrap_or(console);
+        let raw = patch_blob(&given).unwrap().unwrap().0;
+        let aliased = alias_blob(&given).unwrap().expect("an unbounded range gets aliases");
+        assert!(alias_blob(&aliased).unwrap().is_none(), "aliasing is idempotent");
+        assert_eq!(root_cbv_params(&aliased), root_cbv_params(&given));
         assert_eq!(root_cbv_params(&aliased).len(), 1);
         let ranges = |b: &[u8]| {
             let (o, n) = crate::console_slots_mesh::rts0_range(b).unwrap();
@@ -727,7 +730,8 @@ void main() {
             (0..np).filter(|i| rd(po + i * 12) == 0).map(|i| rd(rd(po + i * 12 + 8))).sum::<usize>()
         };
         assert_eq!(ranges(&aliased), ranges(&raw));
-        assert!(ranges(&aliased) > ranges(&container));
+        assert!(ranges(&aliased) > ranges(&given));
+        assert_eq!(ranges(&container), ranges(&aliased));
     }
 
     #[test]

@@ -2784,6 +2784,7 @@ impl<'a> Emitter<'a> {
         }
         let continues: Vec<(usize, usize)> =
             back.iter().filter(|(&b, &l)| heads[&l] != b).map(|(&b, &l)| (b, heads[&l])).collect();
+        let cont: BTreeSet<usize> = continues.iter().map(|&(b, _)| b).collect();
         for (b, closing) in continues {
             back.remove(&b);
             target.insert(b, closing);
@@ -2805,6 +2806,10 @@ impl<'a> Emitter<'a> {
             // flag stays set on the first iteration, so everything before the label is
             // skipped, and in-body flags are cleared at the bottom of each iteration.
         }
+        let plan = if structure_enabled() { plan_structure(&target, &loops, &cont, |b| self.insns[b].enc == Enc::Sopp && Self::branch_cond(self.insns[b].op).is_some(), |b| self.insns[b].enc == Enc::Sopp && self.insns[b].op == 2) } else { Structure::default() };
+        for b in plan.regions.keys().chain(plan.breaks.iter()).chain(plan.elses.iter()) {
+            target.remove(b);
+        }
         let labels: BTreeSet<usize> = target.values().copied().collect();
         for l in &labels {
             self.line(&format!("bool j{l} = false;"));
@@ -2819,7 +2824,29 @@ impl<'a> Emitter<'a> {
         let insns = self.insns.clone();
         let mut open = false;
         let mut cur: Vec<usize> = vec![];
+        let mut stack: Vec<(usize, Option<usize>)> = vec![];
         for (i, ins) in insns.iter().enumerate() {
+            while let Some(top) = stack.last_mut() {
+                if top.1 == Some(i) {
+                    if open {
+                        self.line("}");
+                        open = false;
+                    }
+                    cur.clear();
+                    self.line("} else {");
+                    top.1 = None;
+                } else if top.0 == i {
+                    if open {
+                        self.line("}");
+                        open = false;
+                    }
+                    cur.clear();
+                    self.line("}");
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
             if let Some(&b) = heads.get(&i) {
                 if open {
                     self.line("}");
@@ -2854,6 +2881,20 @@ impl<'a> Emitter<'a> {
                 open = false;
                 cur.clear();
             }
+            if plan.breaks.contains(&i) {
+                let cond = Self::branch_cond(ins.op).unwrap_or("false");
+                self.line(&format!("if ({cond}) break;"));
+            }
+            if let Some(&(t, els)) = plan.regions.get(&i) {
+                if open {
+                    self.line("}");
+                    open = false;
+                }
+                cur.clear();
+                let cond = Self::branch_cond(ins.op).unwrap_or("false");
+                self.line(&format!("if (!({cond})) {{"));
+                stack.push((t, els));
+            }
             if back.contains_key(&i) {
                 // Evaluate the back-edge condition inside the guard (a skipped branch is not taken).
                 let cond = Self::branch_cond(ins.op).unwrap_or("false");
@@ -2872,13 +2913,19 @@ impl<'a> Emitter<'a> {
                 for t in labels.iter().filter(|&&t| t > head && t <= i) {
                     self.line(&format!("j{t} = false;"));
                 }
-                let exits: Vec<String> = labels.iter().filter(|&&t| t > i).map(|t| format!("j{t}")).collect();
+                let exits: Vec<String> = labels.iter().filter(|&&t| t > i && (!structure_enabled() || target.iter().any(|(&b, &bt)| bt == t && b >= head && b <= i))).map(|t| format!("j{t}")).collect();
                 let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(" || ")) };
                 self.line(&format!("}} while (tb_c{i}{exit} && ++tb_guard < {}u);", loop_guard(65536)));
                 self.loop_depth = self.loop_depth.saturating_sub(1);
             }
         }
         if open {
+            self.line("}");
+        }
+        while let Some(top) = stack.pop() {
+            if top.1.is_some() {
+                self.line("} else {");
+            }
             self.line("}");
         }
         Ok(())
@@ -5244,7 +5291,7 @@ impl<'a> Emitter<'a> {
                     x = format!("({x} ^ 0x80000000u)");
                 }
             }
-            let e = format!("tb_t32({op}u, {x})");
+            let e = format!("tb_t32_{op}({x})");
             if ins.enc == Enc::Vop3 && (ins.aux.imm2 != 0 || ins.aux.imm != 0) {
                 let fe = self.fres(ins, format!("asfloat({e})"));
                 return self.wv(&d, &fe);
@@ -7299,6 +7346,63 @@ fn f32_native() -> bool {
 fn f64_native() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("TOMBOX_XS_F64_NATIVE").map(|v| v.trim() == "1").unwrap_or(false))
+}
+
+#[derive(Default)]
+struct Structure {
+    regions: BTreeMap<usize, (usize, Option<usize>)>,
+    breaks: BTreeSet<usize>,
+    elses: BTreeSet<usize>,
+}
+
+fn structure_enabled() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("TOMBOX_XLAT_STRUCTURE").map(|v| v.trim() != "0").unwrap_or(true))
+}
+
+fn plan_structure(fwd: &HashMap<usize, usize>, loops: &[(usize, usize)], cont: &BTreeSet<usize>, is_cond: impl Fn(usize) -> bool, is_jump: impl Fn(usize) -> bool) -> Structure {
+    let mut st = Structure::default();
+    let mut edges: Vec<(usize, usize)> = fwd.iter().map(|(&b, &t)| (b, t)).collect();
+    edges.sort_unstable();
+    let entered = |s: usize, e: usize, own: (usize, usize)| edges.iter().any(|&(b, t)| t >= s && t < e && !(b >= s && b < e) && (b, t) != own);
+    let loop_ok = |i: usize, t: usize| loops.iter().all(|&(l, b)| if l <= i && i <= b { t <= b } else if i < l { t <= l || t > b } else { true });
+    let nest = |acc: &[(usize, usize)], i: usize, t: usize| {
+        acc.iter().all(|&(a, at)| {
+            let (lt, hi, ht) = if a < i { (at, i, t) } else { (t, a, at) };
+            hi >= lt || ht <= lt
+        })
+    };
+    let mut acc: Vec<(usize, usize)> = vec![];
+    for &(i, t) in &edges {
+        if cont.contains(&i) || !is_cond(i) || st.elses.contains(&i) {
+            continue;
+        }
+        let inner = loops.iter().filter(|&&(l, b)| l <= i && i < b).max_by_key(|&&(l, _)| l);
+        if let Some(&(_, b)) = inner {
+            if t == b + 1 {
+                st.breaks.insert(i);
+                continue;
+            }
+        }
+        if !loop_ok(i, t) || !nest(&acc, i, t) || entered(i + 1, t, (i, t)) {
+            continue;
+        }
+        let j = t - 1;
+        if j > i && is_jump(j) && !cont.contains(&j) {
+            if let Some(&t2) = fwd.get(&j) {
+                if t2 > t && loop_ok(j, t2) && nest(&acc, j, t2) && !entered(t, t2, (i, t)) {
+                    st.regions.insert(i, (t2, Some(t)));
+                    st.elses.insert(j);
+                    acc.push((i, t));
+                    acc.push((j, t2));
+                    continue;
+                }
+            }
+        }
+        st.regions.insert(i, (t, None));
+        acc.push((i, t));
+    }
+    st
 }
 
 pub fn loop_guard(default: u32) -> u32 {

@@ -38,6 +38,9 @@ pub const TITLE_LIMIT: u64 = 0x3_6000_0000;
 static PEAK_USED: AtomicU64 = AtomicU64::new(0);
 
 pub fn title_used() -> u64 {
+    if crate::title_acct::enabled() && crate::sys::env_trimmed_is(b"TOMBOX_XMEM_TITLE_USED_OLD\0", b"1") != Some(true) {
+        return crate::title_acct::parts().total().min(TITLE_LIMIT);
+    }
     let proc = process_memory();
     (proc.private_usage as u64 + crate::phys::live_bytes()).min(TITLE_LIMIT)
 }
@@ -117,7 +120,11 @@ pub unsafe extern "system" fn XMemGetWorkingSetStatistics(flags: u32, out: *mut 
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    crate::title_acct::announce();
     let mut ws = gather(flags);
+    if flags & WS_TITLE != 0 {
+        crate::title_acct::trace("ws", &format!("flags={flags:#x}"));
+    }
     if flags & WS_POOL != 0 {
         match pool_bytes() {
             Ok(b) => {
@@ -380,7 +387,7 @@ mod tests {
         let total = u64::from_le_bytes(big[0..8].try_into().unwrap());
         let used = u64::from_le_bytes(big[8..16].try_into().unwrap());
         assert_eq!(total, TITLE_LIMIT);
-        assert!(used > 0 && used <= total);
+        assert!(used <= total);
         assert!(big[0x38..0x48].iter().all(|&b| b == 0));
         assert!(big[0x50..].iter().all(|&b| b == 0xcc));
         let mut old = [0xccu8; 0x80];
@@ -404,7 +411,7 @@ mod tests {
         assert_eq!(total, 14_495_514_624);
         assert_eq!(u64::from_le_bytes(v2[0x28..0x30].try_into().unwrap()), total);
         assert_eq!(u64::from_le_bytes(v2[0x30..0x38].try_into().unwrap()), used);
-        assert!(used > 0 && used <= total);
+        assert!(used <= total);
     }
 
     #[test]

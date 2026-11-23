@@ -169,7 +169,7 @@ unsafe extern "system" fn create_descriptor_heap(
         // Keep the heap REAL (so it works when passed to SetDescriptorHeaps etc.);
         // patch the shared heap vtable once to fix the handle-getter ABI.
         crate::heap_wrap::ensure_patched(unsafe { *ppv });
-        if crate::rtcap::enabled() && !pdesc.is_null() {
+        if (crate::rtcap::enabled() || crate::passcap::tables_on()) && !pdesc.is_null() {
             // Binding trace: remember shader-visible heaps (GPU handle -> CPU handle).
             let d = pdesc as *const u32;
             let (htype, numd, flags) = unsafe { (*d.add(0), *d.add(1), *d.add(2)) };
@@ -596,6 +596,9 @@ unsafe extern "system" fn create_committed_resource(
         if crate::rtcap::enabled() && desc_copy[0] == 1 && !pheap.is_null() {
             let width = u64::from_le_bytes(desc_copy[0x10..0x18].try_into().unwrap());
             unsafe { crate::bindtrace::note_buffer(*ppv, width, *pheap) };
+        }
+        if pooled.is_none() {
+            unsafe { crate::title_gpu::committed(*ppv, &xdesc) };
         }
     }
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -1266,18 +1269,40 @@ unsafe extern "system" fn real_create_root_signature(real: *mut c_void, mask: u3
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(real_orig(16)) };
     let stripped = unsafe { crate::rs_xbox::pc_blob_raw(blob, len) };
     let (blob, len) = stripped.as_ref().map_or((blob, len), |b| (b.as_ptr(), b.len()));
+    let aliased = if blob.is_null() || len == 0 { None } else { crate::cbv_raw::alias_blob(unsafe { core::slice::from_raw_parts(blob, len) }).ok().flatten() };
+    let (blob, len) = aliased.as_ref().map_or((blob, len), |b| (b.as_ptr(), b.len()));
+    let copy = |b: *const u8, l: usize| if b.is_null() || l == 0 { Vec::new() } else { unsafe { core::slice::from_raw_parts(b, l) }.to_vec() };
+    let sent = core::cell::RefCell::new(Vec::<u8>::new());
     let mut gds = unsafe { crate::gds::patch_root_signature(blob, len) };
     let (gb, gl) = gds.as_ref().map_or((blob, len), |(b, _)| (b.as_ptr(), b.len()));
-    let cen = unsafe { crate::centroid_bind::create(gb, gl, &|b, l| f(real, mask, b, l, riid, ppv), ppv) };
+    let cen = unsafe {
+        crate::centroid_bind::create(gb, gl, &|b, l| {
+            *sent.borrow_mut() = copy(b, l);
+            f(real, mask, b, l, riid, ppv)
+        }, ppv)
+    };
     let mut hr = match (&cen, &gds) {
         (Some(hr), _) => *hr,
-        (None, Some((b, _))) => unsafe { f(real, mask, b.as_ptr(), b.len(), riid, ppv) },
-        (None, None) => unsafe { f(real, mask, blob, len, riid, ppv) },
+        (None, Some((b, _))) => {
+            *sent.borrow_mut() = b.clone();
+            unsafe { f(real, mask, b.as_ptr(), b.len(), riid, ppv) }
+        }
+        (None, None) => {
+            *sent.borrow_mut() = copy(blob, len);
+            unsafe { f(real, mask, blob, len, riid, ppv) }
+        }
     };
     if hr < 0 && gds.is_some() {
         record("d3d12_xs", "gds", &format!("root signature with the GDS parameter rejected hr={hr:#010x}; created without GDS"));
         gds = None;
+        *sent.borrow_mut() = copy(blob, len);
         hr = unsafe { f(real, mask, blob, len, riid, ppv) };
+    }
+    if hr >= 0 && !ppv.is_null() && unsafe { !(*ppv).is_null() } {
+        let s = sent.borrow();
+        if !s.is_empty() {
+            crate::pso_lib::note_real_root(unsafe { *ppv } as usize, &s);
+        }
     }
     if hr >= 0 && !ppv.is_null() {
         if let Some((_, idx)) = gds { crate::gds::note_root_signature(unsafe { *ppv }, idx) }
@@ -1808,6 +1833,9 @@ unsafe extern "system" fn create_heap(
         }
     };
     let hr = unsafe { f(real, d.as_ptr(), riid, ppv) };
+    if hr >= 0 && !ppv.is_null() {
+        unsafe { crate::title_gpu::heap(*ppv, size) };
+    }
     let note = format!(" | pc size={:#x} align={:#x} flags={:#x}", u64at(&d, 0), u64at(&d, 0x20), u32at(&d, 0x28));
     if hr >= 0 && crate::rtcap::enabled() && !ppv.is_null() {
         crate::bindtrace::note_heap_type(unsafe { *ppv } as usize, htype);

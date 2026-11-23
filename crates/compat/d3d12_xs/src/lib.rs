@@ -14,6 +14,9 @@
 mod device_wrap;
 mod res3d;
 mod res_pool;
+mod title_gpu;
+#[cfg(test)]
+mod title_gpu_tests;
 mod dxgi_device;
 mod xone_dxgi;
 mod xone_queue;
@@ -24,6 +27,7 @@ mod hang_cap;
 mod hang_snap;
 mod rootlog;
 mod bl_alias;
+mod cpu_watch;
 mod vs_snorm;
 mod pso_async;
 mod xone_heap;

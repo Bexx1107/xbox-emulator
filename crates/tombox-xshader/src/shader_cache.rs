@@ -21,7 +21,7 @@ extern "system" {
     fn GetModuleFileNameW(h: *mut c_void, buf: *mut u16, n: u32) -> u32;
 }
 
-fn module_path() -> Option<PathBuf> {
+pub(crate) fn module_path() -> Option<PathBuf> {
     let mut h: *mut c_void = std::ptr::null_mut();
     let mut buf = [0u16; 1024];
     let n = unsafe {

@@ -12,6 +12,7 @@ pub struct Durango {
 }
 
 const PROGRAM_PREFIX: usize = 0x28;
+pub const BINDING_RECORD: usize = 0x14;
 
 fn u32_at(b: &[u8], o: usize) -> Result<u32, String> {
     b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]])).ok_or_else(|| format!("durango: u32 read at {o:#x} out of bounds (len {})", b.len()))
@@ -37,7 +38,7 @@ pub fn parse(b: &[u8]) -> Result<Durango, String> {
         return Err(format!("not a Durango shader blob (first words {:x?})", b.get(0..0x24)));
     }
     let code_start = u64_at(b, 0x28)? as usize;
-    let code_end = u64_at(b, 0x30)? as usize;
+    let code_end = (u64_at(b, 0x30)? as usize).saturating_add(PROGRAM_PREFIX);
     if code_start >= code_end || code_end > b.len() || (code_end - code_start) % 4 != 0 {
         return Err(format!("durango: bad code range {code_start:#x}..{code_end:#x} in {} bytes", b.len()));
     }
@@ -46,6 +47,9 @@ pub fn parse(b: &[u8]) -> Result<Durango, String> {
     let prog_end = prog_start + prog_len;
     if prog_len == 0 || prog_len % 4 != 0 || prog_end > code_end || u32_at(b, prog_end - 4)? != 0xbf81_0000 {
         return Err(format!("durango: program {prog_start:#x}+{prog_len:#x} (header 0x1dc) does not end in s_endpgm inside code {code_start:#x}..{code_end:#x}"));
+    }
+    if (code_end - prog_end) % BINDING_RECORD != 0 {
+        return Err(format!("durango: {:#x} bytes after the program at {prog_end:#x} are not whole {BINDING_RECORD}-byte binding records (code ends {code_end:#x})", code_end - prog_end));
     }
     Ok(Durango {
         hash: u64_at(b, 8)?,
@@ -908,6 +912,54 @@ mod tests {
 
     fn bytes(w: &[u32]) -> Vec<u8> {
         w.iter().flat_map(|d| d.to_le_bytes()).collect()
+    }
+
+    fn durango_blob(program: &[u32], records: &[[u32; 5]], header_code_size: usize) -> Vec<u8> {
+        let cs = 0x200usize;
+        let mut b = vec![0u8; cs + PROGRAM_PREFIX];
+        b.extend(bytes(program));
+        for r in records {
+            b.extend(bytes(r));
+        }
+        let tail_at = b.len();
+        b.extend(bytes(&[0, 0, (tail_at - 0x10) as u32, 0, 0x18, 9, 0x0006_0004, 0]));
+        let n = b.len();
+        b[0..8].copy_from_slice(&(n as u64).to_le_bytes());
+        b[0x18..0x1c].copy_from_slice(&5u32.to_le_bytes());
+        b[0x28..0x30].copy_from_slice(&(cs as u64).to_le_bytes());
+        b[0x30..0x38].copy_from_slice(&((cs + header_code_size) as u64).to_le_bytes());
+        b[0x1dc..0x1e0].copy_from_slice(&((program.len() * 4) as u32).to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn durango_code_size_excludes_the_program_prefix() {
+        let program = [0xbefc_0303, 0xc808_0000, 0xbf81_0000];
+        let record = [0x1a, 0x0010_1000, 0x6000_0000, 0, 0];
+        let blob = durango_blob(&program, &[record], program.len() * 4 + BINDING_RECORD);
+        let d = parse(&blob).unwrap();
+        assert_eq!(words(&d.code), program);
+        assert_eq!(words(&d.data), record);
+        assert_eq!(d.code_end, 0x200 + PROGRAM_PREFIX + program.len() * 4 + BINDING_RECORD);
+        assert_eq!(words(&d.tail)[..2], [0, 0]);
+    }
+
+    #[test]
+    fn durango_binding_table_keeps_every_record() {
+        let program = [0xbf80_0000, 0xbf81_0000];
+        let records: Vec<[u32; 5]> = (0..7).map(|i| [i, 0x0005_0101 + i, 0x3000_0000, 0, 0]).collect();
+        let blob = durango_blob(&program, &records, program.len() * 4 + records.len() * BINDING_RECORD);
+        let d = parse(&blob).unwrap();
+        assert_eq!(d.data.len(), records.len() * BINDING_RECORD);
+        assert_eq!(words(&d.data[6 * BINDING_RECORD..]), records[6]);
+    }
+
+    #[test]
+    fn durango_partial_binding_record_is_an_error() {
+        let program = [0xbf80_0000, 0xbf81_0000];
+        let record = [0x1a, 0x0010_1000, 0x6000_0000, 0, 0];
+        let blob = durango_blob(&program, &[record], program.len() * 4 + 8);
+        assert!(parse(&blob).unwrap_err().contains("binding records"));
     }
 
     #[test]
