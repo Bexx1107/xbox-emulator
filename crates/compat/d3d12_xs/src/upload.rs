@@ -1435,6 +1435,33 @@ unsafe fn pump_inner(queue: *mut c_void) {
 }
 
 #[cfg(test)]
+pub(crate) fn test_offsets(desc: &[u8; 0x38]) -> Result<(u64, usize, Vec<u32>), String> {
+    let l = layout_for(desc)?;
+    let w = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap()) as u32;
+    let h = u32::from_le_bytes(desc[0x18..0x1c].try_into().unwrap());
+    let m = unsafe { l.submap(0, w, h) }.ok_or_else(|| "no element map for subresource 0".to_string())?;
+    Ok((l.total, l.bpe as usize, m.offs.clone()))
+}
+
+#[cfg(test)]
+pub(crate) struct TestWw {
+    pub watched: Option<bool>,
+    pub sent: bool,
+    pub band_uploads: u64,
+    pub whole_uploads: u64,
+    pub lost: u64,
+    pub dirty_subs: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn test_ww(res: *mut c_void) -> TestWw {
+    let g = UP.lock().unwrap();
+    let Some(up) = g.as_ref() else { return TestWw { watched: None, sent: false, band_uploads: 0, whole_uploads: 0, lost: 0, dirty_subs: 0 } };
+    let t = up.tracked.iter().find(|t| t.res == res as usize);
+    TestWw { watched: t.map(|t| t.ww), sent: t.map_or(false, |t| t.sent.iter().all(|&x| x)), band_uploads: up.ww.band_uploads, whole_uploads: up.ww.whole_uploads, lost: up.ww.lost, dirty_subs: up.ww.dirty_subs }
+}
+
+#[cfg(test)]
 mod zero_watch_tests {
     use super::*;
 

@@ -691,6 +691,7 @@ mod tests {
 
     #[test]
     fn title_virtual_alloc2_counts_and_map_view_of_file3_does_not() {
+        let _g = crate::phys::map_test_guard();
         extern "system" {
             fn CreateFileMappingW(file: usize, sa: *const c_void, protect: u32, hi: u32, lo: u32, name: *const u16) -> usize;
             fn UnmapViewOfFile(base: *const c_void) -> i32;

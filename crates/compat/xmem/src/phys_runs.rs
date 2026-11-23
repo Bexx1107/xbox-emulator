@@ -290,6 +290,7 @@ mod tests {
 
     #[test]
     fn released_check_flags_a_left_behind_placeholder() {
+        let _g = crate::phys::map_test_guard();
         #[link(name = "kernelbase", kind = "raw-dylib")]
         extern "system" {
             fn VirtualAlloc2(process: Handle, base: *mut c_void, size: usize, kind: u32, protect: u32, params: *mut c_void, count: u32) -> *mut c_void;
