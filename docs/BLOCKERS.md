@@ -1229,3 +1229,6 @@ Headless runs straight into each title's test scene, on the staged release of 11
 
 ## RDNA2 f16 FMA NaN payloads on non-AMD hosts (tombox-xshader, #194) - 2026-11-23
 - OPEN: RDNA2 NaN payload propagation for v_fmac_f16 / v_fmamk_f16 / v_fmaak_f16 is not modelled. The translator uses host f16 math, so a NaN result carries the host GPU's payload: WARP keeps the gfx1036 payloads, an NVIDIA GPU returns its canonical 0x7fff. exec_vop::rdna2_silicon compares these cases bit-exact on WARP and, under TOMBOX_EXEC_HW=1, only as a NaN class (v_cmp_class_f16) plus the preserved upper half. On gfx1036 with IEEE mode off, a signalling NaN operand also comes back unquieted, which no host path reproduces; the recorded cases exclude signalling NaN inputs.
+
+## gather4_l footprint ignores sampler bias/clamp (tombox-xshader, #196) - 2026-11-23
+- OPEN: image_gather4_l / _l_o / _c_l / _c_l_o on 2D and 2D-array images choose the footprint mip from the unbiased explicit LOD. The S# LOD_BIAS, MIN_LOD and MAX_LOD are not applied to that choice, so a sampler with a non-zero bias or a LOD clamp that excludes the chosen mip gathers from a different level than RDNA2 does. Next step: read those S# fields in the shader where the descriptor is visible and apply them before the mip pick, with a WARP exec test that uses a non-zero clamp.
