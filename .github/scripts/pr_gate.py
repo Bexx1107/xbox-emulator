@@ -26,6 +26,8 @@ COMMENT = {
     ".psm1": re.compile(r"^\s*(#|<#|#>)"),
 }
 COMMENT_OK = re.compile(r"^\s*#Requires\b")
+RVA_CONST = re.compile(r"\bconst\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*(usize|u64)\s*=\s*0x([0-9a-fA-F_]+)")
+RVA_PATH = re.compile(r"^crates/compat/.*\.rs$")
 
 
 def git(*args):
@@ -90,6 +92,10 @@ def check_lines(base, head, paths):
             for rx, why in PRIVATE:
                 if rx.search(text):
                     errors.append(("%s:%d" % (p, n), why))
+            if RVA_PATH.search(p):
+                m = RVA_CONST.search(text)
+                if m and 6 <= len(m.group(2).replace("_", "").lstrip("0")) <= 8:
+                    errors.append(("%s:%d" % (p, n), "title RVA-style constant (usize/u64 with 6-8 significant hex digits) in a compat crate"))
             if rule and rule.search(text) and not (n == 1 and text.startswith("#!")) and not COMMENT_OK.search(text):
                 errors.append(("%s:%d" % (p, n), "comment line (the project keeps code free of comment lines)"))
     return errors
