@@ -543,6 +543,8 @@ struct Shot {
     budget_note: Option<String>,
     ps_cache: HashMap<usize, u64>,
     probes: Vec<ProbeBuf>,
+    cpu_pending: Vec<(usize, u64, String)>,
+    cpu_submit: Vec<String>,
 }
 
 #[derive(Default)]
@@ -757,6 +759,34 @@ unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
     for (i, va) in &cbv {
         let src = crate::cbv_copy::lookup_source(*va).map(|s| format!("PC buffer {:#x}+{:#x} ({:#x} bytes left, state {:#x})", s.res, s.off, s.left, s.state)).unwrap_or_else(|| "not inside any known PC buffer".into());
         notes.push(format!("  root[{i}] title va={va:#x} -> {src}"));
+        if let Some(s) = crate::cbv_copy::lookup_source(*va) {
+            let r = s.res as *mut c_void;
+            let heap = crate::bindtrace::buffer_at(*va).map(|b| b.3);
+            let backing = if crate::alias::is_aliased(r) {
+                "(a) placed on an existing heap over the title's own pages: the GPU copy reads the title's CPU writes directly, no mirror"
+            } else if heap == Some(2) {
+                "(a) PC upload heap the title maps and writes itself: the GPU copy reads the title's CPU writes directly, no mirror"
+            } else if crate::placed::is_committed_placement(r) {
+                "(b) separate committed stand-in for title memory; upload.rs mirrors only Texture2D (unsupported_reason dim != 3), so this buffer has no mirror refresh path, no dirty state and no last-upload pump"
+            } else {
+                "unclassified: not aliased, not an upload heap bindtrace saw, not a committed placement"
+            };
+            notes.push(format!("  root[{i}] copy source backing: {backing}; heap type {}", heap.map_or("unknown (buffer not noted)".to_string(), |h| h.to_string())));
+        }
+        let path = if crate::cbv_raw::copy_on() { "cbv_raw copy mode: ring copy of the source recorded as a GPU CopyBufferRegion in this list, so it reads the source when the GPU runs it" } else if crate::cbv_raw::enabled() { "cbv_raw raw-view mode" } else { "direct root CBV" };
+        notes.push(format!("  root[{i}] bind path: {path}; title va alignment {} (va & 0xff = {:#x})", if *va & 0xff == 0 { "256-byte aligned" } else { "NOT 256-byte aligned" }, *va & 0xff));
+        if let Some(shot) = g.shot.as_mut() {
+            shot.cpu_pending.push((k, *va, format!("probe PS {h:016x} root[{i}] title va={va:#x}")));
+        }
+        match crate::bindtrace::read_va(*va, 1024) {
+            Some(bytes) => {
+                let w: Vec<String> = bytes.chunks_exact(4).map(|x| format!("{:08x}", u32::from_le_bytes(x.try_into().unwrap()))).collect();
+                for (r, c) in w.chunks(16).enumerate() {
+                    notes.push(format!("  root[{i}] CPU view at record time dw[{:3}..] {}", r * 16, c.join(" ")));
+                }
+            }
+            None => notes.push(format!("  root[{i}] CPU view at record time: not an upload-heap buffer bindtrace can map")),
+        }
     }
     let rt_l: Vec<String> = rts.iter().map(|r| if *r == 0 { "-".into() } else { cached_label(g, *r) }).collect();
     let ds_l = if dsv == 0 { "-".to_string() } else { cached_label(g, dsv) };
@@ -895,8 +925,8 @@ unsafe fn probe_after(this: *mut c_void) {
                 out.push(ProbeBuf { rb: 0, qh: 0, n: 0, kind: 2, label: format!("list {list:#x} pass seq {seq} root[{i}] title va={va:#x}: not inside any known PC buffer, no readback") });
                 continue;
             };
-            let n = src.left.min(256);
-            let Ok(rb) = committed(dev, 3, &buffer_desc(256), 0x400) else { continue };
+            let n = src.left.min(1024);
+            let Ok(rb) = committed(dev, 3, &buffer_desc(1024), 0x400) else { continue };
             let bar = crate::cbv_copy::source_barrier(src.state);
             if let Some((before, during)) = bar {
                 list_call_barrier(list, &[barrier_sub0(src.res, before, during)]);
@@ -1380,6 +1410,20 @@ pub fn note_submit(queue: usize, real: &[*mut c_void]) {
     }
     with(|g| {
         let Some(shot) = g.shot.as_mut() else { return };
+        let keys: Vec<usize> = real.iter().map(|l| *l as usize).collect();
+        let mut keep = Vec::new();
+        for (lk, va, label) in core::mem::take(&mut shot.cpu_pending) {
+            if keys.iter().any(|&x| x == lk || key(x as *mut c_void) == lk) {
+                let text = match unsafe { crate::bindtrace::read_va(va, 1024) } {
+                    Some(bytes) => bytes.chunks_exact(4).map(|x| format!("{:08x}", u32::from_le_bytes(x.try_into().unwrap()))).collect::<Vec<_>>().chunks(16).enumerate().map(|(r, c)| format!("  dw[{:3}..] {}", r * 16, c.join(" "))).collect::<Vec<_>>().join("\n"),
+                    None => "  not an upload-heap buffer bindtrace can map".to_string(),
+                };
+                shot.cpu_submit.push(format!("{label}: CPU view at ExecuteCommandLists (queue {queue:#x})\n{text}"));
+            } else {
+                keep.push((lk, va, label));
+            }
+        }
+        shot.cpu_pending = keep;
         for l in real {
             if !shot.submit.contains_key(&(*l as usize)) {
                 g.submit_seq += 1;
@@ -1556,7 +1600,7 @@ pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32,
             }
             if let Some(w) = why {
                 g.next_id += 1;
-                g.shot = Some(Shot { id: g.next_id, why: w.clone(), start_present: g.presents, end_present: 0, t, frames_left: s.frames, passes: Vec::new(), caps: Vec::new(), submit: HashMap::new(),
+                g.shot = Some(Shot { id: g.next_id, why: w.clone(), start_present: g.presents, end_present: 0, t, frames_left: s.frames, passes: Vec::new(), caps: Vec::new(), submit: HashMap::new(), cpu_pending: Vec::new(), cpu_submit: Vec::new(),
                     bytes: 0, waits: 0, order: 0, src: 0, src_label: String::new(), chain: String::new(), budget_note: None, ps_cache: HashMap::new(), probes: Vec::new() });
                 ACTIVE.store(true, Ordering::Relaxed);
                 record("d3d12_xs", "passcap", &format!("shot {} armed ({w}) at present #{} t={t:.2}s: recording the next {} frame(s)", g.next_id, g.presents, s.frames));
@@ -1732,6 +1776,10 @@ fn write_shot(sh: Shot, gpu_done: bool, waited: Vec<(usize, bool)>, raw: bool) {
             if p.qh != 0 {
                 unsafe { call!(p.qh, 2, fn() -> u32) };
             }
+        }
+        for s in &sh.cpu_submit {
+            pt.push_str(s);
+            pt.push_str("\n");
         }
         let _ = std::fs::write(dir.join("probes.txt"), pt);
     }

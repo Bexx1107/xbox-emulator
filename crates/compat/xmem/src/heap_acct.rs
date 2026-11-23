@@ -72,6 +72,10 @@ pub fn register_title(heap: usize, allocated: u64, overhead: u64) -> Option<&'st
     Some(a)
 }
 
+pub fn is_title(heap: usize) -> bool {
+    slot(heap).is_some_and(|a| a.title.load(Ordering::Acquire))
+}
+
 pub fn title_bytes() -> u64 {
     ACCT.iter()
         .filter(|a| a.title.load(Ordering::Acquire) && a.heap.load(Ordering::Acquire) != 0)

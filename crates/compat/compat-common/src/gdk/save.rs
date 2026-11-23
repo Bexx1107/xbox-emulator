@@ -5,8 +5,17 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
+
+fn first_call(slot: u32, name: &str) {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let bit = 1u64 << slot;
+    if SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        log(name, &format!("first call (slot {slot})"));
+    }
+}
 
 pub const CLSID: Guid = Guid::parse("704c3f58-e629-4cc2-b197-30511b996fe2");
 
@@ -289,6 +298,7 @@ type BlobCb = unsafe extern "system" fn(*const BlobInfoC, *mut c_void) -> bool;
 static OP_INIT: &[u8] = b"XGameSaveInitializeProviderAsync\0";
 
 unsafe extern "system" fn init_provider_async(_t: This, user: usize, scid: *const u8, sync_on_demand: bool, block: *mut c_void) -> i32 {
+    first_call(4, "XGameSaveInitializeProviderAsync");
     let scid = cstr(scid).unwrap_or_default();
     let dir = provider_dir(&super::title().key, super::user::user().xuid, &scid);
     let payload = match Store::open(dir.clone()) {
@@ -303,16 +313,19 @@ unsafe extern "system" fn init_provider_async(_t: This, user: usize, scid: *cons
 }
 
 unsafe extern "system" fn init_provider_result(_t: This, block: *mut c_void, out: *mut usize) -> i32 {
+    first_call(5, "XGameSaveInitializeProviderResult");
     xasync::value(block, OP_INIT, out)
 }
 
 unsafe extern "system" fn close_provider(_t: This, p: *mut Provider) {
+    first_call(6, "XGameSaveCloseProvider");
     if !p.is_null() {
         drop(Box::from_raw(p));
     }
 }
 
 unsafe extern "system" fn delete_container(_t: This, p: *const Provider, name: *const u8) -> i32 {
+    first_call(10, "XGameSaveDeleteContainer");
     let (Some(p), Some(n)) = (p.as_ref(), cstr(name)) else { return E_INVALIDARG };
     match p.store.delete_container(&n) {
         Ok(_) => S_OK,
@@ -338,6 +351,7 @@ unsafe fn report_container(info: &ContainerInfo, ctx: *mut c_void, cb: Container
 }
 
 unsafe extern "system" fn get_container_info(_t: This, p: *const Provider, name: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> i32 {
+    first_call(13, "XGameSaveGetContainerInfo");
     let (Some(p), Some(n), Some(cb)) = (p.as_ref(), cstr(name), cb) else { return E_INVALIDARG };
     if let Some(info) = p.store.container_info(&n) {
         report_container(&info, ctx, cb);
@@ -346,6 +360,7 @@ unsafe extern "system" fn get_container_info(_t: This, p: *const Provider, name:
 }
 
 unsafe extern "system" fn enumerate_containers(_t: This, p: *const Provider, ctx: *mut c_void, cb: Option<ContainerCb>) -> i32 {
+    first_call(14, "XGameSaveEnumerateContainerInfo");
     let (Some(p), Some(cb)) = (p.as_ref(), cb) else { return E_INVALIDARG };
     for info in p.store.containers() {
         if !report_container(&info, ctx, cb) {
@@ -356,6 +371,7 @@ unsafe extern "system" fn enumerate_containers(_t: This, p: *const Provider, ctx
 }
 
 unsafe extern "system" fn create_container(_t: This, p: *const Provider, name: *const u8, out: *mut *mut Container) -> i32 {
+    first_call(16, "XGameSaveCreateContainer");
     if p.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
@@ -365,12 +381,14 @@ unsafe extern "system" fn create_container(_t: This, p: *const Provider, name: *
 }
 
 unsafe extern "system" fn close_container(_t: This, c: *mut Container) {
+    first_call(17, "XGameSaveCloseContainer");
     if !c.is_null() {
         drop(Box::from_raw(c));
     }
 }
 
 unsafe extern "system" fn enumerate_blobs(_t: This, c: *const Container, ctx: *mut c_void, cb: Option<BlobCb>) -> i32 {
+    first_call(18, "XGameSaveEnumerateBlobInfo");
     let (Some(c), Some(cb)) = (c.as_ref(), cb) else { return E_INVALIDARG };
     for (name, size) in (*c.provider).store.blobs(&c.name) {
         let n = CString::new(name).unwrap_or_default();
@@ -383,6 +401,7 @@ unsafe extern "system" fn enumerate_blobs(_t: This, c: *const Container, ctx: *m
 }
 
 unsafe extern "system" fn read_blob_data(_t: This, c: *const Container, names: *const *const u8, count: *mut u32, size: usize, out: *mut u8) -> i32 {
+    first_call(20, "XGameSaveReadBlobData");
     let Some(c) = c.as_ref() else { return E_INVALIDARG };
     if count.is_null() {
         return E_INVALIDARG;
@@ -423,6 +442,7 @@ unsafe extern "system" fn read_blob_data(_t: This, c: *const Container, names: *
 }
 
 unsafe extern "system" fn create_update(_t: This, c: *const Container, display: *const u8, out: *mut *mut Update) -> i32 {
+    first_call(23, "XGameSaveCreateUpdate");
     if c.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
@@ -431,12 +451,14 @@ unsafe extern "system" fn create_update(_t: This, c: *const Container, display: 
 }
 
 unsafe extern "system" fn close_update(_t: This, u: *mut Update) {
+    first_call(24, "XGameSaveCloseUpdate");
     if !u.is_null() {
         drop(Box::from_raw(u));
     }
 }
 
 unsafe extern "system" fn submit_blob_write(_t: This, u: *mut Update, name: *const u8, data: *const u8, len: usize) -> i32 {
+    first_call(25, "XGameSaveSubmitBlobWrite");
     let Some(u) = u.as_mut() else { return E_INVALIDARG };
     let Some(n) = cstr(name).filter(|n| valid_name(n, 256)) else { return E_GS_INVALID_CONTAINER_NAME };
     if data.is_null() && len > 0 {
@@ -450,6 +472,7 @@ unsafe extern "system" fn submit_blob_write(_t: This, u: *mut Update, name: *con
 }
 
 unsafe extern "system" fn submit_update(_t: This, u: *const Update) -> i32 {
+    first_call(27, "XGameSaveSubmitUpdate");
     let Some(u) = u.as_ref() else { return E_INVALIDARG };
     let c = &*u.container;
     let store = &(*c.provider).store;
@@ -505,6 +528,7 @@ unsafe fn open_provider(user: usize, scid: *const u8) -> Result<Box<Provider>, i
 }
 
 unsafe extern "system" fn init_provider(_t: This, user: usize, scid: *const u8, _sync: bool, out: *mut *mut Provider) -> i32 {
+    first_call(3, "XGameSaveInitializeProvider");
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -518,6 +542,7 @@ unsafe extern "system" fn init_provider(_t: This, user: usize, scid: *const u8, 
 }
 
 unsafe extern "system" fn get_quota(_t: This, p: *const Provider, out: *mut i64) -> i32 {
+    first_call(7, "XGameSaveGetRemainingQuota");
     let Some(p) = p.as_ref() else { return E_INVALIDARG };
     if out.is_null() {
         return E_INVALIDARG;
@@ -532,15 +557,18 @@ static OP_READ: &[u8] = b"XGameSaveReadBlobDataAsync\0";
 static OP_SUBMIT: &[u8] = b"XGameSaveSubmitUpdateAsync\0";
 
 unsafe extern "system" fn get_quota_async(_t: This, p: *const Provider, block: *mut c_void) -> i32 {
+    first_call(8, "XGameSaveGetRemainingQuotaAsync");
     let Some(p) = p.as_ref() else { return E_INVALIDARG };
     xasync::run(block, OP_QUOTA, xasync::Payload::value(remaining(p)))
 }
 
 unsafe extern "system" fn get_quota_result(_t: This, block: *mut c_void, out: *mut i64) -> i32 {
+    first_call(9, "XGameSaveGetRemainingQuotaResult");
     xasync::value(block, OP_QUOTA, out)
 }
 
 unsafe extern "system" fn delete_container_async(t: This, p: *const Provider, name: *const u8, block: *mut c_void) -> i32 {
+    first_call(11, "XGameSaveDeleteContainerAsync");
     if p.is_null() || cstr(name).is_none() {
         return E_INVALIDARG;
     }
@@ -549,10 +577,12 @@ unsafe extern "system" fn delete_container_async(t: This, p: *const Provider, na
 }
 
 unsafe extern "system" fn status_result(_t: This, block: *mut c_void) -> i32 {
+    first_call(12, "XGameSaveDeleteContainerResult or XGameSaveSubmitUpdateResult");
     xasync::status(block)
 }
 
 unsafe extern "system" fn enumerate_containers_by_name(_t: This, p: *const Provider, prefix: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> i32 {
+    first_call(15, "XGameSaveEnumerateContainerInfoByName");
     let (Some(p), Some(cb)) = (p.as_ref(), cb) else { return E_INVALIDARG };
     let pre = cstr(prefix).unwrap_or_default();
     for info in p.store.containers() {
@@ -564,6 +594,7 @@ unsafe extern "system" fn enumerate_containers_by_name(_t: This, p: *const Provi
 }
 
 unsafe extern "system" fn enumerate_blobs_by_name(_t: This, c: *const Container, prefix: *const u8, ctx: *mut c_void, cb: Option<BlobCb>) -> i32 {
+    first_call(19, "XGameSaveEnumerateBlobInfoByName");
     let (Some(c), Some(cb)) = (c.as_ref(), cb) else { return E_INVALIDARG };
     let pre = cstr(prefix).unwrap_or_default();
     for (name, size) in (*c.provider).store.blobs(&c.name) {
@@ -588,6 +619,7 @@ unsafe fn wanted_names(c: &Container, names: *const *const u8, count: u32) -> Ve
 }
 
 unsafe extern "system" fn read_blob_data_async(_t: This, c: *const Container, names: *const *const u8, count: u32, block: *mut c_void) -> i32 {
+    first_call(21, "XGameSaveReadBlobDataAsync");
     let Some(c) = c.as_ref() else { return E_INVALIDARG };
     let store = &(*c.provider).store;
     let wanted = wanted_names(c, names, count);
@@ -614,6 +646,7 @@ unsafe extern "system" fn read_blob_data_async(_t: This, c: *const Container, na
 }
 
 unsafe extern "system" fn read_blob_data_result(_t: This, block: *mut c_void, size: usize, out: *mut u8, count: *mut u32) -> i32 {
+    first_call(22, "XGameSaveReadBlobDataResult");
     if count.is_null() {
         return E_INVALIDARG;
     }
@@ -639,6 +672,7 @@ unsafe extern "system" fn read_blob_data_result(_t: This, block: *mut c_void, si
 }
 
 unsafe extern "system" fn submit_blob_delete(_t: This, u: *mut Update, name: *const u8) -> i32 {
+    first_call(26, "XGameSaveSubmitBlobDelete");
     let Some(u) = u.as_mut() else { return E_INVALIDARG };
     let Some(n) = cstr(name).filter(|n| valid_name(n, 256)) else { return E_GS_INVALID_CONTAINER_NAME };
     u.writes.retain(|w| w.0 != n);
@@ -649,6 +683,7 @@ unsafe extern "system" fn submit_blob_delete(_t: This, u: *mut Update, name: *co
 }
 
 unsafe extern "system" fn submit_update_async(t: This, u: *const Update, block: *mut c_void) -> i32 {
+    first_call(28, "XGameSaveSubmitUpdateAsync");
     if u.is_null() {
         return E_INVALIDARG;
     }

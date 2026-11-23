@@ -593,7 +593,7 @@ unsafe extern "system" fn create_committed_resource(
         }
         unsafe { crate::rtcap::register(*ppv, &desc_copy[..0x38], init_state) };
         crate::res3d::note_create(unsafe { *ppv }, &desc_copy[..0x38], &format!("committed heapType={heap_type} heapFlags={heap_flags:#x} state={init_state:#x} backing={backing:x?}"));
-        if crate::rtcap::enabled() && desc_copy[0] == 1 && !pheap.is_null() {
+        if (crate::rtcap::enabled() || crate::passcap::tables_on()) && desc_copy[0] == 1 && !pheap.is_null() {
             let width = u64::from_le_bytes(desc_copy[0x10..0x18].try_into().unwrap());
             unsafe { crate::bindtrace::note_buffer(*ppv, width, *pheap) };
         }
@@ -1408,7 +1408,11 @@ unsafe fn patch_real_device(real: *mut c_void) {
             record("d3d12_xs", "bindtrace", "could not unprotect the device method table - descriptor trace disabled");
             return;
         }
+        let full = crate::rtcap::enabled();
         for (slot, f) in hooks {
+            if slot == 16 && !full {
+                continue;
+            }
             REAL_ORIG[slot].store(*vt.add(slot), Ordering::Relaxed);
             *vt.add(slot) = f;
         }
@@ -2142,7 +2146,7 @@ pub fn wrap_device(real: *mut c_void) -> *mut c_void {
         unsafe { crate::shader_xlat::probe_typed_atomic64(real) };
         crate::blend_probe::note_device(real);
     }
-    if crate::rtcap::enabled() && !real.is_null() {
+    if (crate::rtcap::enabled() || crate::passcap::tables_on()) && !real.is_null() {
         unsafe { patch_real_device(real) };
     }
     let w = Box::new(DeviceWrapper { vtable: vtable(), real, refs: AtomicU32::new(1) });

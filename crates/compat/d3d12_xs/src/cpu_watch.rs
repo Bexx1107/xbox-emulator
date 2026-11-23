@@ -12,6 +12,44 @@ extern "system" {
     fn GetWriteWatch(flags: u32, base: *mut c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
     fn GetModuleHandleA(name: *const u8) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn GetLastError() -> u32;
+    fn VirtualQuery(addr: *const c_void, mbi: *mut Mbi, len: usize) -> usize;
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct Mbi {
+    base: usize,
+    alloc_base: usize,
+    alloc_protect: u32,
+    partition: u16,
+    pad0: u16,
+    size: usize,
+    state: u32,
+    protect: u32,
+    ty: u32,
+    pad1: u32,
+}
+
+pub fn region(addr: usize) -> String {
+    let mut m = Mbi::default();
+    let n = unsafe { VirtualQuery(addr as *const c_void, &mut m, core::mem::size_of::<Mbi>()) };
+    if n == 0 {
+        return format!("VirtualQuery({addr:#x}) failed (error {})", unsafe { GetLastError() });
+    }
+    let ty = match m.ty {
+        0x2_0000 => "private",
+        0x4_0000 => "mapped",
+        0x100_0000 => "image",
+        _ => "none",
+    };
+    let st = match m.state {
+        0x1000 => "commit",
+        0x2000 => "reserve",
+        0x1_0000 => "free",
+        _ => "?",
+    };
+    format!("type={ty} state={st} protect={:#x} alloc_base={:#x} alloc_protect={:#x} region={:#x}+{:#x} va-alloc_base={:#x}", m.protect, m.alloc_base, m.alloc_protect, m.base, m.size, addr.wrapping_sub(m.alloc_base))
 }
 
 type OwnerFn = unsafe extern "system" fn(usize, *mut usize, *mut usize) -> u32;
@@ -136,7 +174,7 @@ pub fn take_dirty(lo: usize, hi: usize, buf: &mut Vec<usize>) -> Result<Vec<(usi
     let mut gran = 0u32;
     let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, a as *mut c_void, b - a, buf.as_mut_ptr() as *mut *mut c_void, &mut count, &mut gran) };
     if r != 0 {
-        return Err(r);
+        return Err(unsafe { GetLastError() });
     }
     let g = if gran == 0 { PAGE } else { gran as usize };
     Ok(runs(&buf[..count.min(pages)], g))

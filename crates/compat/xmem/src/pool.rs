@@ -105,7 +105,7 @@ pub fn preallocate(index: usize) -> bool {
         let gran = 1usize << sh;
         let mut ok = true;
         while (p.free.len() as u64) < p.hysteresis as u64 {
-            let c = reserve_aligned(gran, gran, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            let c = crate::write_watch::reserve(gran, gran, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
             if c.is_null() {
                 ok = false;
                 break;

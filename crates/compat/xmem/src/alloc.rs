@@ -120,7 +120,7 @@ pub fn default_alloc(size: usize, attributes: u64) -> *mut c_void {
         crate::write_note::committed(p as usize, len);
         return p;
     }
-    let p = reserve_aligned(len, align, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    let p = crate::write_watch::reserve(len, align, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if p.is_null() {
         let err = unsafe { GetLastError() };
         record(M, "XMemAllocDefault", &format!("size={size:#x} attrs={attributes:#x} align={align:#x} -> NULL (err={err})"));
@@ -128,6 +128,7 @@ pub fn default_alloc(size: usize, attributes: u64) -> *mut c_void {
     }
     track(p, Kind::Virtual(len), ty);
     account(ty, len, true);
+    crate::write_note::committed(p as usize, len);
     p
 }
 
@@ -165,14 +166,48 @@ type FreeHook = unsafe extern "system" fn(*mut c_void, u64);
 static ALLOC_HOOK: AtomicUsize = AtomicUsize::new(0);
 static FREE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
+fn alloc_log_type() -> Option<u32> {
+    static T: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let v = T.load(Ordering::Relaxed);
+    if v != usize::MAX {
+        return (v != usize::MAX - 1).then_some(v as u32);
+    }
+    let t = std::env::var("TOMBOX_XMEM_ALLOC_LOG").ok().and_then(|s| s.trim().parse::<u32>().ok()).filter(|t| *t < 16);
+    T.store(t.map_or(usize::MAX - 1, |t| t as usize), Ordering::Relaxed);
+    t
+}
+
+fn log_alloc(size: usize, attributes: u64, p: *mut c_void, hooked: bool) {
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    let a = Attr(attributes);
+    if alloc_log_type() != Some(a.memory_type()) || LOGGED.fetch_add(1, Ordering::Relaxed) >= 64 {
+        return;
+    }
+    record(
+        M,
+        "XMemAlloc",
+        &format!(
+            "type={} size={size:#x} end={:#x} attrs={attributes:#x} page_size={} align={:#x} -> {p:p}{}",
+            a.memory_type(),
+            p as usize + size,
+            a.page_size(),
+            a.effective_alignment(),
+            if hooked { " (title allocation hook)" } else { "" }
+        ),
+    );
+}
+
 #[no_mangle]
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
     let h = ALLOC_HOOK.load(Ordering::Acquire);
-    if h != 0 {
+    let p = if h != 0 {
         let f: AllocHook = unsafe { core::mem::transmute(h) };
-        return unsafe { f(size, attributes) };
-    }
-    default_alloc(size, attributes)
+        unsafe { f(size, attributes) }
+    } else {
+        default_alloc(size, attributes)
+    };
+    log_alloc(size, attributes, p, h != 0);
+    p
 }
 
 #[no_mangle]

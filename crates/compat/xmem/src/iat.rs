@@ -10,6 +10,7 @@ extern "system" {
     fn GetWindowsDirectoryW(out: *mut u16, len: u32) -> u32;
     fn GetModuleHandleExW(flags: u32, name: *const u16, out: *mut usize) -> i32;
     fn GetModuleHandleW(name: *const u16) -> usize;
+    fn ReadProcessMemory(process: Handle, addr: *const c_void, out: *mut c_void, len: usize, read: *mut usize) -> i32;
 }
 
 const MEM_PRIVATE: u32 = 0x2_0000;
@@ -62,21 +63,29 @@ unsafe fn cstr<'a>(a: usize, limit: usize) -> Option<&'a [u8]> {
     s.iter().position(|&c| c == 0).map(|n| &s[..n])
 }
 
+pub fn copy_out(addr: usize, out: &mut [u8]) -> bool {
+    let mut n = 0usize;
+    unsafe { ReadProcessMemory(GetCurrentProcess(), addr as *const c_void, out.as_mut_ptr() as *mut c_void, out.len(), &mut n) != 0 && n == out.len() }
+}
+
 pub fn image_size(base: usize) -> Option<usize> {
-    unsafe {
-        if !readable(base, 0x400) || core::ptr::read_unaligned(base as *const u16) != 0x5a4d {
-            return None;
-        }
-        let lfanew = rd32(base + 0x3c) as usize;
-        if lfanew > 0x1000 || !readable(base + lfanew, 0x108) || rd32(base + lfanew) != 0x4550 {
-            return None;
-        }
-        let opt = base + lfanew + 24;
-        if core::ptr::read_unaligned(opt as *const u16) != 0x20b {
-            return None;
-        }
-        Some(rd32(opt + 56) as usize)
+    let mut dos = [0u8; 0x40];
+    if !copy_out(base, &mut dos) || dos[0] != b'M' || dos[1] != b'Z' {
+        return None;
     }
+    let lfanew = u32::from_le_bytes(dos[0x3c..0x40].try_into().unwrap()) as usize;
+    if lfanew > 0x1000 {
+        return None;
+    }
+    let mut nt = [0u8; 0x108];
+    if !copy_out(base + lfanew, &mut nt) || nt[..4] != *b"PE\0\0" {
+        return None;
+    }
+    let opt = 24;
+    if u16::from_le_bytes([nt[opt], nt[opt + 1]]) != 0x20b {
+        return None;
+    }
+    Some(u32::from_le_bytes(nt[opt + 56..opt + 60].try_into().unwrap()) as usize)
 }
 
 unsafe fn write_slot(slot: usize, value: usize) -> bool {
@@ -292,6 +301,45 @@ mod tests {
 
     extern "system" {
         fn GetModuleHandleW(name: *const u16) -> usize;
+    }
+
+    #[test]
+    fn private_image_scan_survives_regions_freed_while_scanning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static STOP: AtomicBool = AtomicBool::new(false);
+        STOP.store(false, Ordering::Release);
+        let churn = std::thread::spawn(|| {
+            let mut n = 0u64;
+            while !STOP.load(Ordering::Acquire) {
+                let p = unsafe { VirtualAlloc(core::ptr::null_mut(), 0x2_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+                if p != 0 {
+                    unsafe {
+                        let b = p as *mut u8;
+                        *b = b'M';
+                        *b.add(1) = b'Z';
+                        core::ptr::write_unaligned((p + 0x3c) as *mut u32, 0x80);
+                        core::ptr::copy_nonoverlapping(b"PE\0\0".as_ptr(), b.add(0x80), 4);
+                        core::ptr::write_unaligned((p + 0x80 + 24) as *mut u16, 0x20b);
+                        core::ptr::write_unaligned((p + 0x80 + 24 + 56) as *mut u32, 0x2_0000);
+                        VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+                    }
+                    n += 1;
+                }
+            }
+            n
+        });
+        let mut scans = 0;
+        let t0 = std::time::Instant::now();
+        while scans < 40 || t0.elapsed() < std::time::Duration::from_millis(300) {
+            let _ = title_modules();
+            scans += 1;
+            if scans >= 400 {
+                break;
+            }
+        }
+        STOP.store(true, Ordering::Release);
+        let churned = churn.join().unwrap();
+        assert!(churned > 0 && scans >= 40, "churned {churned} scans {scans}");
     }
 
     #[test]

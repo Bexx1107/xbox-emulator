@@ -11,10 +11,10 @@ mod range_hooks;
 mod stats;
 mod sys;
 mod title_acct;
-#[cfg(test)]
-mod test_veh;
 mod virt;
 mod write_note;
+mod write_watch;
+mod ww_heap;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

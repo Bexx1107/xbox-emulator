@@ -961,6 +961,7 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     if real.is_empty() {
         return;
     }
+    crate::upload::submit_hook(queue);
     crate::sys_ts::note_queue(queue, REAL_QVT[16].load(Ordering::Relaxed), REAL_QVT[17].load(Ordering::Relaxed));
     crate::rtcap::note_submit(queue as usize, &title, &real);
     let split = crate::cl2_state::before_execute(queue, &real);

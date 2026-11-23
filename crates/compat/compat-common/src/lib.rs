@@ -26,6 +26,7 @@ fn log_path() -> &'static std::path::PathBuf {
 pub mod net_guard;
 pub mod netview;
 pub mod locale;
+pub mod physical_pages;
 pub mod gdk_user;
 pub mod gdk_store;
 pub mod gdk;
@@ -40,6 +41,7 @@ pub mod live;
 pub mod title_os;
 pub mod kmd_bridge;
 pub mod private_heap;
+pub mod partition_heap;
 pub mod headless;
 pub mod iat;
 

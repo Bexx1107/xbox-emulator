@@ -77,8 +77,9 @@ fn virtual_alloc_inner(address: *mut c_void, size: usize, alloc_type: u32, attri
         }
     }
     let p = crate::phys::serialized(|| {
-        if base == 0 && wt & MEM_RESERVE != 0 && gran > 0x1_0000 {
-            reserve_aligned(len, gran, wt, wp)
+        if wt & MEM_RESERVE != 0 {
+            let align = if base == 0 && gran > 0x1_0000 { gran } else { 0 };
+            crate::write_watch::reserve_at(base, len, align, wt, wp)
         } else {
             unsafe { VirtualAlloc(base as *mut c_void, len, wt, wp) }
         }

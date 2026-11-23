@@ -67,28 +67,29 @@ pub unsafe fn built_by_us(base: usize) -> bool {
     if let Some(&v) = BUILT.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&(base, size)) {
         return v;
     }
-    let pe = base + core::ptr::read_unaligned((base + 0x3c) as *const u32) as usize;
-    let nsec = core::ptr::read_unaligned((pe + 6) as *const u16) as usize;
-    let opt = core::ptr::read_unaligned((pe + 20) as *const u16) as usize;
+    let rd = |a: usize, n: usize| -> Option<Vec<u8>> {
+        let mut v = vec![0u8; n];
+        if crate::iat::copy_out(a, &mut v) { Some(v) } else { None }
+    };
+    let Some(dos) = rd(base + 0x3c, 4) else { return false };
+    let pe = base + u32::from_le_bytes(dos[..4].try_into().unwrap()) as usize;
+    let Some(fh) = rd(pe, 24) else { return false };
+    let nsec = u16::from_le_bytes([fh[6], fh[7]]) as usize;
+    let opt = u16::from_le_bytes([fh[20], fh[21]]) as usize;
     let first = pe + 24 + opt;
     let mut found = false;
     for i in 0..nsec.min(96) {
-        let s = first + i * 40;
-        if !crate::iat::readable(s, 40) {
-            break;
-        }
-        let vsize = core::ptr::read_unaligned((s + 8) as *const u32) as usize;
-        let va = core::ptr::read_unaligned((s + 12) as *const u32) as usize;
-        let ch = core::ptr::read_unaligned((s + 36) as *const u32);
+        let Some(h) = rd(first + i * 40, 40) else { break };
+        let u32at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+        let (vsize, va, ch) = (u32at(8) as usize, u32at(12) as usize, u32at(36));
         if ch & (SCN_MEM_EXECUTE | SCN_UNINITIALIZED) != 0 || vsize == 0 || va + vsize > size {
             continue;
         }
-        if !crate::iat::readable(base + va, vsize) {
-            continue;
-        }
-        if has_rust_marks(core::slice::from_raw_parts((base + va) as *const u8, vsize)) {
-            found = true;
-            break;
+        if let Some(data) = rd(base + va, vsize) {
+            if has_rust_marks(&data) {
+                found = true;
+                break;
+            }
         }
     }
     BUILT.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert((base, size), found);

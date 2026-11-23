@@ -9,6 +9,7 @@ pub mod plm;
 pub mod quiesce;
 pub mod routes;
 pub mod routes_rt;
+pub mod webm_probe;
 
 use core::ffi::c_void;
 use patch::Hook;
@@ -175,6 +176,7 @@ unsafe fn install() {
     k32legacy::publish();
     let n = sweep_now();
     fortnite_match::apply();
+    webm_probe::start();
     let watching = watch_loads();
     let n = n + if watching { unsafe { routes::sweep(hook_table(), &mut Vec::new()) } } else { 0 };
     crate::record_raw("os_host", "install", &format!("{n} import slots patched; late-load watch {}; {}", if watching { "on" } else { "UNAVAILABLE" }, coverage::summary()));

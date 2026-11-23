@@ -1035,3 +1035,6 @@ mod cl_fw_hw;
 
 #[path = "device_place_hw.rs"]
 mod device_place_hw;
+
+#[path = "upload_ww_hw.rs"]
+mod upload_ww_hw;

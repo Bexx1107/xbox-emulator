@@ -397,6 +397,11 @@ try {
       $ra += @('-Overlay', (Join-Path $TestRoot 'XDefiant'), '-Drive', $Spec.Drive)
     }
   }
+  if ($Title -in @('trackmania', 'terraria')) {
+    if ($Env.ContainsKey('TOMBOX_AGILITY_PATH')) { $ra += @('-Agility', "`"$($Env['TOMBOX_AGILITY_PATH'])`"") }
+    if ($Env.ContainsKey('TOMBOX_AGILITY_VERSION')) { $ra += @('-AgilityVersion', "$($Env['TOMBOX_AGILITY_VERSION'])") }
+    if ($Env.ContainsKey('TOMBOX_D3D12_DEBUG') -and "$($Env['TOMBOX_D3D12_DEBUG'])" -ne '0') { $ra += '-D3d12Debug' }
+  }
   if ($GameArgs) { $ra += @('-GameArgs', "`"$GameArgs`"") }
   Say ("  launch: powershell {0}" -f ($ra -join ' ')) 'DarkGray'
   if ($Env.Count) { Say ("  env: {0}" -f (($Env.Keys | ForEach-Object { "$_=$($Env[$_])" }) -join ' ')) 'DarkGray' }
