@@ -299,20 +299,20 @@ fn pk_int16(m: &str, ins: &Insn) -> Result<Option<String>, String> {
         return Err(format!("{m}: NEG/NEG_HI on an integer packed op"));
     }
     let clamp = (w0 >> 15) & 1 != 0;
-    if clamp && !matches!(m, "v_pk_add_i16" | "v_pk_sub_i16" | "v_pk_add_u16" | "v_pk_sub_u16" | "v_pk_max_i16" | "v_pk_min_i16" | "v_pk_max_u16" | "v_pk_min_u16") {
+    if clamp && !matches!(m, "v_pk_add_i16" | "v_pk_sub_i16" | "v_pk_add_u16" | "v_pk_sub_u16" | "v_pk_mad_u16" | "v_pk_mad_i16" | "v_pk_max_i16" | "v_pk_min_i16" | "v_pk_max_u16" | "v_pk_min_u16") {
         return Err(format!("{m}: CLAMP on an integer packed op without a defined saturation"));
     }
     let src: Vec<&Opnd> = (0..nsrc).map(|i| ins.src.get(i).ok_or_else(|| format!("{m}: missing source {i}"))).collect::<Result<_, _>>()?;
-    if let Some(o) = src.iter().find(|o| matches!(o, Opnd::ConstF32(_))) {
-        return Err(format!("{m}: inline float constant {o:?} on an integer packed op"));
-    }
     let sel = [(w0 >> 11) & 7, ((w1 >> 27) & 3) | (((w0 >> 14) & 1) << 2)];
     let mut halves = Vec::new();
     for h in sel {
         let mut u = Vec::new();
         let mut i = Vec::new();
         for (k, o) in src.iter().enumerate() {
-            let x = r(o)?;
+            let x = match o {
+                Opnd::ConstF32(f) => format!("{:#x}u", f.to_bits()),
+                _ => r(o)?,
+            };
             if (h >> k) & 1 != 0 {
                 u.push(format!("(({x}) >> 16)"));
                 i.push(format!("(asint({x}) >> 16)"));
@@ -327,7 +327,9 @@ fn pk_int16(m: &str, ins: &Insn) -> Result<Option<String>, String> {
             "v_pk_lshrrev_b16" => format!("({} >> ({} & 15u))", u[1], u[0]),
             "v_pk_ashrrev_i16" => format!("asuint({} >> (int)({} & 15u))", i[1], u[0]),
             "v_pk_mul_lo_u16" => format!("({} * {})", v[0], v[1]),
+            "v_pk_mad_u16" if clamp => format!("min({} * {} + {}, 0xffffu)", v[0], v[1], v[2]),
             "v_pk_mad_u16" => format!("({} * {} + {})", v[0], v[1], v[2]),
+            "v_pk_mad_i16" if clamp => format!("asuint(clamp({} * {} + {}, -32768, 32767))", v[0], v[1], v[2]),
             "v_pk_mad_i16" => format!("asuint({} * {} + {})", v[0], v[1], v[2]),
             "v_pk_add_u16" if clamp => format!("min({} + {}, 0xffffu)", v[0], v[1]),
             "v_pk_add_u16" => format!("({} + {})", v[0], v[1]),

@@ -694,10 +694,12 @@ fn vop3p_int16_names_follow_the_rdna2_opcode_table() {
 fn vop3p_int16_refuses_modifiers_without_defined_integer_semantics() {
     let err = |w: [u32; 2]| translate(&shader(&program(&w), None)).err().unwrap_or_default();
     assert!(err(vop3p(0x0a, 0, [v(1), v(2), 0], 7, 0b010, false)).contains("NEG/NEG_HI on an integer packed op"));
-    assert!(err(vop3p(0x09, 0, [v(1), v(2), v(3)], 7, 0, true)).contains("CLAMP on an integer packed op"));
     assert!(err(vop3p(0x01, 0, [v(1), v(2), 0], 7, 0, true)).contains("CLAMP on an integer packed op"));
     assert!(err(vop3p(0x04, 0, [v(1), v(2), 0], 7, 0, true)).contains("CLAMP on an integer packed op"));
-    assert!(err(vop3p(0x0a, 0, [v(1), 242, 0], 7, 0, false)).contains("inline float constant"));
+    check("v_pk_add_u16", &program(&vop3p(0x0a, 0, [v(1), 242, 0], 7, 0, false)), None, &[]);
+    for op in [0x00, 0x09] {
+        check("clamp", &program(&vop3p(op, 0, [v(1), v(2), v(3)], 7, 0, true)), None, &[]);
+    }
     for op in [0x02, 0x03, 0x07, 0x0a, 0x0b, 0x0d] {
         check("clamp", &program(&vop3p(op, 0, [v(1), v(2), 0], 7, 0, true)), None, &[]);
     }
