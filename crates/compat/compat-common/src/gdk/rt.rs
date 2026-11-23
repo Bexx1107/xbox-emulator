@@ -842,7 +842,7 @@ pub unsafe fn begin(block: *mut Block, ctx: *mut c_void, identity: usize, _name:
     states().lock().unwrap_or_else(|e| e.into_inner()).insert(block as usize, s.clone());
     mark(block, E_PENDING, true);
     let hr = call(&s, 0, block, 0, core::ptr::null_mut());
-    if hr < 0 {
+    if hr < 0 && hr != E_PENDING {
         complete_state(&s, block, hr, 0);
     }
     S_OK
@@ -880,6 +880,9 @@ pub unsafe fn complete(block: *mut Block, hr: i32, size: usize) {
 }
 
 unsafe fn complete_state(s: &Arc<AState>, block: *mut Block, hr: i32, size: usize) {
+    if hr == E_PENDING {
+        return;
+    }
     {
         let mut st = s.status.lock().unwrap_or_else(|e| e.into_inner());
         if st.0 != E_PENDING {

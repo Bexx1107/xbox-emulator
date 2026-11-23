@@ -275,6 +275,7 @@ pub fn gds_copy_plan(to_gds: bool, dword: u32, count: u32, mem_state: u32, mem_u
 }
 
 pub unsafe fn copy(list: *mut c_void, to_gds: bool, dword: u32, count: u32, va: u64, what: &str) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::COPY) };
     if count == 0 {
         return;
     }

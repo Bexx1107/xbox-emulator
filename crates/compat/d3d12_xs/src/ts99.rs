@@ -382,6 +382,7 @@ unsafe fn bind(list: *mut c_void, p: Pipe, s: Scratch) {
 }
 
 unsafe fn dispatch(list: *mut c_void, cal: &Calibration, base: u32, count: u32) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     let k = constants(cal, base, count);
     unsafe {
         let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_CONSTANTS));
@@ -392,6 +393,7 @@ unsafe fn dispatch(list: *mut c_void, cal: &Calibration, base: u32, count: u32) 
 }
 
 pub unsafe fn emit(list: *mut c_void, heap: *mut c_void, start: u32, n: u32, dst: usize, off: u64, dst_state: Option<u32>) -> bool {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     if n == 0 {
         return true;
     }

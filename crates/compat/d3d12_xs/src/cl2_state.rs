@@ -1204,6 +1204,7 @@ unsafe fn pc_resolve(list: *mut c_void, heap: usize, ty: u32, index: u32, dst: u
 }
 
 unsafe fn suspend_queries(list: *mut c_void) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     let qs = with(list, |s| s.queries.clone());
     if qs.is_empty() {
         return;
@@ -1248,6 +1249,7 @@ unsafe fn resume_queries(list: *mut c_void) {
 }
 
 pub(crate) unsafe fn pause_queries(list: *mut c_void, occlusion_only: bool) -> Vec<(usize, u32, u32)> {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     let qs: Vec<ActiveQuery> = with(list, |s| if s.suspended { Vec::new() } else { s.queries.iter().filter(|q| !occlusion_only || q.ty <= 1).cloned().collect() });
     if qs.is_empty() {
         return Vec::new();
@@ -1342,6 +1344,7 @@ pub(crate) fn test_restore(saved: Vec<usize>) {
 }
 
 unsafe fn accumulate(list: *mut c_void, heap: usize, ty: u32, dst: *mut c_void, plan: &[(u32, u64, u32, u32, Vec<u32>)]) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     let Some(p) = (unsafe { query_pipe(list) }) else { return };
     let key = crate::list_split::origin_of(list);
     let cp: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64) = unsafe { core::mem::transmute(pc_list_slot(list, PC_COPY_BUFFER)) };
@@ -1551,6 +1554,7 @@ pub(crate) fn query_parts(list: *mut c_void) -> Vec<Vec<u32>> {
 }
 
 pub(crate) unsafe fn close_part_into(list: *mut c_void, slots: &[Option<u32>]) -> i32 {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     let qs = with(list, |s| if s.open { s.queries.clone() } else { Vec::new() });
     if !qs.is_empty() {
         for q in &qs {

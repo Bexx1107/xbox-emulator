@@ -494,6 +494,7 @@ unsafe fn sources(list: *mut c_void, srcs: &[(usize, u32)], to_copy: bool) {
 }
 
 unsafe fn predicate_pass(list: *mut c_void, c: &Call, slots: u32, n: u64, l: &Layout, w: &Where, (rs, pso): (usize, usize)) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     let s = w.s;
     let k = constants(n, w.in_off, w.pred_off, c.max_size, c.size_buf != 0, c.title.map(|t| t.2), l, c.live.len());
     let (gx, gy) = dispatch_dims(n);

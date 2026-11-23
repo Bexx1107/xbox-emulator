@@ -656,6 +656,7 @@ unsafe fn own_rtv(dev: *mut c_void, res: usize, view: &Option<[u8; 24]>, heaps: 
 }
 
 unsafe fn flush_sel(list: *mut c_void, eager: bool, sel: Sel) {
+    let _ij = crate::inject::mark(crate::inject::DRAW);
     if !enabled() {
         return;
     }

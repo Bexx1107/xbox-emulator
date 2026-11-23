@@ -127,6 +127,11 @@ pub fn all_views() -> Vec<(usize, bool)> {
 }
 
 pub fn note_desc(dest: usize, d: Desc) {
+    match &d {
+        Desc::Srv { res, .. } => crate::firstuse::note(*res, crate::firstuse::SRV),
+        Desc::Uav { res, .. } => crate::firstuse::note(*res, crate::firstuse::UAV),
+        _ => {}
+    }
     with(|s| {
         let frame = s.frame;
         s.descs.insert(dest, Entry { d, frame });
@@ -445,6 +450,44 @@ pub fn table_srv_fmt(list: usize, compute: bool, param: u32, slot: u32) -> Optio
     })
 }
 
+pub fn table_uav(list: usize, compute: bool, param: u32, slot: u32) -> Option<(usize, Option<[u8; 40]>)> {
+    with(|s| {
+        let h = *s.tables.get(&(list, compute))?.get(param as usize)?;
+        if h == 0 {
+            return None;
+        }
+        let heap = s.heaps.iter().find(|x| x.gpu != 0 && x.inc != 0 && h >= x.gpu && h < x.gpu + (x.count * x.inc) as u64)?;
+        let idx = (h - heap.gpu) as usize / heap.inc + slot as usize;
+        if idx >= heap.count {
+            return None;
+        }
+        let cpu = heap.cpu + idx * heap.inc;
+        let d = match s.descs.get(&cpu) {
+            Some(e) => e.d.clone(),
+            None => unsafe { desc_bytes(cpu, heap.inc) }.and_then(|b| s.by_bytes.get(&b).cloned())?,
+        };
+        match d {
+            Desc::Uav { res, desc } => Some((res, desc)),
+            _ => None,
+        }
+    })
+}
+
+pub fn uav_view_text(desc: Option<[u8; 40]>) -> String {
+    let Some(d) = desc else { return "default view (null desc)".to_string() };
+    let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+    let (fmt, dim) = (u(0), u(4));
+    match dim {
+        4 => format!("fmt={fmt} Texture2D MipSlice={} PlaneSlice={}", u(8), u(12)),
+        5 => format!("fmt={fmt} Texture2DArray MipSlice={} First={} Size={} PlaneSlice={}", u(8), u(12), u(16), u(20)),
+        3 => format!("fmt={fmt} Texture1DArray MipSlice={} First={} Size={}", u(8), u(12), u(16)),
+        2 => format!("fmt={fmt} Texture1D MipSlice={}", u(8)),
+        8 => format!("fmt={fmt} Texture3D MipSlice={} FirstW={} WSize={}", u(8), u(12), u(16)),
+        1 => format!("fmt={fmt} Buffer first={} n={} stride={}", u64::from_le_bytes(d[8..16].try_into().unwrap()), u(16), u(20)),
+        _ => format!("fmt={fmt} ViewDimension={dim}"),
+    }
+}
+
 pub fn table_count(list: usize, compute: bool) -> usize {
     with(|s| s.tables.get(&(list, compute)).map_or(0, |t| t.len()))
 }
@@ -573,7 +616,8 @@ pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -
                 } else {
                     " not placed".to_string()
                 };
-                out.push_str(&format!("    param[{}]+{} {kind} {what} | {view}{aged}{st}{loc}\n", it.param, it.slot));
+                let fu = if res == 0 { String::new() } else { crate::firstuse::describe(res) };
+                out.push_str(&format!("    param[{}]+{} {kind} {what} | {view}{aged}{st}{loc}{fu}\n", it.param, it.slot));
             }
             Desc::Sampler { desc } => {
                 let u = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());

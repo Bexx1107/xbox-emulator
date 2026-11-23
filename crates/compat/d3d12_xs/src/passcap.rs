@@ -386,7 +386,16 @@ pub fn label_of(res: usize, d: &[u8; 0x38]) -> String {
 }
 
 fn barrier_sub0(res: usize, before: u32, after: u32) -> [u64; 4] {
-    [0, res as u64, (before as u64) << 32, after as u64]
+    barrier_sub(res, 0, before, after)
+}
+
+fn barrier_sub(res: usize, sub: u32, before: u32, after: u32) -> [u64; 4] {
+    [0, res as u64, ((before as u64) << 32) | sub as u64, after as u64]
+}
+
+pub fn mips_on() -> bool {
+    static M: OnceLock<bool> = OnceLock::new();
+    *M.get_or_init(|| std::env::var("TOMBOX_PASSCAP_MIPS").map(|v| v.trim() == "1").unwrap_or(false))
 }
 
 unsafe fn committed(dev: usize, heap: u32, desc: &[u8; 0x38], state: u32) -> Result<usize, i32> {
@@ -424,9 +433,17 @@ pub unsafe fn list_device(list: usize) -> Option<usize> {
 }
 
 pub unsafe fn inject(dev: usize, list: usize, res: usize, state: u32, slot: &str, budget_left: u64) -> Result<Cap, String> {
+    inject_mip(dev, list, res, state, slot, budget_left, 0)
+}
+
+pub unsafe fn inject_mip(dev: usize, list: usize, res: usize, state: u32, slot: &str, budget_left: u64, mip: u32) -> Result<Cap, String> {
     let d = desc_of(res);
     let label = label_of(res, &d);
     let (dim, w, h, fmt, samples, flags) = (d32(&d, 0), u64::from_le_bytes(d[0x10..0x18].try_into().unwrap()) as usize, d32(&d, 0x18) as usize, d32(&d, 0x20), d32(&d, 0x24), d32(&d, 0x30));
+    let mips = u16::from_le_bytes([d[0x1e], d[0x1f]]) as u32;
+    if mip > 0 && (samples > 1 || mip >= mips.max(1)) {
+        return Err(format!("{label}: mip {mip} not capturable (samples {samples}, mips {mips})"));
+    }
     if dim != 3 {
         return Err(format!("{label}: dimension {dim} is not a 2D texture"));
     }
@@ -452,10 +469,12 @@ pub unsafe fn inject(dev: usize, list: usize, res: usize, state: u32, slot: &str
     let mut fp = [0u8; 32];
     let (mut rows, mut row_size, mut total) = (0u32, 0u64, 0u64);
     call!(dev, 38, fn(*const u8, u32, u32, u64, *mut [u8; 32], *mut u32, *mut u64, *mut u64) -> (),
-        cd.as_ptr(), 0, 1, 0, &mut fp, &mut rows, &mut row_size, &mut total);
+        cd.as_ptr(), mip, 1, 0, &mut fp, &mut rows, &mut row_size, &mut total);
     if total == 0 || total == u64::MAX {
         return Err(format!("{label}: no copyable footprint"));
     }
+    let (w, h) = if mip == 0 { (w, h) } else { (u32::from_le_bytes(fp[0x0c..0x10].try_into().unwrap()) as usize, u32::from_le_bytes(fp[0x10..0x14].try_into().unwrap()) as usize) };
+    fp[0..8].copy_from_slice(&0u64.to_le_bytes());
     let tmp_bytes = if samples > 1 { total } else { 0 };
     if total + tmp_bytes > budget_left {
         return Err(format!("{label}: budget exhausted ({} MB left)", budget_left >> 20));
@@ -483,7 +502,7 @@ pub unsafe fn inject(dev: usize, list: usize, res: usize, state: u32, slot: &str
         (tmp, tmp)
     } else {
         if state != ST_COPY_SOURCE {
-            list_call_barrier(list, &[barrier_sub0(res, state, ST_COPY_SOURCE)]);
+            list_call_barrier(list, &[barrier_sub(res, mip, state, ST_COPY_SOURCE)]);
         }
         (res, 0)
     };
@@ -493,10 +512,11 @@ pub unsafe fn inject(dev: usize, list: usize, res: usize, state: u32, slot: &str
     dst[16..48].copy_from_slice(&fp);
     let mut sl = [0u8; 48];
     sl[0..8].copy_from_slice(&(src as u64).to_le_bytes());
+    sl[16..20].copy_from_slice(&mip.to_le_bytes());
     let f: unsafe extern "system" fn(*mut c_void, *const u8, u32, u32, u32, *const u8, *const c_void) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list as *mut c_void, PC_COPY_TEXTURE_REGION));
     f(list as *mut c_void, dst.as_ptr(), 0, 0, 0, sl.as_ptr(), core::ptr::null());
     if samples <= 1 && state != ST_COPY_SOURCE {
-        list_call_barrier(list, &[barrier_sub0(res, ST_COPY_SOURCE, state)]);
+        list_call_barrier(list, &[barrier_sub(res, mip, ST_COPY_SOURCE, state)]);
     }
     let read_fmt = u32::from_le_bytes(fp[0x08..0x0c].try_into().unwrap());
     Ok(Cap { idx: 0, slot: slot.to_string(), res, label, w, h, fmt, read_fmt, samples, state, state_src: "caller", rb, tmp, pitch, total: total + tmp_bytes })
@@ -718,6 +738,10 @@ fn budget_left(shot: &Shot) -> u64 {
 }
 
 unsafe fn capture_into(g: &mut G, list: usize, res: usize, state: u32, state_src: &'static str, slot: &str) -> Result<usize, String> {
+    capture_into_mip(g, list, res, state, state_src, slot, 0)
+}
+
+unsafe fn capture_into_mip(g: &mut G, list: usize, res: usize, state: u32, state_src: &'static str, slot: &str, mip: u32) -> Result<usize, String> {
     if g.device == 0 {
         g.device = list_device(list).ok_or("GetDevice failed")?;
     }
@@ -729,7 +753,7 @@ unsafe fn capture_into(g: &mut G, list: usize, res: usize, state: u32, state_src
         shot.budget_note.get_or_insert(n.clone());
         return Err(n);
     }
-    let mut c = inject(dev, list, res, state, slot, budget_left(shot)).inspect_err(|e| {
+    let mut c = inject_mip(dev, list, res, state, slot, budget_left(shot), mip).inspect_err(|e| {
         if e.contains("budget") {
             shot.budget_note.get_or_insert(e.clone());
         }
@@ -787,6 +811,15 @@ unsafe fn boundary(g: &mut G, list: *mut c_void, end: &str) {
         match capture_into(g, list as usize, r, s, why, &name) {
             Ok(i) => pass.caps.push(i),
             Err(e) => pass.notes.push(format!("{name}: {e}")),
+        }
+        if mips_on() && !depth {
+            let mips = u16::from_le_bytes([desc_of(r)[0x1e], desc_of(r)[0x1f]]) as u32;
+            for m in 1..mips.min(16) {
+                match capture_into_mip(g, list as usize, r, s, why, &format!("{name}m{m}"), m) {
+                    Ok(i) => pass.caps.push(i),
+                    Err(e) => pass.notes.push(format!("{name} mip {m}: {e}")),
+                }
+            }
         }
     }
     let shot = g.shot.as_mut().unwrap();
@@ -1113,6 +1146,56 @@ unsafe extern "system" fn set_graphics_root_sig(this: *mut c_void, rs: *mut c_vo
     f(this, rs)
 }
 
+unsafe extern "system" fn set_compute_table(this: *mut c_void, i: u32, h: u64) {
+    if !crate::rtcap::enabled() && tables_on() {
+        crate::bindtrace::set_table(this as usize, true, i, h);
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(prev(35));
+    f(this, i, h)
+}
+
+fn cs_of(pso: usize) -> u64 {
+    let real = crate::pso_async::real_of(pso);
+    for p in [pso, real] {
+        if p == 0 {
+            continue;
+        }
+        if let Some((_, c)) = crate::device_x::pso_stage_codes(p).into_iter().find(|(n, _)| *n == "cs") {
+            return crate::shader_xlat::origin_hash(c).unwrap_or(1);
+        }
+    }
+    0
+}
+
+fn note_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    with(|g| {
+        if g.shot.is_none() {
+            return;
+        }
+        let k = key(this);
+        let Some(st) = g.lists.get(&k) else { return };
+        if st.probe_notes.iter().filter(|n| n.starts_with("dispatch ")).count() >= 24 {
+            return;
+        }
+        let (pso, n) = (st.pso, st.dispatches);
+        let cs = cs_of(pso);
+        let mut uavs = Vec::new();
+        for param in 0..crate::bindtrace::table_count(this as usize, true).min(16) as u32 {
+            for slot in 0..16u32 {
+                if let Some((res, d)) = crate::bindtrace::table_uav(this as usize, true, param, slot) {
+                    let lab = if res == 0 { "null".to_string() } else { cached_label(g, res) };
+                    uavs.push(format!("param[{param}]+{slot} UAV {lab} | {}", crate::bindtrace::uav_view_text(d)));
+                }
+            }
+        }
+        let st = g.lists.get_mut(&k).unwrap();
+        st.probe_notes.push(format!("dispatch {n} cs={cs:016x} pso={pso:#x} groups={x}x{y}x{z}: {} compute-table UAVs (TOMBOX_PASSCAP: wave size and LDS come from translating cs offline)", uavs.len()));
+        for u in uavs.into_iter().take(32) {
+            st.probe_notes.push(format!("  {u}"));
+        }
+    });
+}
+
 unsafe extern "system" fn set_graphics_table(this: *mut c_void, i: u32, h: u64) {
     if !crate::rtcap::enabled() && tables_on() {
         crate::bindtrace::set_table(this as usize, false, i, h);
@@ -1255,6 +1338,9 @@ unsafe extern "system" fn draw_indexed(this: *mut c_void, a: u32, b: u32, c: u32
 }
 unsafe extern "system" fn dispatch(this: *mut c_void, a: u32, b: u32, c: u32) {
     note_draw(this, 2);
+    if ACTIVE.load(Ordering::Relaxed) {
+        note_dispatch(this, a, b, c);
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(prev(14));
     f(this, a, b, c)
 }
@@ -1472,8 +1558,8 @@ pub fn install(vt: &[AtomicUsize]) {
     if !on() {
         return;
     }
-    let hooks: [(usize, usize); 25] = [
-        (36, set_graphics_table as *const () as usize), (24, set_stencil_ref as *const () as usize), (42, set_graphics_root_cbv as *const () as usize), (34, set_graphics_root_sig as *const () as usize), (38, set_graphics_root_c1 as *const () as usize), (40, set_graphics_root_cn as *const () as usize),
+    let hooks: [(usize, usize); 26] = [
+        (36, set_graphics_table as *const () as usize), (35, set_compute_table as *const () as usize), (24, set_stencil_ref as *const () as usize), (42, set_graphics_root_cbv as *const () as usize), (34, set_graphics_root_sig as *const () as usize), (38, set_graphics_root_c1 as *const () as usize), (40, set_graphics_root_cn as *const () as usize),
         (9, close as *const () as usize), (10, reset as *const () as usize), (12, draw as *const () as usize), (13, draw_indexed as *const () as usize), (14, dispatch as *const () as usize),
         (16, copy_region as *const () as usize), (17, copy_resource as *const () as usize), (19, resolve as *const () as usize), (25, set_pso as *const () as usize), (26, barrier as *const () as usize),
         (50, om_set_targets as *const () as usize), (51, clear_dsv as *const () as usize), (52, clear_rtv as *const () as usize), (59, indirect as *const () as usize), (83, copy_region_x as *const () as usize),
@@ -1492,7 +1578,7 @@ pub fn install(vt: &[AtomicUsize]) {
     }
     let s = sel().unwrap();
     record("d3d12_xs", "passcap", &format!(
-        "TOMBOX_PASSCAP armed: shots at t={:?} s after first present, presents={:?}, file trigger={} ({}\\now or %TEMP%\\tombox_passcap_now), frames/shot={}, budget {} MB / {} captures, chain log every {} presents, output {}; hooks chained on Xbox slots 9,10,12,13,14,16,17,19,24,25,26,34,36,38,40,42,50,51,52,59,81,83,84,98,127; probe PS {:x?}{}{} (draws are never skipped or changed; captures add barrier+copy commands only on capture frames)",
+        "TOMBOX_PASSCAP armed: shots at t={:?} s after first present, presents={:?}, file trigger={} ({}\\now or %TEMP%\\tombox_passcap_now), frames/shot={}, budget {} MB / {} captures, chain log every {} presents, output {}; hooks chained on Xbox slots 9,10,12,13,14,16,17,19,24,25,26,34,35,36,38,40,42,50,51,52,59,81,83,84,98,127; probe PS {:x?}{}{} (draws are never skipped or changed; captures add barrier+copy commands only on capture frames)",
         s.secs, s.presents, s.file, out_root().display(), s.frames, s.budget_mb, s.max_caps, s.chain_every, out_root().display(), probe_hashes(),
         if missing.is_empty() { String::new() } else { format!("; empty slots left alone: {missing:?}") },
         if s.unknown.is_empty() { String::new() } else { format!("; ignored tokens {:?}", s.unknown) }));

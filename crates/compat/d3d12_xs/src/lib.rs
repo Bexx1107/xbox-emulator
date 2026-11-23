@@ -42,6 +42,8 @@ mod blend_probe;
 mod gpuprof;
 mod gpuprof_q;
 mod va_census;
+mod firstuse;
+mod inject;
 mod slowcall;
 mod console_slots;
 mod console_slots_cl2;

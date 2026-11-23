@@ -59,6 +59,41 @@ pub fn decode_name(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+pub const BLOB_ENC_MAX: usize = 244;
+pub const CONTAINER_ENC_MAX: usize = 253;
+
+fn fnv(s: &str, seed: u64) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+    for &b in s.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+pub fn file_enc(s: &str, max: usize) -> String {
+    let e = encode_name(s);
+    if e.len() <= max {
+        e
+    } else {
+        let f = s.to_lowercase();
+        format!("~H{:016x}{:016x}", fnv(&f, 0), fnv(&f, 0x9e37_79b9_7f4a_7c15))
+    }
+}
+
+fn is_hashed(enc: &str) -> bool {
+    enc.starts_with("~H")
+}
+
+fn name_from(enc: &str, sidecar: &Path, max: usize) -> Option<String> {
+    if is_hashed(enc) {
+        let n = std::fs::read_to_string(sidecar).ok()?;
+        file_enc(&n, max).eq_ignore_ascii_case(enc).then_some(n)
+    } else {
+        decode_name(enc)
+    }
+}
+
 pub fn valid_name(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max && !s.contains('\0')
 }
@@ -129,6 +164,12 @@ impl Store {
                     Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
                     _ => {}
                 }
+                if is_hashed(enc) {
+                    match std::fs::remove_file(d.join(format!("n_{enc}"))) {
+                        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                        _ => {}
+                    }
+                }
             } else if line == "N" {
                 let tmp = d.join(".display.tmp");
                 if tmp.exists() {
@@ -144,16 +185,17 @@ impl Store {
     }
 
     fn cdir(&self, name: &str) -> PathBuf {
-        self.root.join(format!("c_{}", encode_name(name)))
+        self.root.join(format!("c_{}", file_enc(name, CONTAINER_ENC_MAX)))
     }
 
     pub fn blobs(&self, container: &str) -> Vec<(String, u64)> {
         let mut v = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(self.cdir(container)) {
+        let d = self.cdir(container);
+        if let Ok(rd) = std::fs::read_dir(&d) {
             for e in rd.flatten() {
                 let f = e.file_name().to_string_lossy().into_owned();
                 if let Some(enc) = f.strip_prefix("b_").and_then(|x| x.strip_suffix(".blob")) {
-                    if let Some(n) = decode_name(enc) {
+                    if let Some(n) = name_from(enc, &d.join(format!("n_{enc}")), BLOB_ENC_MAX) {
                         v.push((n, e.metadata().map(|m| m.len()).unwrap_or(0)));
                     }
                 }
@@ -172,7 +214,7 @@ impl Store {
         let display = std::fs::read_to_string(d.join(".display")).unwrap_or_default();
         let mut modified = mtime(&d);
         for (b, _) in &blobs {
-            modified = modified.max(mtime(&d.join(format!("b_{}.blob", encode_name(b)))));
+            modified = modified.max(mtime(&d.join(format!("b_{}.blob", file_enc(b, BLOB_ENC_MAX)))));
         }
         Some(ContainerInfo {
             name: name.to_string(),
@@ -188,7 +230,7 @@ impl Store {
         if let Ok(rd) = std::fs::read_dir(&self.root) {
             for e in rd.flatten() {
                 let f = e.file_name().to_string_lossy().into_owned();
-                if let Some(n) = f.strip_prefix("c_").and_then(decode_name) {
+                if let Some(n) = f.strip_prefix("c_").and_then(|enc| name_from(enc, &e.path().join(".name"), CONTAINER_ENC_MAX)) {
                     if e.path().is_dir() {
                         names.push(n);
                     }
@@ -200,16 +242,22 @@ impl Store {
     }
 
     pub fn read_blob(&self, container: &str, blob: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.cdir(container).join(format!("b_{}.blob", encode_name(blob)))).ok()
+        std::fs::read(self.cdir(container).join(format!("b_{}.blob", file_enc(blob, BLOB_ENC_MAX)))).ok()
     }
 
     pub fn commit(&self, container: &str, display: Option<&str>, writes: &[(String, Vec<u8>)], deletes: &[String]) -> io::Result<()> {
         let _g = Self::lock();
         let d = self.cdir(container);
         std::fs::create_dir_all(&d)?;
+        if is_hashed(&file_enc(container, CONTAINER_ENC_MAX)) && std::fs::read_to_string(d.join(".name")).ok().as_deref() != Some(container) {
+            std::fs::write(d.join(".name"), container)?;
+        }
         let mut journal = String::new();
         for (name, data) in writes {
-            let enc = encode_name(name);
+            let enc = file_enc(name, BLOB_ENC_MAX);
+            if is_hashed(&enc) {
+                std::fs::write(d.join(format!("n_{enc}")), name)?;
+            }
             let tmp = d.join(format!("b_{enc}.blob.tmp"));
             let mut f = std::fs::File::create(&tmp)?;
             io::Write::write_all(&mut f, data)?;
@@ -217,7 +265,7 @@ impl Store {
             journal.push_str(&format!("W {enc}\n"));
         }
         for name in deletes {
-            journal.push_str(&format!("D {}\n", encode_name(name)));
+            journal.push_str(&format!("D {}\n", file_enc(name, BLOB_ENC_MAX)));
         }
         if let Some(disp) = display {
             std::fs::write(d.join(".display.tmp"), disp)?;

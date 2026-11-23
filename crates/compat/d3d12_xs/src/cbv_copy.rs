@@ -759,6 +759,7 @@ pub unsafe fn bind(list: *mut c_void, side: u8, idx: u32, va: u64) {
 }
 
 pub unsafe fn run(list: *mut c_void, job: &Job, zero: Option<usize>, ty: u32, pred: Option<(usize, u64, u32)>) {
+    let _ij = crate::inject::mark(crate::inject::COPY);
     if !job.copies.is_empty() {
         let setp: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_PREDICATION)) };
         if pred.is_some() {

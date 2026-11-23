@@ -941,6 +941,7 @@ fn move_to(out: &mut Vec<[u8; 32]>, l: usize, r: usize, s: u32) {
 }
 
 pub unsafe fn sync_resource(l: *mut c_void, res: usize, state: u32) -> bool {
+    let _ij = unsafe { crate::inject::scope(l, crate::inject::COPY) };
     let ms = mirrors_of(res);
     if ms.is_empty() {
         return false;

@@ -402,6 +402,7 @@ pub fn read_sample(resource: usize, offset: u64, len: usize) -> Option<Vec<u8>> 
 }
 
 pub unsafe fn record_begin(list: *mut c_void) -> Option<u32> {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     let p = unsafe { pipeline(list) }?;
     let slot = begin_slot_index(NEXT_BEGIN.fetch_add(1, Ordering::Relaxed));
     unsafe {
@@ -413,6 +414,7 @@ pub unsafe fn record_begin(list: *mut c_void) -> Option<u32> {
 }
 
 pub unsafe fn record_sample(list: *mut c_void, res: *mut c_void, offset: u64, begin_slot: u32, writes: &[Write]) -> usize {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     if writes.is_empty() {
         return 0;
     }

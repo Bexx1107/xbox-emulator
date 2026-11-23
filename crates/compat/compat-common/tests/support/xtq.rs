@@ -1981,6 +1981,30 @@ pub fn verify_failed_begin_completes() {
     a.close(q);
 }
 
+pub fn verify_pending_begin_stays_pending() {
+    let a = api();
+    let q = thread_pool_queue();
+    unsafe extern "system" fn pending(op: u32, _d: *const Data) -> i32 {
+        if op == OP_BEGIN {
+            E_PENDING
+        } else {
+            0
+        }
+    }
+    let mut b = Block::new(q);
+    let called = Arc::new(AtomicI32::new(1));
+    let c = called.clone();
+    on_done(&mut b, move |b| c.store(api().status(b, false), SeqCst));
+    let hr = a.begin(&mut *b, 0, 0, pending);
+    assert!(hr == 0 || hr == E_PENDING, "XAsyncBegin with a Begin op returning E_PENDING returned {hr:#x}");
+    assert_eq!(a.status(&mut *b, false), E_PENDING, "a Begin op returning E_PENDING must leave the call pending");
+    assert!(!until(300, || called.load(SeqCst) != 1), "the completion callback ran for a call still pending");
+    a.complete(&mut *b, 0, 0);
+    assert_eq!(a.status(&mut *b, true), 0);
+    assert!(until(2000, || called.load(SeqCst) == 0), "completing the pending call must run the callback");
+    a.close(q);
+}
+
 pub fn verify_zero_payload_cleans_up_fast() {
     let a = api();
     let q = a.create(MANUAL, MANUAL);
@@ -2219,7 +2243,7 @@ macro_rules! xtq_tests {
             verify_cancellation, verify_cleanup_waits_for_work, verify_cleanup_waits_for_work_distributed,
             verify_run_async, verify_custom_queue, verify_cant_schedule_twice, verify_wait_for_completion,
             verify_periodic_pattern, verify_run_alot_async, verify_get_async_status_no_deadlock,
-            verify_failed_begin_completes, verify_zero_payload_cleans_up_fast, verify_complete_in_begin,
+            verify_failed_begin_completes, verify_pending_begin_stays_pending, verify_zero_payload_cleans_up_fast, verify_complete_in_begin,
             verify_begin_after_terminate, verify_failure_in_do_work, verify_duplicate_result_calls_fail,
             verify_duplicate_pending_result_calls_succeed, verify_no_write_after_get_status_race,
             verify_result_buffer_checks);

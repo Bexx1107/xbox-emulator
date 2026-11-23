@@ -47,6 +47,8 @@ pub const TAG_CBV_COPY: u8 = 2;
 pub const TAG_RESOLVE: u8 = 3;
 pub const TAG_UPLOAD: u8 = 4;
 pub const TAG_PRESENT: u8 = 5;
+pub const TAG_INJECT0: u8 = 16;
+const INJECT_NAMES: [&str; 7] = ["inject:detile", "inject:copy", "inject:clear", "inject:resolve", "inject:barrier", "inject:draw", "inject:query"];
 const KIND_PASS: u8 = 16;
 const KIND_CLOSE: u8 = 255;
 
@@ -57,6 +59,7 @@ fn tag_name(tag: u64) -> &'static str {
         TAG_RESOLVE => "resolve",
         TAG_UPLOAD => "upload_pump",
         TAG_PRESENT => "present_copy",
+        t if (TAG_INJECT0..TAG_INJECT0 + 7).contains(&t) => INJECT_NAMES[(t - TAG_INJECT0) as usize],
         _ => "emu?",
     }
 }
@@ -92,6 +95,7 @@ struct State {
     done: Vec<Vec<Ev>>,
     presents: u64,
     window: Option<u64>,
+    win_start: u64,
     finalize_at: Option<u64>,
     last: Option<Instant>,
     reports: u32,
@@ -159,6 +163,7 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
         done: Vec::new(),
         presents: 0,
         window: None,
+        win_start: 0,
         finalize_at: None,
         last: None,
         reports: 0,
@@ -334,6 +339,7 @@ unsafe fn stamp_ev(list: *mut c_void, tag: Option<u8>, kind: u8, count: bool) {
         let r = s.lists.entry(list as usize).or_default();
         let (label, kind) = match tag {
             Some(t) => (Label { a: t as u64, b: 0, compute: false }, KIND_PASS),
+            None if count && kind >= KIND_OP0 => (Label { a: 0, b: 0, compute: false }, kind),
             None if count => {
                 r.last_kind = kind;
                 (r.label.unwrap_or(Label { a: 0, b: 0, compute: kind == 2 }), kind)
@@ -512,6 +518,141 @@ pub unsafe fn ecl_end(queue: *mut c_void, exec: ExecFn) {
 }
 
 
+pub const KIND_OP0: u8 = 20;
+const OPS: [(usize, &str); 12] = [
+    (15, "CopyBufferRegion"), (16, "CopyTextureRegion"), (17, "CopyResource"), (18, "CopyTiles"), (19, "ResolveSubresource"),
+    (26, "ResourceBarrier"), (52, "ClearRenderTargetView"), (53, "ClearUnorderedAccessViewUint"), (54, "ClearUnorderedAccessViewFloat"),
+    (55, "DiscardResource"), (83, "CopyTextureRegionX"), (51, "ClearDepthStencilView"),
+];
+const KIND_EMU_BARRIER: u8 = KIND_OP0 + 12;
+static OP_NEXT: [AtomicUsize; 12] = [const { AtomicUsize::new(0) }; 12];
+static REAL_BARRIER: AtomicUsize = AtomicUsize::new(0);
+static EMU_BARRIER_CALLS: AtomicU32 = AtomicU32::new(0);
+static EMU_BARRIER_COUNT: AtomicU32 = AtomicU32::new(0);
+static INJ: Mutex<([u64; crate::inject::KINDS], [u64; crate::inject::KINDS])> = Mutex::new(([0; crate::inject::KINDS], [0; crate::inject::KINDS]));
+
+pub fn inject_text(a: &[u64; crate::inject::KINDS], b: &[u64; crate::inject::KINDS], nf: u64) -> String {
+    let v: Vec<String> = (0..crate::inject::KINDS).filter(|&k| b[k] > a[k]).map(|k| format!("{} {:.1}/f", crate::inject::NAMES[k], (b[k] - a[k]) as f64 / nf.max(1) as f64)).collect();
+    format!("emulator-injected commands in the window: {}", if v.is_empty() { "none".to_string() } else { v.join(", ") })
+}
+
+thread_local! {
+    static IN_TITLE_BARRIER: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+pub fn op_name(kind: u8) -> &'static str {
+    if kind == KIND_EMU_BARRIER {
+        return "emulator ResourceBarrier";
+    }
+    OPS.get(kind.wrapping_sub(KIND_OP0) as usize).map_or("op?", |o| o.1)
+}
+
+fn ops_level() -> u64 {
+    static L: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *L.get_or_init(|| env_u64("TOMBOX_GPUPROF_OPS").unwrap_or(1))
+}
+
+unsafe fn op_stamp(list: *mut c_void, i: usize) {
+    unsafe { stamp_ev(list, None, KIND_OP0 + i as u8, true) };
+}
+
+macro_rules! op_hooks {
+    ($(($name:ident, $i:literal)),* $(,)?) => {
+        $(
+            unsafe extern "system" fn $name(this: *mut c_void, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize, g: usize) -> usize {
+                unsafe { op_stamp(this, $i) };
+                let n: unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize, usize, usize, usize) -> usize =
+                    unsafe { core::mem::transmute(OP_NEXT[$i].load(Ordering::Relaxed)) };
+                unsafe { n(this, a, b, c, d, e, f, g) }
+            }
+        )*
+    };
+}
+op_hooks!((op0, 0), (op1, 1), (op2, 2), (op3, 3), (op4, 4), (op6, 6), (op7, 7), (op8, 8), (op9, 9), (op10, 10));
+
+unsafe extern "system" fn op_barrier(this: *mut c_void, n: u32, b: *const u8) {
+    unsafe { op_stamp(this, 5) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = unsafe { core::mem::transmute(OP_NEXT[5].load(Ordering::Relaxed)) };
+    IN_TITLE_BARRIER.with(|c| c.set(true));
+    unsafe { f(this, n, b) };
+    IN_TITLE_BARRIER.with(|c| c.set(false));
+}
+
+unsafe extern "system" fn op_clear_dsv(this: *mut c_void, h: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const c_void) {
+    unsafe { op_stamp(this, 11) };
+    let f: unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const c_void) = unsafe { core::mem::transmute(OP_NEXT[11].load(Ordering::Relaxed)) };
+    unsafe { f(this, h, flags, depth, stencil, n, rects) }
+}
+
+unsafe extern "system" fn real_barrier(this: *mut c_void, n: u32, b: *const u8) {
+    if ARMED.load(Ordering::Relaxed) && !IN_TITLE_BARRIER.with(|c| c.get()) {
+        EMU_BARRIER_CALLS.fetch_add(1, Ordering::Relaxed);
+        EMU_BARRIER_COUNT.fetch_add(n, Ordering::Relaxed);
+        if ops_level() >= 3 {
+            unsafe { stamp_ev(this, None, KIND_EMU_BARRIER, true) };
+        }
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = unsafe { core::mem::transmute(REAL_BARRIER.load(Ordering::Relaxed)) };
+    unsafe { f(this, n, b) }
+}
+
+pub unsafe fn install_ops(vt: &[AtomicUsize]) {
+    if !enabled() || ops_level() == 0 {
+        return;
+    }
+    let hooks: [usize; 12] = [op0 as usize, op1 as usize, op2 as usize, op3 as usize, op4 as usize, op_barrier as usize, op6 as usize, op7 as usize, op8 as usize, op9 as usize, op10 as usize, op_clear_dsv as usize];
+    let mut done = Vec::new();
+    for (i, (slot, name)) in OPS.iter().enumerate() {
+        let prev = vt.get(*slot).map_or(0, |v| v.load(Ordering::Relaxed));
+        if prev == 0 {
+            continue;
+        }
+        OP_NEXT[i].store(prev, Ordering::Relaxed);
+        vt[*slot].store(hooks[i], Ordering::Relaxed);
+        done.push(*name);
+    }
+    let mut emu = "emulator barriers not counted (TOMBOX_GPUPROF_OPS=2 counts them, 3 also times each)".to_string();
+    if ops_level() >= 2 {
+        let p = unsafe { crate::cmdlist_wrap::real_slot_ptr(26) };
+        if !p.is_null() {
+            extern "system" {
+                fn VirtualProtect(p: *mut c_void, n: usize, prot: u32, old: *mut u32) -> i32;
+            }
+            let mut old = 0u32;
+            if unsafe { VirtualProtect(p as *mut c_void, 8, 0x04, &mut old) } != 0 {
+                REAL_BARRIER.store(unsafe { *p }, Ordering::Relaxed);
+                unsafe { *p = real_barrier as usize };
+                let mut tmp = 0u32;
+                unsafe { VirtualProtect(p as *mut c_void, 8, old, &mut tmp) };
+                emu = "emulator barriers counted at the real ResourceBarrier".to_string();
+            }
+        }
+    }
+    record("d3d12_xs", "gpuprof", &format!("title command timing installed on {}; {emu}", done.join(", ")));
+}
+
+fn ops_summary(rows: &[((u64, u64, bool, u8), (u64, u64))], per: &dyn Fn(u64) -> f64, nf: u64, emu_calls: u32, emu_n: u32) -> String {
+    let mut v: Vec<(u8, u64, u64)> = Vec::new();
+    for ((_, _, _, kind), (t, c)) in rows {
+        if *kind >= KIND_OP0 && *kind != KIND_PASS {
+            match v.iter_mut().find(|e| e.0 == *kind) {
+                Some(e) => {
+                    e.1 += t;
+                    e.2 += c;
+                }
+                None => v.push((*kind, *t, *c)),
+            }
+        }
+    }
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let parts: Vec<String> = v.iter().map(|(k, t, c)| format!("{} {:.3} ms/f {:.1}/f", op_name(*k), per(*t), *c as f64 / nf as f64)).collect();
+    let mut out = format!("title non-draw commands (each timed to the next stamp, so emulation done inside the call is included): {}", if parts.is_empty() { "-".to_string() } else { parts.join(" | ") });
+    if emu_calls > 0 {
+        out.push_str(&format!(" | emulator ResourceBarrier calls {:.1}/f ({:.1} barriers/f)", emu_calls as f64 / nf as f64, emu_n as f64 / nf as f64));
+    }
+    out
+}
+
 pub unsafe fn pass_begin(list: *mut c_void, tag: u8) {
     unsafe { stamp_ev(list, Some(tag), KIND_PASS, true) };
 }
@@ -605,7 +746,10 @@ unsafe fn report(s: &mut State) {
         for w in seq.windows(2) {
             let (t0, t1) = (ts(w[0].slot), ts(w[1].slot));
             if t0 != 0 && t1 >= t0 && w[0].kind <= 1 && !w[0].label.compute && crate::passcap::ps_ms_target() == Some(w[0].label.b) {
-                crate::passcap::note_slow_call(w[0].label.b, (t1 - t0) as f64 * tick_ms, w[0].frame);
+                let ms = (t1 - t0) as f64 * tick_ms;
+                if crate::passcap::note_slow_call(w[0].label.b, ms, w[0].frame) {
+                    record("d3d12_xs", "gpuprof", &format!("ps_ms call: PS {:016x} {ms:.2} ms at present #{} (firstuse frame numbering)", w[0].label.b, s.win_start + w[0].frame as u64 + 1));
+                }
             }
             if t0 == 0 || t1 < t0 || t1 - t0 > max_ticks {
                 bad += 1;
@@ -652,6 +796,9 @@ unsafe fn report(s: &mut State) {
         "[gpuprof] window {}: {nf} frames, {n} timed events ({bad} rejected), freq={freq} Hz | summed GPU {:.3} ms/frame, wall span {:.3} ms/frame\n",
         s.reports, per(total), span);
     out.push_str(&format!("[gpuprof]   passes: {}\n", pass_summary(&rows, &per, nf)));
+    let (i0, i1) = *INJ.lock().unwrap_or_else(|e| e.into_inner());
+    out.push_str(&format!("[gpuprof]   {}\n", inject_text(&i0, &i1, nf)));
+    out.push_str(&format!("[gpuprof]   {}\n", ops_summary(&rows, &per, nf, EMU_BARRIER_CALLS.load(Ordering::Relaxed), EMU_BARRIER_COUNT.load(Ordering::Relaxed))));
     out.push_str(&format!("[gpuprof]   {}\n", queue_summary(&ecl_q, &list_q, ecl_bad, &per, nf, if hi > lo { hi - lo } else { 0 }, covered)));
     out.push_str(&format!("[gpuprof]   {}\n", crate::gpuprof_q::freq_note(&crate::gpuprof_q::freqs(), freq)));
     out.push_str(&format!("[gpuprof]   {}\n", crate::gpuprof_q::report_line()));
@@ -659,7 +806,7 @@ unsafe fn report(s: &mut State) {
         let ms = |t: u64| t as f64 * tick_ms;
         let mut d: Vec<(f64, String)> = rows.iter().map(|((a, b, compute, kind), (t, _))| {
             let in_worst = by_frame.get(&(wf, *a, *b, *compute, *kind)).copied().unwrap_or(0);
-            let who = if *kind == KIND_PASS { tag_name(*a).to_string() } else { name(&Label { a: *a, b: *b, compute: *compute }) };
+            let who = if *kind == KIND_PASS { tag_name(*a).to_string() } else if *kind >= KIND_OP0 { op_name(*kind).to_string() } else { name(&Label { a: *a, b: *b, compute: *compute }) };
             (ms(in_worst) - per(*t), who)
         }).collect();
         d.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(core::cmp::Ordering::Equal));
@@ -668,8 +815,8 @@ unsafe fn report(s: &mut State) {
             ms(wt), ms(med), per_frame.len(), if top.is_empty() { "-".to_string() } else { top.join(", ") }));
     }
     for ((a, b, compute, kind), (t, c)) in rows.iter().take(40) {
-        let k = match *kind { 0 => "draw", 1 => "drawidx", 2 => "dispatch", 3 => "indirect", 4 => "listhead", KIND_PASS => "emupass", _ => "?" };
-        let who = if *kind == KIND_PASS { tag_name(*a).to_string() } else { name(&Label { a: *a, b: *b, compute: *compute }) };
+        let k = match *kind { 0 => "draw", 1 => "drawidx", 2 => "dispatch", 3 => "indirect", 4 => "listhead", KIND_PASS => "emupass", k if k >= KIND_OP0 => "titleop", _ => "?" };
+        let who = if *kind == KIND_PASS { tag_name(*a).to_string() } else if *kind >= KIND_OP0 { op_name(*kind).to_string() } else { name(&Label { a: *a, b: *b, compute: *compute }) };
         out.push_str(&format!("[gpuprof]   {:7.3} ms/f {:5.1}% {:6.1} calls/f {k:8} {who}\n",
             per(*t), *t as f64 * 100.0 / total.max(1) as f64, *c as f64 / nf as f64));
     }
@@ -766,6 +913,7 @@ pub fn on_present() {
             if s.presents >= start + frames() {
                 ARMED.store(false, Ordering::Relaxed);
                 crate::gpuprof_q::disarm();
+                INJ.lock().unwrap_or_else(|e| e.into_inner()).1 = crate::inject::totals();
                 s.window = None;
                 s.finalize_at = Some(s.presents + SETTLE);
             }
@@ -790,7 +938,11 @@ pub fn on_present() {
             SLOT.store(0, Ordering::Relaxed);
             FRAME_IX.store(0, Ordering::Relaxed);
             s.window = Some(s.presents);
+            s.win_start = s.presents;
             crate::gpuprof_q::arm();
+            *INJ.lock().unwrap_or_else(|e| e.into_inner()) = (crate::inject::totals(), crate::inject::totals());
+            EMU_BARRIER_CALLS.store(0, Ordering::Relaxed);
+            EMU_BARRIER_COUNT.store(0, Ordering::Relaxed);
             ARMED.store(true, Ordering::Relaxed);
         }
     });
@@ -937,8 +1089,57 @@ mod tests {
 
     #[test]
     fn every_tag_has_a_name() {
-        for t in [TAG_BLENDCLAMP, TAG_CBV_COPY, TAG_RESOLVE, TAG_UPLOAD, TAG_PRESENT] {
+        for t in [TAG_BLENDCLAMP, TAG_CBV_COPY, TAG_RESOLVE, TAG_UPLOAD, TAG_PRESENT, TAG_INJECT0, TAG_INJECT0 + 6] {
             assert_ne!(tag_name(t as u64), "emu?");
         }
+        assert_eq!(tag_name((TAG_INJECT0 + 1) as u64), "inject:copy");
+        assert_eq!(tag_name((TAG_INJECT0 + 7) as u64), "emu?");
+    }
+
+    static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+    unsafe extern "system" fn rec7(_t: *mut c_void, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize, g: usize) -> usize {
+        SEEN.lock().unwrap().extend([a, b, c, d, e, f, g].map(|x| x as u64));
+        99
+    }
+
+    unsafe extern "system" fn rec_dsv(_t: *mut c_void, h: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const c_void) {
+        SEEN.lock().unwrap().extend([h as u64, flags as u64, depth.to_bits() as u64, stencil as u64, n as u64, rects as u64]);
+    }
+
+    #[test]
+    fn inject_text_reports_per_frame_deltas() {
+        let a = [0u64; crate::inject::KINDS];
+        let mut b = a;
+        b[crate::inject::BARRIER as usize] = 32;
+        b[crate::inject::COPY as usize] = 8;
+        assert_eq!(inject_text(&a, &b, 16), "emulator-injected commands in the window: copy 0.5/f, barrier 2.0/f");
+        assert_eq!(inject_text(&a, &a, 16), "emulator-injected commands in the window: none");
+    }
+
+    #[test]
+    fn op_hooks_forward_every_argument_unchanged() {
+        OP_NEXT[0].store(rec7 as usize, Ordering::Relaxed);
+        OP_NEXT[11].store(rec_dsv as usize, Ordering::Relaxed);
+        SEEN.lock().unwrap().clear();
+        assert_eq!(unsafe { op0(core::ptr::null_mut(), 1, 2, 3, 4, 5, 6, 7) }, 99);
+        unsafe { op_clear_dsv(core::ptr::null_mut(), 0x1234, 3, 0.25, 7, 2, 0x40 as *const c_void) };
+        assert_eq!(*SEEN.lock().unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 0x1234, 3, 0.25f32.to_bits() as u64, 7, 2, 0x40]);
+    }
+
+    #[test]
+    fn op_kinds_are_named_and_summarised_apart_from_draws() {
+        assert_eq!(op_name(KIND_OP0 + 5), "ResourceBarrier");
+        assert_eq!(op_name(KIND_OP0 + 11), "ClearDepthStencilView");
+        assert_eq!(op_name(KIND_EMU_BARRIER), "emulator ResourceBarrier");
+        assert!(KIND_OP0 > KIND_PASS && KIND_EMU_BARRIER < KIND_CLOSE);
+        let rows = vec![
+            ((7, 8, false, 0), (1600, 32)),
+            ((0, 0, false, KIND_OP0 + 1), (320, 16)),
+            ((0, 0, false, KIND_OP0 + 5), (32, 160)),
+            ((TAG_CBV_COPY as u64, 0, false, KIND_PASS), (16, 160)),
+        ];
+        let per = |t: u64| t as f64 / 16.0;
+        assert_eq!(ops_summary(&rows, &per, 16, 32, 64), "title non-draw commands (each timed to the next stamp, so emulation done inside the call is included): CopyTextureRegion 20.000 ms/f 1.0/f | ResourceBarrier 2.000 ms/f 10.0/f | emulator ResourceBarrier calls 2.0/f (4.0 barriers/f)");
     }
 }

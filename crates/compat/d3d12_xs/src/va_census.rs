@@ -66,6 +66,25 @@ pub fn note(res: usize, desc: &[u8], va: u64, len: u64, title_va: bool) {
     });
 }
 
+pub fn set_len(res: usize, len: u64) {
+    if !on() || res == 0 || len == 0 {
+        return;
+    }
+    with(|s| {
+        if let Some(i) = s.reg.get_mut(&res) {
+            i.len = len;
+        }
+    });
+}
+
+pub fn same_start(c: &Cluster) -> usize {
+    let mut starts: Vec<u64> = c.members.iter().map(|m| m.1.va).collect();
+    starts.sort_unstable();
+    let n = starts.len();
+    starts.dedup();
+    n - starts.len()
+}
+
 pub fn note_how(res: usize, how: String) {
     if !on() || res == 0 {
         return;
@@ -122,10 +141,11 @@ pub fn format(title: &str, items: &[(usize, Info, u8, String)], untracked: usize
     let cl = clusters(items);
     let bytes: u64 = cl.iter().map(|c| c.bytes).sum();
     let known = items.iter().filter(|x| x.1.title_va).count();
-    let mut out = format!("{title}: {} resources ({known} at a title VA, {} at a synthetic VA, {untracked} not in the creation registry); {} title VA ranges map to more than one PC resource, {bytes:#x} bytes ({:.1} MiB)\n",
+    let dup: usize = cl.iter().map(same_start).sum();
+    let mut out = format!("{title}: {} resources ({known} at a title VA, {} at a synthetic VA, {untracked} not in the creation registry); {} title VA ranges map to more than one PC resource, {bytes:#x} bytes ({:.1} MiB); {dup} resources share an exact start VA with another (lengths use the title layout size)\n",
         items.len() + untracked, items.len() - known, cl.len(), bytes as f64 / 1048576.0);
     for (n, c) in cl.iter().take(TOP).enumerate() {
-        out.push_str(&format!("  #{n} va={:#x} size={:#x} resources={}\n", c.va, c.bytes, c.members.len()));
+        out.push_str(&format!("  #{n} va={:#x} size={:#x} resources={} same-start={}\n", c.va, c.bytes, c.members.len(), same_start(c)));
         for (res, i, p, how) in &c.members {
             out.push_str(&format!("    res {res:#x} fmt={} {}x{} mips={} dim={} [{how}] va={:#x} len={:#x} paths={} created#{}\n",
                 i.fmt, i.w, i.h, i.mips, i.dim, i.va, i.len, paths(*p), i.seq));
@@ -186,7 +206,7 @@ mod tests {
         assert_eq!((c[0].va, c[0].bytes, c[0].members.len()), (0x23ccb0000, 0x560000, 2));
         assert_eq!((c[1].va, c[1].bytes), (0x100000, 0x2800));
         let s = format("t", &items, 3);
-        assert!(s.starts_with("t: 10 resources (5 at a title VA, 2 at a synthetic VA, 3 not in the creation registry); 2 title VA ranges map to more than one PC resource, 0x562800 bytes"), "{s}");
+        assert!(s.starts_with("t: 10 resources (5 at a title VA, 2 at a synthetic VA, 3 not in the creation registry); 2 title VA ranges map to more than one PC resource, 0x562800 bytes (5.4 MiB); 1 resources share an exact start VA with another"), "{s}");
         assert!(s.contains("    res 0xb fmt=90 2048x512 mips=12 dim=3 [CreatePlacedResourceX aliased Title heap 0x10+0x0] va=0x23ccb0000 len=0x560000 paths=RTV created#2\n"), "{s}");
         assert_eq!(paths(P_CREATE | P_SRV | P_RTV), "create,SRV,RTV");
     }

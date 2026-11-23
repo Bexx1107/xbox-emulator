@@ -1226,6 +1226,7 @@ impl Draw {
 }
 
 unsafe fn issue(list: *mut c_void, d: Draw, replay: bool) {
+    let _ij = if replay { Some(unsafe { crate::inject::scope(list, crate::inject::DRAW) }) } else { None };
     let pc = |i: usize| unsafe { crate::cmdlist_wrap::pc_method(list, i) };
     match d {
         Draw::Instanced(a, b, c, e) => {

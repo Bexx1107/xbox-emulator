@@ -1437,6 +1437,12 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             t.watch[sub as usize] = now + WATCH_PUMPS;
             t.hot = t.hot.max(now + WATCH_PUMPS);
         }
+        if !t.sent.iter().any(|&x| x) {
+            crate::firstuse::note_bytes(t.res, crate::firstuse::UPLOAD, t.layout.total);
+            if t.p.layout() != 264 {
+                crate::firstuse::note_bytes(t.res, crate::firstuse::DETILE, t.layout.total);
+            }
+        }
         t.sent[sub as usize] = true;
         t.cpu_dirty[sub as usize].clear();
         up.uploaded_subs += 1;

@@ -71,6 +71,7 @@ unsafe fn resolve_inner(list: *mut c_void, dst: *mut c_void, dst_sub: u32, src: 
         }
         let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u32, *const [i32; 4], u32, u32) =
             unsafe { core::mem::transmute(*(*(list as *const *const usize)).add(PC_SLOT_RESOLVE_REGION)) };
+        let _ij = crate::inject::mark(crate::inject::RESOLVE);
         unsafe { f(list, dst, dst_sub, 0, 0, src, src_sub, &r, format, RESOLVE_MODE_AVERAGE) };
         return;
     }

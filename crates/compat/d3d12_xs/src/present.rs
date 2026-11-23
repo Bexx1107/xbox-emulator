@@ -760,6 +760,7 @@ unsafe fn present_x_body(queue: *mut c_void, plane_count: u32, planes: *const u8
     crate::perf::on_present();
     crate::qwait::poll();
     crate::gpuprof::on_present();
+    crate::firstuse::on_present();
     crate::hot_reload::on_present();
     crate::present_probe::on_present(src, plane_count, planes);
     crate::passcap::on_present(queue, src, plane_count, planes);

@@ -229,6 +229,7 @@ unsafe fn scratch(list: *mut c_void) -> Option<Scratch> {
 }
 
 unsafe fn write_value(list: *mut c_void, va: u64, value: u64) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::COPY) };
     let words = [value as u32, (value >> 32) as u32];
     let fallback = |why: &str| {
         if once(16) {

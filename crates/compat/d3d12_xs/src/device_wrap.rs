@@ -1439,6 +1439,7 @@ unsafe fn patch_real_device(real: *mut c_void) {
 unsafe extern "system" fn create_rtv_traced(this: *mut DeviceWrapper, res: *mut c_void, pdesc: *const u8, dest: usize) {
     let real = unsafe { (*this).real };
     let inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = unsafe { core::mem::transmute(*real_vtbl(real).add(15)) };
+    crate::firstuse::note(res as usize, crate::firstuse::RTV);
     crate::rtcap::note_view(dest, res as usize, unsafe { inc(real, 2) } as usize);
     unsafe { crate::blendclamp::note_rtv(dest, res as usize, pdesc) };
     unsafe { crate::rtcap::register_view_target(res, 4) };
@@ -1448,6 +1449,7 @@ unsafe extern "system" fn create_rtv_traced(this: *mut DeviceWrapper, res: *mut 
 }
 unsafe extern "system" fn create_dsv_traced(this: *mut DeviceWrapper, res: *mut c_void, pdesc: *const u8, dest: usize) {
     let real = unsafe { (*this).real };
+    crate::firstuse::note(res as usize, crate::firstuse::DSV);
     crate::rtcap::note_view(dest, res as usize, 0);
     unsafe { crate::rtcap::register_view_target(res, 0x10) };
     crate::replay::note_view(dest, 'd', res as usize, if pdesc.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts(pdesc, 24) }) });
@@ -1986,6 +1988,7 @@ unsafe extern "system" fn create_placed_resource_x(
         unsafe { addref(res) };
         unsafe { crate::gpu_va::note_resource(real, res, &d, init_state, Some(va)) };
         if crate::va_census::on() {
+            crate::va_census::set_len(res as usize, xbox_size);
             crate::va_census::note_how(res as usize, match &made { Some(m) => format!("CreatePlacedResourceX aliased {:?} heap {:#x}+{:#x}", m.kind, m.heap, m.offset), None => "CreatePlacedResourceX separate committed".to_string() });
         }
         crate::placed::register(res, crate::placed::Placed { va, desc: orig, init_state });

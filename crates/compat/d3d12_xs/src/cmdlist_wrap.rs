@@ -41,6 +41,11 @@ pub(crate) unsafe fn real_list_slot(slot: usize) -> usize {
 static INSERTED_HITS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) const CONSOLE_NULL_SLOT: usize = 66;
 
+pub(crate) unsafe fn real_slot_ptr(slot: usize) -> *mut usize {
+    let p = unsafe { REAL_VT_PTR };
+    if p.is_null() { core::ptr::null_mut() } else { unsafe { p.add(slot) as *mut usize } }
+}
+
 pub(crate) unsafe fn real_method(slot: usize) -> usize {
     unsafe { *REAL_VT_PTR.add(slot) }
 }
@@ -265,6 +270,7 @@ unsafe extern "system" fn indirect_traced(this: *mut c_void, sig: *mut c_void, n
 static FLUSH_HITS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn flush_texture_cache_x(this: *mut c_void) {
+    let _ij = unsafe { crate::inject::scope(this, crate::inject::BARRIER) };
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ON.get_or_init(|| std::env::var("TOMBOX_FLUSH_UAV").map(|v| v != "0").unwrap_or(true));
     if FLUSH_HITS.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -425,6 +431,7 @@ pub fn apply(real_list: *mut c_void) {
             crate::pso_async::install(&XBOX_VT);
             crate::cbv_raw::install_draw_check(&XBOX_VT);
             crate::passcap::install(&XBOX_VT);
+            crate::gpuprof::install_ops(&XBOX_VT);
             XBOX_VT[CONSOLE_NULL_SLOT].store(0, Ordering::Relaxed);
             record("d3d12_xs", "cmdlist.vtable",
                 &format!("built Xbox-layout cmdlist vtable from real {real_vt:p} (+4 shift at PC28)"));

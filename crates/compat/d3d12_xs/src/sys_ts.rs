@@ -223,6 +223,7 @@ unsafe fn build_on(dev: *mut c_void, code: &[u8]) -> Option<Pipeline> {
 }
 
 pub unsafe fn write(list: *mut c_void, va: u64) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     let Some((e, off)) = crate::gpu_va::lookup(va) else {
         if once(8) {
             record("d3d12_xs", "sys_ts", &format!("SYSTEM_TIMESTAMP destination {va:#x} is not in a tracked buffer"));
