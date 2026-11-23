@@ -268,6 +268,83 @@ fn sat_int(e: &str, bits: u32) -> String {
     format!("(min(asuint(max({e}, -{h})) + {h:#x}u, {:#x}u) ^ {h:#x}u)", (h << 1) - 1)
 }
 
+fn f16_inline(x: f32) -> u32 {
+    if (x - 0.159_154_94).abs() < 1e-7 {
+        return 0x3118;
+    }
+    let b = x.to_bits();
+    ((b >> 16) & 0x8000) | ((((b >> 23) & 0xff) - 112) << 10)
+}
+
+fn f16_inline_val(x: f32, hi: bool) -> String {
+    match (hi, f16_inline(x)) {
+        (true, _) => "0.0".into(),
+        (false, 0x3118) => "f16tof32(0x3118u)".into(),
+        _ => format!("({x:?})"),
+    }
+}
+
+fn pk_int16(m: &str, ins: &Insn) -> Result<Option<String>, String> {
+    let (nsrc, signed) = match m {
+        "v_pk_mad_i16" => (3, true),
+        "v_pk_mad_u16" => (3, false),
+        "v_pk_add_i16" | "v_pk_sub_i16" | "v_pk_max_i16" | "v_pk_min_i16" | "v_pk_ashrrev_i16" => (2, true),
+        "v_pk_mul_lo_u16" | "v_pk_add_u16" | "v_pk_sub_u16" | "v_pk_max_u16" | "v_pk_min_u16" | "v_pk_lshlrev_b16" | "v_pk_lshrrev_b16" => (2, false),
+        _ => return Ok(None),
+    };
+    let (w0, w1) = (ins.raw[0], ins.raw.get(1).copied().unwrap_or(0));
+    if (w1 >> 29) & 7 != 0 || (w0 >> 8) & 7 != 0 {
+        return Err(format!("{m}: NEG/NEG_HI on an integer packed op"));
+    }
+    let clamp = (w0 >> 15) & 1 != 0;
+    if clamp && !matches!(m, "v_pk_add_i16" | "v_pk_sub_i16" | "v_pk_add_u16" | "v_pk_sub_u16" | "v_pk_max_i16" | "v_pk_min_i16" | "v_pk_max_u16" | "v_pk_min_u16") {
+        return Err(format!("{m}: CLAMP on an integer packed op without a defined saturation"));
+    }
+    let src: Vec<&Opnd> = (0..nsrc).map(|i| ins.src.get(i).ok_or_else(|| format!("{m}: missing source {i}"))).collect::<Result<_, _>>()?;
+    if let Some(o) = src.iter().find(|o| matches!(o, Opnd::ConstF32(_))) {
+        return Err(format!("{m}: inline float constant {o:?} on an integer packed op"));
+    }
+    let sel = [(w0 >> 11) & 7, ((w1 >> 27) & 3) | (((w0 >> 14) & 1) << 2)];
+    let mut halves = Vec::new();
+    for h in sel {
+        let mut u = Vec::new();
+        let mut i = Vec::new();
+        for (k, o) in src.iter().enumerate() {
+            let x = r(o)?;
+            if (h >> k) & 1 != 0 {
+                u.push(format!("(({x}) >> 16)"));
+                i.push(format!("(asint({x}) >> 16)"));
+            } else {
+                u.push(format!("(({x}) & 0xffffu)"));
+                i.push(format!("(asint(({x}) << 16) >> 16)"));
+            }
+        }
+        let v = if signed { &i } else { &u };
+        let e = match m {
+            "v_pk_lshlrev_b16" => format!("({} << ({} & 15u))", u[1], u[0]),
+            "v_pk_lshrrev_b16" => format!("({} >> ({} & 15u))", u[1], u[0]),
+            "v_pk_ashrrev_i16" => format!("asuint({} >> (int)({} & 15u))", i[1], u[0]),
+            "v_pk_mul_lo_u16" => format!("({} * {})", v[0], v[1]),
+            "v_pk_mad_u16" => format!("({} * {} + {})", v[0], v[1], v[2]),
+            "v_pk_mad_i16" => format!("asuint({} * {} + {})", v[0], v[1], v[2]),
+            "v_pk_add_u16" if clamp => format!("min({} + {}, 0xffffu)", v[0], v[1]),
+            "v_pk_add_u16" => format!("({} + {})", v[0], v[1]),
+            "v_pk_sub_u16" if clamp => format!("asuint(max((int){} - (int){}, 0))", v[0], v[1]),
+            "v_pk_sub_u16" => format!("({} - {})", v[0], v[1]),
+            "v_pk_add_i16" if clamp => format!("asuint(clamp({} + {}, -32768, 32767))", v[0], v[1]),
+            "v_pk_add_i16" => format!("asuint({} + {})", v[0], v[1]),
+            "v_pk_sub_i16" if clamp => format!("asuint(clamp({} - {}, -32768, 32767))", v[0], v[1]),
+            "v_pk_sub_i16" => format!("asuint({} - {})", v[0], v[1]),
+            "v_pk_max_i16" => format!("asuint(max({}, {}))", v[0], v[1]),
+            "v_pk_min_i16" => format!("asuint(min({}, {}))", v[0], v[1]),
+            "v_pk_max_u16" => format!("max({}, {})", v[0], v[1]),
+            _ => format!("min({}, {})", v[0], v[1]),
+        };
+        halves.push(format!("({e} & 0xffffu)"));
+    }
+    Ok(Some(format!("({} | ({} << 16))", halves[0], halves[1])))
+}
+
 /// Scalar register number of an operand (SGPRs, plus vcc_lo/vcc_hi = 106/107, which SMEM
 /// loads can target directly: `s_buffer_load_dwordx2 vcc_lo, ...`).
 fn sreg_num(o: &Opnd) -> Option<u8> {
@@ -4481,7 +4558,7 @@ impl<'a> Emitter<'a> {
         let h16 = |o: &Opnd| -> Result<String, String> {
             let hi_sel = ins.enc == Enc::Vop3 && s.iter().position(|x| std::ptr::eq(x, o)).map_or(false, |i| (ins.raw[0] >> (11 + i)) & 1 != 0);
             let mut e = match o {
-                Opnd::ConstF32(_) => f(o)?,
+                Opnd::ConstF32(x) => f16_inline_val(*x, hi_sel),
                 _ if hi_sel => format!("f16tof32(({}) >> 16)", r(o)?),
                 _ => format!("f16tof32(({}) & 0xffffu)", r(o)?),
             };
@@ -4623,18 +4700,8 @@ impl<'a> Emitter<'a> {
             let halves: Vec<String> = if (w0 >> 15) & 1 != 0 { halves.into_iter().map(|h| format!("saturate({h})")).collect() } else { halves };
             return self.wv(&d, &format!("(tb_f2h({}) | (tb_f2h({}) << 16))", halves[0], halves[1]));
         }
-        if matches!(m.as_str(), "v_pk_lshlrev_b16" | "v_pk_lshrrev_b16") {
-            let (w0, w1) = (ins.raw[0], ins.raw.get(1).copied().unwrap_or(0));
-            if (w1 >> 29) & 7 != 0 || (w0 >> 8) & 7 != 0 || (w0 >> 15) & 1 != 0 {
-                return Err(format!("{m}: NEG/NEG_HI/CLAMP on an integer packed op"));
-            }
-            let sel = [(w0 >> 11) & 7, ((w1 >> 27) & 3) | (((w0 >> 14) & 1) << 2)];
-            let mut halves = Vec::new();
-            for h in sel {
-                let x: Vec<String> = (0..2).map(|i| r(&s[i]).map(|x| if (h >> i) & 1 != 0 { format!("(({x}) >> 16)") } else { format!("(({x}) & 0xffffu)") })).collect::<Result<_, _>>()?;
-                halves.push(if m == "v_pk_lshlrev_b16" { format!("(({} << ({} & 15u)) & 0xffffu)", x[1], x[0]) } else { format!("({} >> ({} & 15u))", x[1], x[0]) });
-            }
-            return self.wv(&d, &format!("({} | ({} << 16))", halves[0], halves[1]));
+        if let Some(e) = pk_int16(&m, ins)? {
+            return self.wv(&d, &e);
         }
         if matches!(m.as_str(), "v_min3_f16" | "v_max3_f16" | "v_med3_f16") {
             let (a, b, c) = (h16(&s[0])?, h16(&s[1])?, h16(&s[2])?);
@@ -4749,7 +4816,10 @@ impl<'a> Emitter<'a> {
             let mut u = Vec::new();
             let mut i = Vec::new();
             for k in 0..n {
-                let x = r(&s[k])?;
+                let x = match &s[k] {
+                    Opnd::ConstF32(x) if m.ends_with("_f16") => format!("{:#x}u", f16_inline(*x)),
+                    o => r(o)?,
+                };
                 if (opsel >> k) & 1 != 0 {
                     u.push(format!("(({x}) >> 16)"));
                     i.push(format!("(asint({x}) >> 16)"));
@@ -5168,7 +5238,7 @@ impl<'a> Emitter<'a> {
             "v_min3_f32" => Some(format!("min(min({}, {}), {})", fa()?, fb()?, fc()?)),
             "v_max3_f32" => Some(format!("max(max({}, {}), {})", fa()?, fb()?, fc()?)),
             "v_med3_f32" => Some(format!(
-                "max(min({0}, {1}), min(max({0}, {1}), {2}))",
+                "((tb_nan({0}) || tb_nan({1}) || tb_nan({2})) ? min(min({0}, {1}), {2}) : max(min({0}, {1}), min(max({0}, {1}), {2})))",
                 fa()?,
                 fb()?,
                 fc()?
@@ -5179,7 +5249,10 @@ impl<'a> Emitter<'a> {
             "v_cvt_f32_ubyte1" => Some(format!("(float)(({a} >> 8) & 0xffu)")),
             "v_cvt_f32_ubyte2" => Some(format!("(float)(({a} >> 16) & 0xffu)")),
             "v_cvt_f32_ubyte3" => Some(format!("(float)(({a} >> 24) & 0xffu)")),
-            "v_cvt_f32_f16" => Some(format!("f16tof32({a})")),
+            "v_cvt_f32_f16" => Some(match &s[0] {
+                Opnd::ConstF32(x) => f16_inline_val(*x, false),
+                _ => format!("f16tof32({a})"),
+            }),
             "v_fract_f32" => Some(format!("tb_fract({})", fa()?)),
             "v_trunc_f32" => Some(format!("tb_trunc({})", fa()?)),
             "v_ceil_f32" => Some(format!("tb_ceil({})", fa()?)),
