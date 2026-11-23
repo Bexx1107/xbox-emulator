@@ -312,6 +312,11 @@ pub(crate) fn runtime_source(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Inp
             record("d3d12_xs", "cbv_raw", &format!("HOIST: hash={hash:016x} reads {n} constant raw constant-buffer rows once before the dispatcher loop (TOMBOX_CBRAW_HOIST)"));
         }
     }
+    if mode.cbv_raw == tombox_xshader::pack_key::CbvRaw::Copy {
+        crate::cbv_copy::note_shader_cb(hash, crate::cbv_copy::meta_of(&t));
+    }
+    crate::fmask_check::note_translation(hash, &t.hlsl, &t.fmask);
+    RUNTIME_SOURCES.with(|c| c.set(c.get() + 1));
     let needs = crate::mip_bind::Needs::of(&t);
     crate::mip_bind::note(hash, &needs);
     if let Some(why) = needs.refusal() {
@@ -481,14 +486,19 @@ pub fn export_formats(num_rt: u32, formats: &[u32; 8]) -> [u8; 8] {
     if !SW.on() {
         return k;
     }
+    let ps = crate::blendclamp::ps_mode();
     for i in 0..(num_rt as usize).min(8) {
-        k[i] = match formats[i] {
-            10 | 34 | 54 => 1,
-            26 => 2,
-            _ => 0,
-        };
+        k[i] = export_kind(formats[i], ps);
     }
     k
+}
+
+pub fn export_kind(format: u32, ps_clamp: bool) -> u8 {
+    match format {
+        10 | 34 | 54 => if ps_clamp { 3 } else { 1 },
+        26 => if ps_clamp { 4 } else { 2 },
+        _ => 0,
+    }
 }
 
 pub fn cache_key(hash: u64, rtfmt: &[u8; 8]) -> u64 {
@@ -624,13 +634,30 @@ fn index_ctx() -> &'static str {
     static C: OnceLock<String> = OnceLock::new();
     C.get_or_init(|| {
         let f = fma_mode();
-        format!("dxc={} cbv_raw={} loop_grad={} fma={}{}{}{}", tombox_xshader::dxc::available(), if crate::cbv_raw::copy_on() { "copy".to_string() } else { crate::cbv_raw::enabled().to_string() }, loop_grad(), f.preserve as u8, f.any as u8, f.hybrid as u8, f.f2h as u8)
+        format!("dxc={} cbv_raw={} loop_grad={} fma={}{}{}{}", tombox_xshader::dxc::available(), if crate::cbv_raw::copy_on() { "copy2".to_string() } else { crate::cbv_raw::enabled().to_string() }, loop_grad(), f.preserve as u8, f.any as u8, f.hybrid as u8, f.f2h as u8)
     })
+}
+
+thread_local! {
+    pub(crate) static RUNTIME_SOURCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+const CB_META_SALT: u128 = 0x7462_6362_6d65_7461_0000_0000_0000_0001;
+
+fn copy_meta_hit(ik: u128, hash: u64) -> bool {
+    match tombox_xshader::shader_cache::get(ik ^ CB_META_SALT).as_deref().and_then(crate::cbv_copy::decode_meta) {
+        Some(m) => {
+            crate::cbv_copy::note_shader_cb(hash, m);
+            true
+        }
+        None => false,
+    }
 }
 
 fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, _key: u64) -> Result<Vec<u8>, String> {
     let ik = crate::xlat_index::key(blob, hash, rtfmt, link, index_ctx());
-    let hit = ik.and_then(crate::xlat_index::get);
+    let copy = crate::cbv_raw::copy_on();
+    let hit = ik.and_then(crate::xlat_index::get).filter(|_| !copy || ik.is_some_and(|k| copy_meta_hit(k, hash)));
     let r = match hit {
         Some(v) => Ok(v),
         None => {
@@ -638,6 +665,9 @@ fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, _key: u6
             let r = std::panic::catch_unwind(|| translate_uncached(blob, hash, rtfmt, link)).unwrap_or_else(|_| Err("translator panicked".to_string()));
             if let (Some(k), Ok(v)) = (ik, &r) {
                 crate::xlat_index::put(k, v, t0.elapsed().as_secs_f64() * 1000.0);
+                if let Some(m) = copy.then(|| crate::cbv_copy::shader_cb(hash)).flatten() {
+                    let _ = tombox_xshader::shader_cache::put(k ^ CB_META_SALT, &crate::cbv_copy::encode_meta(&m));
+                }
             }
             r
         }
@@ -725,6 +755,16 @@ fn boost_prewarm(key: u64) {
     }
 }
 
+fn prewarm_order<T>(known: Vec<T>, from_game: Vec<T>) -> Vec<T> {
+    let mut v: Vec<T> = from_game.into_iter().rev().collect();
+    v.extend(known.into_iter().rev());
+    v
+}
+
+fn prewarm_workers(cores: usize, from_game: usize) -> usize {
+    if from_game > 0 { cores.saturating_sub(4).max(1) } else { (cores / 3).clamp(1, 6) }
+}
+
 pub fn start_prewarm() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -737,6 +777,8 @@ pub fn start_prewarm() {
         let mut todo: Vec<(std::path::PathBuf, u64, [u8; 8])> = Vec::new();
         let mut seen: std::collections::HashSet<(u64, [u8; 8])> = std::collections::HashSet::new();
         let mut migrated = 0usize;
+        let game = tombox_xshader::shader_cache::game_scan_dir(&title_name());
+        let mut from_game: Vec<(std::path::PathBuf, u64, [u8; 8])> = Vec::new();
         for d in [dir.clone(), legacy_src_dir()] {
             let Ok(rd) = std::fs::read_dir(&d) else { continue };
             for e in rd.flatten() {
@@ -757,12 +799,25 @@ pub fn start_prewarm() {
                 todo.push((p, h, rt));
             }
         }
-        record("d3d12_xs", "shader_xlat", &format!("prewarm: {} known (shader, render-target format) variants from {} ({migrated} migrated from the old temp manifest); pack {} with {} records", todo.len(), dir.display(), tombox_xshader::shader_cache::pack_path().display(), tombox_xshader::shader_cache::stats().records));
+        let known = todo.len();
+        if let Ok(rd) = std::fs::read_dir(&game) {
+            let mut names: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            for name in names {
+                let Some((h, rt)) = parse_src_name(&name) else { continue };
+                if seen.insert((h, rt)) {
+                    from_game.push((game.join(&name), h, rt));
+                }
+            }
+        }
+        let extra = from_game.len();
+        todo = prewarm_order(todo, from_game);
+        record("d3d12_xs", "shader_xlat", &format!("prewarm: {known} known (shader, render-target format) variants from {} ({migrated} migrated from the old temp manifest) + {extra} not yet seen from the title's own files in {}; pack {} with {} records", dir.display(), game.display(), tombox_xshader::shader_cache::pack_path().display(), tombox_xshader::shader_cache::stats().records));
         if todo.is_empty() {
             return;
         }
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let workers = (cores / 3).clamp(1, 6);
+        let workers = prewarm_workers(cores, extra);
         let queue = Arc::new(Mutex::new(todo));
         for _ in 0..workers {
             let q = queue.clone();
@@ -915,6 +970,20 @@ pub fn counts() -> (usize, usize) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn prewarm_takes_known_variants_before_game_scan_ones_and_widens_only_for_a_game_scan() {
+        let mut q = prewarm_order(vec!["k1", "k2"], vec!["g1", "g2", "g3"]);
+        let mut popped = Vec::new();
+        while let Some(x) = q.pop() {
+            popped.push(x);
+        }
+        assert_eq!(popped, vec!["k1", "k2", "g1", "g2", "g3"]);
+        assert_eq!(prewarm_workers(18, 0), 6);
+        assert_eq!(prewarm_workers(18, 2741), 14);
+        assert_eq!(prewarm_workers(4, 10), 1);
+        assert_eq!(prewarm_workers(2, 0), 1);
+    }
+
     fn key_fixtures() -> Vec<(String, Vec<u8>)> {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../analysis/shaders");
         ["xdefiant_vs_swappc_s4.dxbc", "xdefiant_ps_frontface_quad.dxbc", "fortnite_vs_sample.dxbc", "fortnite_ps_sample.dxbc", "fortnite_cs_clear.dxbc"].iter().filter_map(|n| std::fs::read(base.join(n)).ok().map(|b| (n.to_string(), b))).collect()
@@ -965,7 +1034,7 @@ mod tests {
         use tombox_xshader::pack_key::CbvRaw;
         for setting in [None, Some(""), Some("auto"), Some("1"), Some("on"), Some("0"), Some("off"), Some("junk"), Some("copy")] {
             for xbox_one in [false, true] {
-                let mode = crate::cbv_raw::parse_mode(setting).unwrap_or(crate::cbv_raw::Mode::Auto);
+                let mode = crate::cbv_raw::parse_mode(setting).unwrap_or(crate::cbv_raw::Mode::Copy);
                 let enabled = match mode {
                     crate::cbv_raw::Mode::Auto => xbox_one,
                     crate::cbv_raw::Mode::On => true,

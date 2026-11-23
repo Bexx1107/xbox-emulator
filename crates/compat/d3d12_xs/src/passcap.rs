@@ -12,6 +12,7 @@ const IID_DEVICE: Guid = Guid(0x189819f1, 0x1db6, 0x4b57, [0xbe, 0x54, 0x18, 0x2
 const IID_ALLOCATOR: Guid = Guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
 const IID_GFX_LIST: Guid = Guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
 const IID_FENCE: Guid = Guid(0x0a753dcf, 0xc4d8, 0x4b91, [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76]);
+const IID_QUERY_HEAP: Guid = Guid(0x0d9658ae, 0xed45, 0x469e, [0xa6, 0x1d, 0x97, 0x0e, 0xc5, 0x83, 0xca, 0xb4]);
 const IID_RESOURCE: Guid = Guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
 
 pub const ST_COMMON: u32 = 0;
@@ -468,6 +469,20 @@ struct LState {
     dirty: bool,
     pso_dirty: bool,
     seq: u32,
+    cbv: HashMap<u32, u64>,
+    groot: usize,
+    rc: HashMap<u32, Vec<Option<u32>>>,
+    probe_caps: Vec<usize>,
+    probe_notes: Vec<String>,
+    probe_q: usize,
+}
+
+struct ProbeBuf {
+    rb: usize,
+    qh: usize,
+    n: usize,
+    kind: u8,
+    label: String,
 }
 
 #[derive(Default)]
@@ -519,6 +534,7 @@ struct Shot {
     chain: String,
     budget_note: Option<String>,
     ps_cache: HashMap<usize, u64>,
+    probes: Vec<ProbeBuf>,
 }
 
 #[derive(Default)]
@@ -654,7 +670,7 @@ unsafe fn boundary(g: &mut G, list: *mut c_void, end: &str) {
     let want = st.dirty || all;
     let (rts, dsv) = (st.rts.clone(), st.dsv);
     let mut pass = Pass { list: list as usize, key: k, order: 0, seq: st.seq, end: end.to_string(), draws: st.draws, dispatches: st.dispatches, indirect: st.indirect,
-        clears: st.clears.clone(), ps: st.ps.clone(), targets: Vec::new(), caps: Vec::new(), notes: Vec::new(), writes_src: false };
+        clears: st.clears.clone(), ps: st.ps.clone(), targets: Vec::new(), caps: st.probe_caps.clone(), notes: st.probe_notes.clone(), writes_src: false };
     if st.pso_dirty && st.draws + st.indirect == 0 {
         pass.notes.push("SetPipelineState with targets bound but no hooked draw: captured anyway; draw count is a lower bound (the title may draw through an unhooked slot)".into());
     }
@@ -701,7 +717,235 @@ fn reset_pass(st: &mut LState) {
     st.ps.clear();
     st.dirty = false;
     st.pso_dirty = false;
+    st.probe_caps.clear();
+    st.probe_notes.clear();
     st.seq += 1;
+}
+
+pub fn probe_hashes() -> &'static [u64] {
+    static P: OnceLock<Vec<u64>> = OnceLock::new();
+    P.get_or_init(|| std::env::var("TOMBOX_PASSCAP_PS").map(|v| v.split(|c: char| c == ',' || c.is_whitespace()).filter_map(|w| u64::from_str_radix(w.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default())
+}
+
+unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
+    let Some(st) = g.lists.get(&k) else { return };
+    if st.probe_notes.len() >= 4 {
+        return;
+    }
+    let mut cbv: Vec<(u32, u64)> = st.cbv.iter().map(|(a, b)| (*a, *b)).collect();
+    cbv.sort();
+    let pso = st.pso;
+    let rts: Vec<usize> = st.rts.clone();
+    let dsv = st.dsv;
+    let mut notes = vec![format!("probe PS {h:016x}: title root CBVs set since graphics root signature {:#x} (execute-time GPU readback of each source in probes.txt)", st.groot)];
+    let mut rcs: Vec<(u32, Vec<Option<u32>>)> = st.rc.iter().map(|(a, b)| (*a, b.clone())).collect();
+    rcs.sort_by_key(|x| x.0);
+    for (i, w) in &rcs {
+        let words: Vec<String> = w.iter().enumerate().map(|(k, v)| match v { Some(u) => format!("[{k}]{u:#010x}/{}", f32::from_bits(*u)), None => format!("[{k}]unset") }).collect();
+        notes.push(format!("  root[{i}] constants: {}", words.join(" ")));
+    }
+    for (i, va) in &cbv {
+        let src = crate::cbv_copy::lookup_source(*va).map(|s| format!("PC buffer {:#x}+{:#x} ({:#x} bytes left, state {:#x})", s.res, s.off, s.left, s.state)).unwrap_or_else(|| "not inside any known PC buffer".into());
+        notes.push(format!("  root[{i}] title va={va:#x} -> {src}"));
+    }
+    let rt_l: Vec<String> = rts.iter().map(|r| if *r == 0 { "-".into() } else { cached_label(g, *r) }).collect();
+    let ds_l = if dsv == 0 { "-".to_string() } else { cached_label(g, dsv) };
+    notes.push(format!("  bound RTs [{}] DSV {ds_l}", rt_l.join(" | ")));
+    notes.push(format!("  PSO {pso:#x}: {}", crate::device_wrap::pso_desc_text(pso).unwrap_or_else(|| "no PSO desc recorded".into())));
+    notes.push(format!("  translation: {}", crate::fmask_check::translation_text(h)));
+    let b = crate::bindtrace::dump(list as usize, false, &|r| format!("res {r:#x}"));
+    notes.extend(b.lines().map(|l| format!("  {l}")));
+    let mut srvs: Vec<usize> = Vec::new();
+    for part in b.split("SRV res 0x").skip(1) {
+        let hex: String = part.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        if let Ok(r) = usize::from_str_radix(&hex, 16) {
+            if r != 0 && !srvs.contains(&r) && srvs.len() < 8 {
+                srvs.push(r);
+            }
+        }
+    }
+    let mut caps = Vec::new();
+    let direct = list_type(list as usize) == 0;
+    for (n, r) in srvs.iter().enumerate() {
+        if !direct {
+            notes.push(format!("  SRV{n} {r:#x}: list type is not DIRECT; not captured"));
+            continue;
+        }
+        let (state, why) = match g.lists.get(&k).and_then(|s| s.states.get(r).copied()) {
+            Some(s) => (s, "in-list barrier"),
+            None => match crate::rtcap::state_of(*r).or_else(|| Some(crate::gpu_va::state(*r)).filter(|&x| x != 0)) {
+                Some(s) => (s, "tracked global state"),
+                None => (0xc0, "default for an SRV"),
+            },
+        };
+        match capture_into(g, list as usize, *r, state, why, &format!("SRV{n}")) {
+            Ok(i) => caps.push(i),
+            Err(e) => notes.push(format!("  SRV{n} {r:#x}: {e}")),
+        }
+    }
+    let mut qh = 0usize;
+    if g.device == 0 {
+        g.device = list_device(list as usize).unwrap_or(0);
+    }
+    if direct && g.device != 0 {
+        let qd: [u32; 3] = [2, 1, 0];
+        let mut q: *mut c_void = core::ptr::null_mut();
+        let hr = call!(g.device, 39, fn(*const u32, *const Guid, *mut *mut c_void) -> i32, qd.as_ptr(), &IID_QUERY_HEAP, &mut q);
+        if hr >= 0 && !q.is_null() {
+            qh = q as usize;
+            let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, 52));
+            f(list, q, 3, 0);
+        } else {
+            notes.push(format!("  pipeline-statistics query heap creation failed hr={hr:#x}"));
+        }
+    }
+    if let Some(st) = g.lists.get_mut(&k) {
+        st.probe_caps.extend(caps);
+        st.probe_notes.extend(notes);
+        st.probe_q = qh;
+    }
+}
+
+unsafe fn probe_after(this: *mut c_void) {
+    if probe_hashes().is_empty() || !ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    with(|g| {
+        let k = key(this);
+        let Some(st) = g.lists.get_mut(&k) else { return };
+        let qh = core::mem::take(&mut st.probe_q);
+        if qh == 0 {
+            return;
+        }
+        let mut cbv: Vec<(u32, u64)> = st.cbv.iter().map(|(a, b)| (*a, *b)).collect();
+        cbv.sort();
+        let seq = st.seq;
+        let dev = g.device;
+        let list = this as usize;
+        let mut out: Vec<ProbeBuf> = Vec::new();
+        let end: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(this, 53));
+        end(this, qh as *mut c_void, 3, 0);
+        match committed(dev, 3, &buffer_desc(256), 0x400) {
+            Ok(rb) => {
+                let rs: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(this, 54));
+                rs(this, qh as *mut c_void, 3, 0, 1, rb as *mut c_void, 0);
+                out.push(ProbeBuf { rb, qh, n: 88, kind: 0, label: format!("list {list:#x} pass seq {seq} draw pipeline statistics") });
+            }
+            Err(hr) => {
+                call!(qh, 2, fn() -> u32);
+                out.push(ProbeBuf { rb: 0, qh: 0, n: 0, kind: 2, label: format!("list {list:#x} pass seq {seq}: query readback buffer failed hr={hr:#x}") });
+            }
+        }
+        for (i, va) in cbv {
+            let Some(src) = crate::cbv_copy::lookup_source(va) else {
+                out.push(ProbeBuf { rb: 0, qh: 0, n: 0, kind: 2, label: format!("list {list:#x} pass seq {seq} root[{i}] title va={va:#x}: not inside any known PC buffer, no readback") });
+                continue;
+            };
+            let n = src.left.min(256);
+            let Ok(rb) = committed(dev, 3, &buffer_desc(256), 0x400) else { continue };
+            let bar = crate::cbv_copy::source_barrier(src.state);
+            if let Some((before, during)) = bar {
+                list_call_barrier(list, &[barrier_sub0(src.res, before, during)]);
+            }
+            let cp: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(this, 15));
+            cp(this, rb as *mut c_void, 0, src.res as *mut c_void, src.off, n);
+            if let Some((before, during)) = bar {
+                list_call_barrier(list, &[barrier_sub0(src.res, during, before)]);
+            }
+            out.push(ProbeBuf { rb, qh: 0, n: n as usize, kind: 1, label: format!("list {list:#x} pass seq {seq} root[{i}] title va={va:#x} = PC buffer {:#x}+{:#x} (left {:#x}, state {:#x}), copied after the draw on the GPU timeline", src.res, src.off, src.left, src.state) });
+        }
+        if let Some(shot) = g.shot.as_mut() {
+            shot.probes.extend(out);
+        } else {
+            for p in out {
+                if p.rb != 0 {
+                    call!(p.rb, 2, fn() -> u32);
+                }
+                if p.qh != 0 {
+                    call!(p.qh, 2, fn() -> u32);
+                }
+            }
+        }
+    })
+}
+
+unsafe fn probe_text(p: &ProbeBuf) -> String {
+    if p.kind == 2 || p.rb == 0 {
+        return format!("{}\n", p.label);
+    }
+    let mut ptr: *mut u8 = core::ptr::null_mut();
+    let range = [0usize, p.n];
+    let mut t = format!("{}\n", p.label);
+    if call!(p.rb, 8, fn(u32, *const usize, *mut *mut u8) -> i32, 0, range.as_ptr(), &mut ptr) < 0 || ptr.is_null() {
+        t.push_str("  readback Map failed\n");
+        return t;
+    }
+    let bytes = core::slice::from_raw_parts(ptr, p.n).to_vec();
+    let empty = [0usize, 0usize];
+    call!(p.rb, 9, fn(u32, *const usize) -> (), 0, empty.as_ptr());
+    if p.kind == 0 {
+        let q = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+        t.push_str(&format!("  IAVertices={} IAPrimitives={} VSInvocations={} GSInvocations={} GSPrimitives={} CInvocations={} CPrimitives={} PSInvocations={} HS={} DS={} CS={}\n", q(0), q(1), q(2), q(3), q(4), q(5), q(6), q(7), q(8), q(9), q(10)));
+    } else {
+        for (row, c) in bytes.chunks(16).enumerate() {
+            let w: Vec<String> = c.chunks(4).filter(|x| x.len() == 4).map(|x| { let u = u32::from_le_bytes(x.try_into().unwrap()); format!("{u:#010x}/{}", f32::from_bits(u)) }).collect();
+            t.push_str(&format!("  [{:3}] {}\n", row * 4, w.join(" ")));
+        }
+    }
+    t
+}
+
+fn note_rc(this: *mut c_void, i: u32, off: u32, vals: &[u32]) {
+    with(|g| {
+        let st = g.lists.entry(key(this)).or_default();
+        let e = st.rc.entry(i).or_default();
+        for (k, v) in vals.iter().enumerate() {
+            let at = off as usize + k;
+            if at >= 64 {
+                break;
+            }
+            if e.len() <= at {
+                e.resize(at + 1, None);
+            }
+            e[at] = Some(*v);
+        }
+    });
+}
+
+unsafe extern "system" fn set_graphics_root_c1(this: *mut c_void, i: u32, v: u32, off: u32) {
+    note_rc(this, i, off, &[v]);
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(prev(38));
+    f(this, i, v, off)
+}
+
+unsafe extern "system" fn set_graphics_root_cn(this: *mut c_void, i: u32, n: u32, p: *const c_void, off: u32) {
+    if !p.is_null() && n > 0 {
+        let vals = std::slice::from_raw_parts(p as *const u32, (n as usize).min(64));
+        note_rc(this, i, off, vals);
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const c_void, u32) = core::mem::transmute(prev(40));
+    f(this, i, n, p, off)
+}
+
+unsafe extern "system" fn set_graphics_root_sig(this: *mut c_void, rs: *mut c_void) {
+    with(|g| {
+        let st = g.lists.entry(key(this)).or_default();
+        if st.groot != rs as usize {
+            st.groot = rs as usize;
+            st.cbv.clear();
+            st.rc.clear();
+        }
+    });
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(prev(34));
+    f(this, rs)
+}
+
+unsafe extern "system" fn set_graphics_root_cbv(this: *mut c_void, i: u32, va: u64) {
+    with(|g| {
+        g.lists.entry(key(this)).or_default().cbv.insert(i, va);
+    });
+    let f: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(prev(42));
+    f(this, i, va)
 }
 
 unsafe fn views(n: u32, handles: *const usize, single: bool) -> Vec<usize> {
@@ -776,6 +1020,9 @@ fn note_draw(this: *mut c_void, kind: u8) {
                 if !st.ps.contains(&h) && st.ps.len() < 12 {
                     st.ps.push(h);
                 }
+                if probe_hashes().contains(&h) {
+                    unsafe { probe_draw(g, this, k, h) };
+                }
             }
         }
     })
@@ -784,12 +1031,14 @@ fn note_draw(this: *mut c_void, kind: u8) {
 unsafe extern "system" fn draw(this: *mut c_void, a: u32, b: u32, c: u32, d: u32) {
     note_draw(this, 0);
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = core::mem::transmute(prev(12));
-    f(this, a, b, c, d)
+    f(this, a, b, c, d);
+    probe_after(this)
 }
 unsafe extern "system" fn draw_indexed(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
     note_draw(this, 1);
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32) = core::mem::transmute(prev(13));
-    f(this, a, b, c, d, e)
+    f(this, a, b, c, d, e);
+    probe_after(this)
 }
 unsafe extern "system" fn dispatch(this: *mut c_void, a: u32, b: u32, c: u32) {
     note_draw(this, 2);
@@ -1010,7 +1259,8 @@ pub fn install(vt: &[AtomicUsize]) {
     if !on() {
         return;
     }
-    let hooks: [(usize, usize); 19] = [
+    let hooks: [(usize, usize); 23] = [
+        (42, set_graphics_root_cbv as *const () as usize), (34, set_graphics_root_sig as *const () as usize), (38, set_graphics_root_c1 as *const () as usize), (40, set_graphics_root_cn as *const () as usize),
         (9, close as *const () as usize), (10, reset as *const () as usize), (12, draw as *const () as usize), (13, draw_indexed as *const () as usize), (14, dispatch as *const () as usize),
         (16, copy_region as *const () as usize), (17, copy_resource as *const () as usize), (19, resolve as *const () as usize), (25, set_pso as *const () as usize), (26, barrier as *const () as usize),
         (50, om_set_targets as *const () as usize), (51, clear_dsv as *const () as usize), (52, clear_rtv as *const () as usize), (59, indirect as *const () as usize), (83, copy_region_x as *const () as usize),
@@ -1029,8 +1279,8 @@ pub fn install(vt: &[AtomicUsize]) {
     }
     let s = sel().unwrap();
     record("d3d12_xs", "passcap", &format!(
-        "TOMBOX_PASSCAP armed: shots at t={:?} s after first present, presents={:?}, file trigger={} ({}\\now or %TEMP%\\tombox_passcap_now), frames/shot={}, budget {} MB / {} captures, chain log every {} presents, output {}; hooks chained on Xbox slots 9,10,12,13,14,16,17,19,25,26,50,51,52,59,81,83,84,98,127{}{} (draws are never skipped or changed; captures add barrier+copy commands only on capture frames)",
-        s.secs, s.presents, s.file, out_root().display(), s.frames, s.budget_mb, s.max_caps, s.chain_every, out_root().display(),
+        "TOMBOX_PASSCAP armed: shots at t={:?} s after first present, presents={:?}, file trigger={} ({}\\now or %TEMP%\\tombox_passcap_now), frames/shot={}, budget {} MB / {} captures, chain log every {} presents, output {}; hooks chained on Xbox slots 9,10,12,13,14,16,17,19,25,26,34,38,40,42,50,51,52,59,81,83,84,98,127; probe PS {:x?}{}{} (draws are never skipped or changed; captures add barrier+copy commands only on capture frames)",
+        s.secs, s.presents, s.file, out_root().display(), s.frames, s.budget_mb, s.max_caps, s.chain_every, out_root().display(), probe_hashes(),
         if missing.is_empty() { String::new() } else { format!("; empty slots left alone: {missing:?}") },
         if s.unknown.is_empty() { String::new() } else { format!("; ignored tokens {:?}", s.unknown) }));
 }
@@ -1218,7 +1468,7 @@ pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32,
             if let Some(w) = why {
                 g.next_id += 1;
                 g.shot = Some(Shot { id: g.next_id, why: w.clone(), start_present: g.presents, end_present: 0, t, frames_left: s.frames, passes: Vec::new(), caps: Vec::new(), submit: HashMap::new(),
-                    bytes: 0, waits: 0, order: 0, src: 0, src_label: String::new(), chain: String::new(), budget_note: None, ps_cache: HashMap::new() });
+                    bytes: 0, waits: 0, order: 0, src: 0, src_label: String::new(), chain: String::new(), budget_note: None, ps_cache: HashMap::new(), probes: Vec::new() });
                 ACTIVE.store(true, Ordering::Relaxed);
                 record("d3d12_xs", "passcap", &format!("shot {} armed ({w}) at present #{} t={t:.2}s: recording the next {} frame(s)", g.next_id, g.presents, s.frames));
             }
@@ -1377,5 +1627,24 @@ fn write_shot(sh: Shot, gpu_done: bool, waited: Vec<(usize, bool)>, raw: bool) {
         }
     }
     let _ = std::fs::write(dir.join("passes.txt"), &out);
+    if !sh.probes.is_empty() {
+        let mut pt = format!("passcap shot {} probe readbacks (GPU complete={gpu_done}); pass seq matches the pass#/seq of passes.txt lists
+", sh.id);
+        for p in &sh.probes {
+            if gpu_done {
+                pt.push_str(&unsafe { probe_text(p) });
+            } else {
+                pt.push_str(&format!("{} (GPU not complete; not read)
+", p.label));
+            }
+            if p.rb != 0 {
+                unsafe { call!(p.rb, 2, fn() -> u32) };
+            }
+            if p.qh != 0 {
+                unsafe { call!(p.qh, 2, fn() -> u32) };
+            }
+        }
+        let _ = std::fs::write(dir.join("probes.txt"), pt);
+    }
     record("d3d12_xs", "passcap", &format!("shot {} written: {} passes, {} captures -> {}", sh.id, sh.passes.len(), sh.caps.len(), dir.join("passes.txt").display()));
 }

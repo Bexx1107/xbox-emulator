@@ -654,6 +654,10 @@ pub unsafe fn on_set_vbs(list: usize, start: u32, n: u32, views: *const u8) {
 /// Log one traced draw or dispatch (see `trace_hashes`): its arguments, vertex buffers and
 /// everything bound through descriptor tables (constant-buffer contents included).
 pub fn trace_draw(list: usize, compute: bool, text: &str) {
+    if !compute && crate::fmask_check::armed() {
+        let pso = with_trace(|t| t.lists.get(&list_key(list)).map(|s| s.pso).unwrap_or(0));
+        crate::fmask_check::on_draw(list, pso);
+    }
     let line = with_trace(|t| {
         if t.trace_hashes.is_empty() || t.trace_budget == 0 {
             return None;
@@ -982,7 +986,7 @@ pub fn end_frame(captured_into: Option<&std::path::Path>) {
         if t.trace_hashes != tl {
             t.trace_hashes = tl;
             t.trace_pso.clear();
-            t.trace_budget = 48;
+            t.trace_budget = std::env::var("TOMBOX_RTCAP_TRACE_BUDGET").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(48);
         }
     });
     if let Some(dir) = captured_into {

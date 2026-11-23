@@ -573,7 +573,7 @@ pub fn start(wrapper: *mut c_void, dir: &std::path::Path) {
     let n = recs.len();
     let workers = workers_for(n, cores());
     record("d3d12_xs", "pso_xrec", &format!(
-        "{} ({note}) read in {:.0} ms; records are the title's own Xbox PSO inputs, so translator and root-signature changes do not invalidate them; {workers} BELOW_NORMAL workers replay them through the title create path to fill the pipeline library; TOMBOX_PSO_XREC=0 disables",
+        "{} ({note}) read in {:.0} ms; records are the title's own Xbox PSO inputs, so translator and root-signature changes do not invalidate them; {workers} BELOW_NORMAL workers replay them through the title create path to fill the pipeline library (and, with cbv_raw=copy, the per-shader constant-buffer size table the title-thread create step needs); TOMBOX_PSO_XREC=0 disables",
         path.display(), t0.elapsed().as_secs_f64() * 1000.0));
     if n == 0 {
         return;

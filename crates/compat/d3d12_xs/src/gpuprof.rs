@@ -31,12 +31,38 @@ struct Ev {
     slot: u32,
     label: Label,
     kind: u8,
+    count: bool,
+    frame: u32,
 }
 
 #[derive(Default)]
 struct ListRec {
     label: Option<Label>,
     evs: Vec<Ev>,
+    last_kind: u8,
+}
+
+pub const TAG_BLENDCLAMP: u8 = 1;
+pub const TAG_CBV_COPY: u8 = 2;
+pub const TAG_RESOLVE: u8 = 3;
+pub const TAG_UPLOAD: u8 = 4;
+pub const TAG_PRESENT: u8 = 5;
+const KIND_PASS: u8 = 16;
+const KIND_CLOSE: u8 = 255;
+
+fn tag_name(tag: u64) -> &'static str {
+    match tag as u8 {
+        TAG_BLENDCLAMP => "blendclamp",
+        TAG_CBV_COPY => "cbv_copy",
+        TAG_RESOLVE => "resolve",
+        TAG_UPLOAD => "upload_pump",
+        TAG_PRESENT => "present_copy",
+        _ => "emu?",
+    }
+}
+
+fn stampable(ty: u32) -> bool {
+    ty == 0 || ty == 2
 }
 
 struct State {
@@ -55,6 +81,32 @@ struct State {
 static NEXT: [AtomicUsize; 128] = [const { AtomicUsize::new(0) }; 128];
 static ARMED: AtomicBool = AtomicBool::new(false);
 static SLOT: AtomicU32 = AtomicU32::new(0);
+static FRAME_IX: AtomicU32 = AtomicU32::new(0);
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
+}
+
+fn frames() -> u64 {
+    static F: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *F.get_or_init(|| env_u64("TOMBOX_GPUPROF_FRAMES").unwrap_or(FRAMES).clamp(1, 240))
+}
+
+fn period_ms() -> u64 {
+    static P: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *P.get_or_init(|| env_u64("TOMBOX_GPUPROF_PERIOD_MS").unwrap_or(PERIOD_SECS * 1000).max(250))
+}
+
+fn worst_frame(per_frame: &HashMap<u32, u64>) -> Option<(u32, u64, u64)> {
+    if per_frame.is_empty() {
+        return None;
+    }
+    let mut v: Vec<u64> = per_frame.values().copied().collect();
+    v.sort_unstable();
+    let median = v[v.len() / 2];
+    let (&f, &w) = per_frame.iter().max_by_key(|(f, t)| (**t, core::cmp::Reverse(**f)))?;
+    Some((f, w, median))
+}
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 static LIVE: crate::live_sw::Armed = crate::live_sw::Armed::new("TOMBOX_GPUPROF", "gpuprof", false);
@@ -115,7 +167,7 @@ pub unsafe fn install() {
     for (slot, f) in hooks {
         crate::cmdlist_wrap::vt_set(slot, f);
     }
-    record("d3d12_xs", "gpuprof", &format!("installed: {FRAMES}-frame GPU timestamp windows every {PERIOD_SECS}s"));
+    record("d3d12_xs", "gpuprof", &format!("installed: {}-frame GPU timestamp windows every {} ms (TOMBOX_GPUPROF_FRAMES / TOMBOX_GPUPROF_PERIOD_MS); each window also reports its slowest frame against the median", frames(), period_ms()));
 }
 
 fn label_of(pso: usize) -> Label {
@@ -190,7 +242,11 @@ unsafe fn ensure_resources(s: &mut State, list: *mut c_void) -> bool {
 }
 
 unsafe fn stamp(list: *mut c_void, kind: u8) {
-    if !ARMED.load(Ordering::Relaxed) {
+    unsafe { stamp_ev(list, None, kind, true) };
+}
+
+unsafe fn stamp_ev(list: *mut c_void, tag: Option<u8>, kind: u8, count: bool) {
+    if !ARMED.load(Ordering::Relaxed) || !stampable(unsafe { crate::fill::list_type(list) }) {
         return;
     }
     with(|s| {
@@ -204,9 +260,41 @@ unsafe fn stamp(list: *mut c_void, kind: u8) {
         let end: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = unsafe { core::mem::transmute(real(53)) };
         unsafe { end(list, s.heap as *mut c_void, QUERY_TIMESTAMP, slot) };
         let r = s.lists.entry(list as usize).or_default();
-        let label = r.label.unwrap_or(Label { a: 0, b: 0, compute: kind == 2 });
-        r.evs.push(Ev { slot, label, kind });
+        let (label, kind) = match tag {
+            Some(t) => (Label { a: t as u64, b: 0, compute: false }, KIND_PASS),
+            None if count => {
+                r.last_kind = kind;
+                (r.label.unwrap_or(Label { a: 0, b: 0, compute: kind == 2 }), kind)
+            }
+            None => (r.label.unwrap_or(Label { a: 0, b: 0, compute: r.last_kind == 2 }), r.last_kind),
+        };
+        r.evs.push(Ev { slot, label, kind, count, frame: FRAME_IX.load(Ordering::Relaxed) });
     });
+}
+
+pub unsafe fn pass_begin(list: *mut c_void, tag: u8) {
+    unsafe { stamp_ev(list, Some(tag), KIND_PASS, true) };
+}
+
+pub unsafe fn pass_end(list: *mut c_void) {
+    unsafe { stamp_ev(list, None, 0, false) };
+}
+
+pub unsafe fn own_begin(list: *mut c_void, tag: u8) {
+    if !ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    with(|s| {
+        let r = s.lists.entry(list as usize).or_default();
+        r.evs.clear();
+        r.label = None;
+        r.last_kind = 4;
+    });
+    unsafe { pass_begin(list, tag) };
+}
+
+pub unsafe fn own_close(list: *mut c_void) {
+    unsafe { close_list(list) };
 }
 
 unsafe fn close_list(list: *mut c_void) {
@@ -225,7 +313,7 @@ unsafe fn close_list(list: *mut c_void) {
         let resolve: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64) =
             unsafe { core::mem::transmute(real(54)) };
         unsafe { end(list, s.heap as *mut c_void, QUERY_TIMESTAMP, slot) };
-        evs.push(Ev { slot, label: Label { a: 0, b: 0, compute: false }, kind: 255 });
+        evs.push(Ev { slot, label: Label { a: 0, b: 0, compute: false }, kind: KIND_CLOSE, count: false, frame: FRAME_IX.load(Ordering::Relaxed) });
         let mut slots: Vec<u32> = evs.iter().map(|e| e.slot).collect();
         slots.sort_unstable();
         let mut i = 0;
@@ -264,6 +352,8 @@ unsafe fn report(s: &mut State) {
     let tick_ms = if freq != 0 { 1000.0 / freq as f64 } else { 0.0 };
     let max_ticks = if freq != 0 { freq / 10 } else { u64::MAX };
     let mut agg: HashMap<(u64, u64, bool, u8), (u64, u64)> = HashMap::new();
+    let mut per_frame: HashMap<u32, u64> = HashMap::new();
+    let mut by_frame: HashMap<(u32, u64, u64, bool, u8), u64> = HashMap::new();
     let (mut lo, mut hi, mut bad, mut n) = (u64::MAX, 0u64, 0u64, 0u64);
     for seq in &s.done {
         for w in seq.windows(2) {
@@ -277,24 +367,66 @@ unsafe fn report(s: &mut State) {
             n += 1;
             let e = agg.entry((w[0].label.a, w[0].label.b, w[0].label.compute, w[0].kind)).or_default();
             e.0 += t1 - t0;
-            e.1 += 1;
+            e.1 += w[0].count as u64;
+            *per_frame.entry(w[0].frame).or_default() += t1 - t0;
+            *by_frame.entry((w[0].frame, w[0].label.a, w[0].label.b, w[0].label.compute, w[0].kind)).or_default() += t1 - t0;
         }
     }
     unsafe { unmap(s.rb as *mut c_void, 0, core::ptr::null()) };
     let mut rows: Vec<_> = agg.into_iter().collect();
     rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
     let total: u64 = rows.iter().map(|r| r.1 .0).sum();
-    let per = |t: u64| t as f64 * tick_ms / FRAMES as f64;
+    let nf = frames();
+    let per = |t: u64| t as f64 * tick_ms / nf as f64;
     let span = if hi > lo { per(hi - lo) } else { 0.0 };
     let mut out = format!(
-        "[gpuprof] window {}: {FRAMES} frames, {n} timed events ({bad} rejected), freq={freq} Hz | summed GPU {:.3} ms/frame, wall span {:.3} ms/frame\n",
+        "[gpuprof] window {}: {nf} frames, {n} timed events ({bad} rejected), freq={freq} Hz | summed GPU {:.3} ms/frame, wall span {:.3} ms/frame\n",
         s.reports, per(total), span);
+    out.push_str(&format!("[gpuprof]   passes: {}\n", pass_summary(&rows, &per, nf)));
+    if let Some((wf, wt, med)) = worst_frame(&per_frame) {
+        let ms = |t: u64| t as f64 * tick_ms;
+        let mut d: Vec<(f64, String)> = rows.iter().map(|((a, b, compute, kind), (t, _))| {
+            let in_worst = by_frame.get(&(wf, *a, *b, *compute, *kind)).copied().unwrap_or(0);
+            let who = if *kind == KIND_PASS { tag_name(*a).to_string() } else { name(&Label { a: *a, b: *b, compute: *compute }) };
+            (ms(in_worst) - per(*t), who)
+        }).collect();
+        d.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(core::cmp::Ordering::Equal));
+        let top: Vec<String> = d.iter().take(8).filter(|x| x.0 > 0.05).map(|(x, w)| format!("+{x:.2} {w}")).collect();
+        out.push_str(&format!("[gpuprof]   slowest frame {wf}: {:.3} ms vs median {:.3} ms over {} frames | over its per-frame average: {}\n",
+            ms(wt), ms(med), per_frame.len(), if top.is_empty() { "-".to_string() } else { top.join(", ") }));
+    }
     for ((a, b, compute, kind), (t, c)) in rows.iter().take(40) {
-        let k = match kind { 0 => "draw", 1 => "drawidx", 2 => "dispatch", 3 => "indirect", 4 => "listhead", _ => "?" };
-        out.push_str(&format!("[gpuprof]   {:7.3} ms/f {:5.1}% {:6.1} calls/f {k:8} {}\n",
-            per(*t), *t as f64 * 100.0 / total.max(1) as f64, *c as f64 / FRAMES as f64, name(&Label { a: *a, b: *b, compute: *compute })));
+        let k = match *kind { 0 => "draw", 1 => "drawidx", 2 => "dispatch", 3 => "indirect", 4 => "listhead", KIND_PASS => "emupass", _ => "?" };
+        let who = if *kind == KIND_PASS { tag_name(*a).to_string() } else { name(&Label { a: *a, b: *b, compute: *compute }) };
+        out.push_str(&format!("[gpuprof]   {:7.3} ms/f {:5.1}% {:6.1} calls/f {k:8} {who}\n",
+            per(*t), *t as f64 * 100.0 / total.max(1) as f64, *c as f64 / nf as f64));
     }
     record("d3d12_xs", "gpuprof", &out);
+}
+
+fn pass_summary(rows: &[((u64, u64, bool, u8), (u64, u64))], per: &dyn Fn(u64) -> f64, nf: u64) -> String {
+    let mut title = (0u64, 0u64);
+    let mut tags: Vec<(u64, u64, u64)> = Vec::new();
+    for ((a, _, _, kind), (t, c)) in rows {
+        if *kind == KIND_PASS {
+            match tags.iter_mut().find(|e| e.0 == *a) {
+                Some(e) => {
+                    e.1 += t;
+                    e.2 += c;
+                }
+                None => tags.push((*a, *t, *c)),
+            }
+        } else {
+            title.0 += t;
+            title.1 += c;
+        }
+    }
+    tags.sort_by_key(|e| e.0);
+    let mut out = format!("title {:.3} ms/f {:.1} calls/f", per(title.0), title.1 as f64 / nf as f64);
+    for (a, t, c) in tags {
+        out.push_str(&format!(" | {} {:.3} ms/f {:.1} calls/f", tag_name(a), per(t), c as f64 / nf as f64));
+    }
+    out
 }
 
 pub fn on_present() {
@@ -316,7 +448,8 @@ pub fn on_present() {
             return;
         }
         if let Some(start) = s.window {
-            if s.presents >= start + FRAMES {
+            FRAME_IX.store((s.presents - start) as u32, Ordering::Relaxed);
+            if s.presents >= start + frames() {
                 ARMED.store(false, Ordering::Relaxed);
                 s.window = None;
                 s.finalize_at = Some(s.presents + SETTLE);
@@ -328,7 +461,7 @@ pub fn on_present() {
                 s.last = Some(Instant::now());
                 false
             }
-            Some(t) => t.elapsed().as_secs() >= PERIOD_SECS,
+            Some(t) => t.elapsed().as_millis() as u64 >= period_ms(),
         };
         if due && windows_on() {
             for r in s.lists.values_mut() {
@@ -336,6 +469,7 @@ pub fn on_present() {
             }
             s.done.clear();
             SLOT.store(0, Ordering::Relaxed);
+            FRAME_IX.store(0, Ordering::Relaxed);
             s.window = Some(s.presents);
             ARMED.store(true, Ordering::Relaxed);
         }
@@ -343,6 +477,7 @@ pub fn on_present() {
 }
 
 unsafe extern "system" fn h_close(this: *mut c_void) -> i32 {
+    unsafe { crate::blendclamp::flush(this) };
     unsafe { close_list(this) };
     let f: unsafe extern "system" fn(*mut c_void) -> i32 = unsafe { core::mem::transmute(next(9)) };
     unsafe { f(this) }
@@ -403,5 +538,41 @@ mod tests {
     fn labels_print_console_hashes() {
         assert_eq!(name(&Label { a: 0x1e8bbd9bbe7ab9b7, b: 0, compute: true }), "cs=1e8bbd9bbe7ab9b7");
         assert_eq!(name(&Label { a: 1, b: 0, compute: false }), "vs=0000000000000001 ps=-");
+    }
+
+    #[test]
+    fn pass_summary_splits_title_time_from_each_emulator_pass() {
+        let rows = vec![
+            ((7, 8, false, 0), (1600, 32)),
+            ((TAG_BLENDCLAMP as u64, 0, false, KIND_PASS), (320, 48)),
+            ((9, 0, true, 2), (160, 16)),
+            ((TAG_CBV_COPY as u64, 0, false, KIND_PASS), (16, 160)),
+        ];
+        let per = |t: u64| t as f64 / FRAMES as f64;
+        assert_eq!(pass_summary(&rows, &per, FRAMES), "title 110.000 ms/f 3.0 calls/f | blendclamp 20.000 ms/f 3.0 calls/f | cbv_copy 1.000 ms/f 10.0 calls/f");
+    }
+
+    #[test]
+    fn worst_frame_picks_the_slowest_and_reports_the_median() {
+        let m: HashMap<u32, u64> = [(0, 10), (1, 12), (2, 40), (3, 11), (4, 13)].into_iter().collect();
+        assert_eq!(worst_frame(&m), Some((2, 40, 12)));
+        let tie: HashMap<u32, u64> = [(5, 9), (3, 9)].into_iter().collect();
+        assert_eq!(worst_frame(&tie), Some((3, 9, 9)));
+        assert_eq!(worst_frame(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn only_direct_and_compute_lists_take_timestamps() {
+        assert!(stampable(0));
+        assert!(stampable(2));
+        assert!(!stampable(1));
+        assert!(!stampable(3));
+    }
+
+    #[test]
+    fn every_tag_has_a_name() {
+        for t in [TAG_BLENDCLAMP, TAG_CBV_COPY, TAG_RESOLVE, TAG_UPLOAD, TAG_PRESENT] {
+            assert_ne!(tag_name(t as u64), "emu?");
+        }
     }
 }

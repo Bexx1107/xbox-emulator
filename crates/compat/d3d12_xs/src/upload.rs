@@ -1139,6 +1139,7 @@ unsafe fn pump_inner(queue: *mut c_void) {
         const COPY_DEST: u32 = 0x400;
         vcall!(up.alloc, 8, fn() -> i32);
         vcall!(up.list, 10, fn(*mut c_void, *mut c_void) -> i32, up.alloc, core::ptr::null_mut());
+        crate::gpuprof::own_begin(up.list, crate::gpuprof::TAG_UPLOAD);
         for s in &staged {
             if s.state != COPY_DEST {
                 let b = [barrier(s.res, s.state, COPY_DEST)];
@@ -1161,6 +1162,7 @@ unsafe fn pump_inner(queue: *mut c_void) {
                 vcall!(up.list, 26, fn(u32, *const [u64; 4]) -> (), 1, b.as_ptr());
             }
         }
+        crate::gpuprof::own_close(up.list);
         let hr = vcall!(up.list, 9, fn() -> i32);
         if hr < 0 {
             record("d3d12_xs", "upload", &format!("upload list Close FAILED hr={hr:#010x}"));

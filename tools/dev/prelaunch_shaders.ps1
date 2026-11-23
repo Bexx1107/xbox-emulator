@@ -36,6 +36,7 @@ function Invoke-ShaderPrelaunch {
   }
   $a = @('--title', $ExeStem, '--name', $Name, '--yes')
   if (Test-Path $dll) { $a += @('--runtime-dll', $dll) }
+  if ($ExeDir -and $env:TOMBOX_GAME_SCAN -ne '0' -and (Test-Path -LiteralPath $ExeDir)) { $a += @('--game-dir', $ExeDir) }
   if ($NoUi -or $env:TOMBOX_PRELAUNCH_UI -eq '0' -or $env:TOMBOX_HEADLESS -eq '1') { $a += '--no-ui' }
   $sum = Join-Path $LogDir 'shader_prelaunch.txt'
   $a += @('--summary', $sum)

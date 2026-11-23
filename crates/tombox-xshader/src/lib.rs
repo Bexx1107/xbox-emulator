@@ -32,6 +32,7 @@ pub mod runtime_hlsl;
 pub mod cbv_raw_hlsl;
 #[cfg(windows)]
 pub mod shader_cache;
+pub mod game_scan;
 pub mod pack_key;
 pub mod branch_free;
 #[cfg(windows)]

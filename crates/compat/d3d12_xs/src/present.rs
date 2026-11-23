@@ -628,6 +628,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     vcall!(st.alloc, 8, fn() -> i32); // allocator Reset
     vcall!(st.list, 10, fn(*mut c_void, *mut c_void) -> i32, st.alloc, core::ptr::null_mut());
     crate::frame_csv::list_begin(st.device, st.list, st.frames + 1, ts_freq(queue));
+    crate::gpuprof::own_begin(st.list, crate::gpuprof::TAG_PRESENT);
     let pre = [barrier(src, COMMON, COPY_SOURCE), barrier(dst, COMMON, COPY_DEST)];
     vcall!(st.list, 26, fn(u32, *const [u64; 4]) -> (), 2, pre.as_ptr());
     vcall!(st.list, 17, fn(*mut c_void, *mut c_void) -> (), dst, src); // CopyResource
@@ -653,6 +654,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     let post = [barrier(src, COPY_SOURCE, COMMON), barrier(dst, dst_after, COMMON)];
     vcall!(st.list, 26, fn(u32, *const [u64; 4]) -> (), 2, post.as_ptr());
     crate::frame_csv::list_end(st.list, st.frames + 1);
+    crate::gpuprof::own_close(st.list);
     let hr = vcall!(st.list, 9, fn() -> i32);
     if let Some((rb_src, rb_dst)) = snaps {
         if hr >= 0 {

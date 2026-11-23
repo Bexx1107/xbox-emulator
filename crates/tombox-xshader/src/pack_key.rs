@@ -55,10 +55,10 @@ impl CbvRaw {
 
     pub fn decide(setting: Option<&str>, xbox_one_title: bool) -> CbvRaw {
         let rewrite = match setting.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-            Some("copy") => return CbvRaw::Copy,
+            Some("auto") => xbox_one_title,
             Some("1") | Some("on") => true,
             Some("0") | Some("off") => false,
-            _ => xbox_one_title,
+            _ => return CbvRaw::Copy,
         };
         CbvRaw::of(rewrite, xbox_one_title)
     }
@@ -128,6 +128,9 @@ pub fn translate(ex: &ShaderExtract, link: Option<&InputInterp>, cbv: CbvRaw) ->
             return Err("bind: Xbox One title shader is not a Durango program; its constant buffers cannot follow the raw-SRV binding".into());
         }
         t.hlsl = cbv_raw_hlsl::rewrite_hlsl(&t.hlsl).map_err(|e| format!("bind: {e}"))?;
+    }
+    if cbv == CbvRaw::Copy {
+        t.hlsl = cbv_raw_hlsl::rewrite_tables(&t.hlsl, ex.root_sig.as_ref()).map_err(|e| format!("bind: {e}"))?;
     }
     Ok(t)
 }
@@ -234,9 +237,9 @@ mod tests {
         assert_eq!(CbvRaw::decide(Some("on"), true), CbvRaw::On);
         assert_eq!(CbvRaw::decide(Some("0"), true), CbvRaw::Off);
         assert_eq!(CbvRaw::decide(Some("auto"), true), CbvRaw::On);
-        assert_eq!(CbvRaw::decide(None, true), CbvRaw::On);
-        assert_eq!(CbvRaw::decide(None, false), CbvRaw::Off);
-        assert_eq!(CbvRaw::decide(Some("x"), false), CbvRaw::Off);
+        assert_eq!(CbvRaw::decide(None, true), CbvRaw::Copy);
+        assert_eq!(CbvRaw::decide(None, false), CbvRaw::Copy);
+        assert_eq!(CbvRaw::decide(Some("x"), false), CbvRaw::Copy);
         assert_eq!(CbvRaw::decide(Some("copy"), true), CbvRaw::Copy);
         assert_eq!(CbvRaw::decide(Some(" COPY "), false), CbvRaw::Copy);
         for c in [CbvRaw::Off, CbvRaw::On, CbvRaw::Forced, CbvRaw::Copy] {

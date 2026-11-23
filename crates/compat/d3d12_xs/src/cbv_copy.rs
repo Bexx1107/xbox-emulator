@@ -263,6 +263,7 @@ pub struct Engine {
     pub rs_params: HashMap<usize, Vec<(usize, u32, u32, u32)>>,
     pub pso_sizes: HashMap<usize, Vec<(u32, u32, u32, u64)>>,
     pub cb_limits: HashMap<usize, Vec<(u32, u32, u32, u64)>>,
+    pub pso_stages: HashMap<usize, Vec<(u32, u64)>>,
 }
 
 impl Engine {
@@ -335,6 +336,25 @@ impl Engine {
         }
     }
 
+    pub fn materialize(&mut self, pso: usize, meta: &dyn Fn(u64) -> Option<ShaderCb>) -> bool {
+        if self.pso_sizes.contains_key(&pso) {
+            return true;
+        }
+        let Some(stages) = self.pso_stages.get(&pso) else { return false };
+        let mut sizes = Vec::new();
+        let mut limits = Vec::new();
+        for &(vis, h) in stages {
+            let Some(m) = meta(h) else { return false };
+            sizes.extend(m.sizes.iter().map(|&(r, sp, b)| (vis, r, sp, b)));
+            limits.extend(m.limits.iter().map(|&(r, sp, b)| (vis, r, sp, b)));
+        }
+        self.pso_sizes.insert(pso, sizes);
+        if !limits.is_empty() {
+            self.cb_limits.insert(pso, limits);
+        }
+        true
+    }
+
     pub fn declared(&self, pso: Option<usize>, rs: usize, idx: u32) -> Option<u64> {
         Self::per_stage(&self.pso_sizes, &self.rs_params, pso, rs, idx).into_iter().max()
     }
@@ -376,6 +396,11 @@ impl Engine {
         }
         st.pending.retain(|k, _| mask & (1 << k.0) == 0);
         let rs = st.rs;
+        if let Some(p) = pso {
+            if !self.materialize(p, &shader_cb) && self.pso_stages.contains_key(&p) {
+                note(&SIZE_UNKNOWN, 4, &|| format!("pso {p:#x}: a stage's constant buffer sizes were not recorded by its translation; its unaligned root CBVs use a 64 KiB slot zero-filled past the source"));
+            }
+        }
         let sizes: Vec<(Option<u64>, Option<u64>, Option<(u32, u32)>)> = todo.iter().map(|((side, idx), _)| {
             let r = rs[*side as usize];
             (self.declared(pso, r, *idx), self.limit(pso, r, *idx), self.reg_of(r, *idx))
@@ -443,67 +468,100 @@ pub fn slot_limits(m: &std::collections::BTreeMap<u32, u64>) -> Vec<(u32, u32, u
     m.iter().filter(|(slot, _)| **slot & 0x8000_0000 == 0).map(|(slot, b)| (slot & 0xffff, slot >> 16, *b)).collect()
 }
 
-static SHADER_SIZES: Mutex<Option<HashMap<u64, ShaderCb>>> = Mutex::new(None);
+static SHADER_CB: Mutex<Option<HashMap<u64, ShaderCb>>> = Mutex::new(None);
 
-pub fn shader_sizes(blob: &[u8]) -> Option<ShaderCb> {
-    let hash = crate::shader_xlat::fnv1a(blob);
-    if let Some(v) = SHADER_SIZES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&hash) {
-        return Some(v.clone());
-    }
-    let r = std::panic::catch_unwind(|| {
-        let ex = tombox_xshader::extract(blob).ok()?;
-        let t = tombox_xshader::pack_key::translate(&ex, None, tombox_xshader::pack_key::CbvRaw::Off).ok()?;
-        Some(ShaderCb { sizes: tombox_xshader::cbv_raw_hlsl::declared_sizes(&t.hlsl), limits: slot_limits(&t.cb_limits) })
-    })
-    .ok()
-    .flatten()?;
-    SHADER_SIZES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(hash, r.clone());
-    Some(r)
+pub fn note_shader_cb(hash: u64, meta: ShaderCb) {
+    SHADER_CB.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(hash, meta);
 }
 
-type StageCb = (Vec<(u32, u32, u32, u64)>, Vec<(u32, u32, u32, u64)>);
+pub fn shader_cb(hash: u64) -> Option<ShaderCb> {
+    SHADER_CB.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&hash).cloned()
+}
 
-unsafe fn stage_sizes(desc: *const u8, stages: &[(u32, usize)]) -> StageCb {
+pub fn meta_of(t: &tombox_xshader::hlsl::Translated) -> ShaderCb {
+    ShaderCb { sizes: tombox_xshader::cbv_raw_hlsl::declared_sizes(&t.hlsl), limits: slot_limits(&t.cb_limits) }
+}
+
+pub fn encode_meta(m: &ShaderCb) -> Vec<u8> {
+    let mut v = b"TBCBM1".to_vec();
+    for part in [&m.sizes, &m.limits] {
+        v.extend_from_slice(&(part.len() as u32).to_le_bytes());
+        for &(r, sp, b) in part.iter() {
+            v.extend_from_slice(&r.to_le_bytes());
+            v.extend_from_slice(&sp.to_le_bytes());
+            v.extend_from_slice(&b.to_le_bytes());
+        }
+    }
+    v
+}
+
+pub fn decode_meta(b: &[u8]) -> Option<ShaderCb> {
+    let mut at = 6;
+    if b.get(..6)? != b"TBCBM1" {
+        return None;
+    }
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let s = b.get(at..at + n)?;
+        at += n;
+        Some(s)
+    };
+    let mut parts = Vec::new();
+    for _ in 0..2 {
+        let n = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        if n > 4096 {
+            return None;
+        }
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            let r = u32::from_le_bytes(take(4)?.try_into().ok()?);
+            let sp = u32::from_le_bytes(take(4)?.try_into().ok()?);
+            let bytes = u64::from_le_bytes(take(8)?.try_into().ok()?);
+            v.push((r, sp, bytes));
+        }
+        parts.push(v);
+    }
+    let limits = parts.pop()?;
+    let sizes = parts.pop()?;
+    Some(ShaderCb { sizes, limits })
+}
+
+unsafe fn stage_hashes(desc: *const u8, stages: &[(u32, usize)]) -> Vec<(u32, u64)> {
     let mut out = Vec::new();
-    let mut lim = Vec::new();
     for &(vis, off) in stages {
         let p = unsafe { core::ptr::read_unaligned(desc.add(off) as *const u64) } as *const u8;
         let n = unsafe { core::ptr::read_unaligned(desc.add(off + 8) as *const u64) } as usize;
         if p.is_null() || !(32..=0x40_0000).contains(&n) {
             continue;
         }
-        match shader_sizes(unsafe { core::slice::from_raw_parts(p, n) }) {
-            Some(v) => {
-                out.extend(v.sizes.into_iter().map(|(r, sp, b)| (vis, r, sp, b)));
-                lim.extend(v.limits.into_iter().map(|(r, sp, b)| (vis, r, sp, b)));
-            }
-            None => note(&SIZE_UNKNOWN, 4, &|| format!("stage visibility {vis}: declared constant buffer sizes unknown (translation failed); its unaligned root CBVs copy up to 64 KiB clamped to the source end")),
-        }
+        out.push((vis, crate::shader_xlat::fnv1a(unsafe { core::slice::from_raw_parts(p, n) })));
     }
-    (out, lim)
+    out
 }
 
-fn store_pso(pso: usize, v: StageCb) {
+pub fn store_pso(pso: usize, stages: Vec<(u32, u64)>) {
     with(|e| {
-        e.pso_sizes.insert(pso, v.0);
-        if v.1.is_empty() {
-            e.cb_limits.remove(&pso);
-        } else {
-            e.cb_limits.insert(pso, v.1);
-        }
+        e.pso_sizes.remove(&pso);
+        e.cb_limits.remove(&pso);
+        e.pso_stages.insert(pso, stages);
     });
 }
 
 const GFX_STAGES: [(u32, usize); 5] = [(1, 0x08), (5, 0x18), (3, 0x28), (2, 0x38), (4, 0x48)];
 
 pub fn after_gfx_pso(hr: i32, pdesc: *const u8, ppv: *mut *mut c_void) -> i32 {
-    if hr >= 0 && crate::cbv_raw::copy_on() && !pdesc.is_null() && !ppv.is_null() {
-        let pso = unsafe { *ppv } as usize;
-        if pso != 0 {
-            store_pso(pso, unsafe { stage_sizes(pdesc, &GFX_STAGES) });
-        }
+    if crate::cbv_raw::copy_on() {
+        unsafe { record_pso(hr, pdesc, ppv, &GFX_STAGES) };
     }
     hr
+}
+
+unsafe fn record_pso(hr: i32, pdesc: *const u8, ppv: *mut *mut c_void, stages: &[(u32, usize)]) {
+    if hr >= 0 && !pdesc.is_null() && !ppv.is_null() {
+        let pso = unsafe { *ppv } as usize;
+        if pso != 0 {
+            store_pso(pso, unsafe { stage_hashes(pdesc, stages) });
+        }
+    }
 }
 
 pub fn alias_pso(from: usize, to: usize) {
@@ -517,15 +575,15 @@ pub fn alias_pso(from: usize, to: usize) {
         if let Some(v) = e.cb_limits.get(&from).cloned() {
             e.cb_limits.entry(to).or_insert(v);
         }
+        if let Some(v) = e.pso_stages.get(&from).cloned() {
+            e.pso_stages.entry(to).or_insert(v);
+        }
     });
 }
 
 pub fn after_compute_pso(hr: i32, pdesc: *const u8, ppv: *mut *mut c_void) -> i32 {
-    if hr >= 0 && crate::cbv_raw::copy_on() && !pdesc.is_null() && !ppv.is_null() {
-        let pso = unsafe { *ppv } as usize;
-        if pso != 0 {
-            store_pso(pso, unsafe { stage_sizes(pdesc, &[(0, 0x08)]) });
-        }
+    if crate::cbv_raw::copy_on() {
+        unsafe { record_pso(hr, pdesc, ppv, &[(0, 0x08)]) };
     }
     hr
 }
@@ -539,7 +597,6 @@ static SIZE_UNKNOWN: AtomicUsize = AtomicUsize::new(0);
 static UNRESOLVED: AtomicUsize = AtomicUsize::new(0);
 static NO_ROOM: AtomicUsize = AtomicUsize::new(0);
 static BUNDLE_REFUSED: AtomicUsize = AtomicUsize::new(0);
-static TABLE_UNALIGNED: AtomicUsize = AtomicUsize::new(0);
 static COPIES: AtomicUsize = AtomicUsize::new(0);
 static REUSED: AtomicUsize = AtomicUsize::new(0);
 static NO_FENCE: AtomicUsize = AtomicUsize::new(0);
@@ -552,11 +609,7 @@ fn note(c: &AtomicUsize, first: usize, text: &dyn Fn() -> String) {
     }
 }
 
-pub fn note_table_cbv(loc: u64, size: u32) {
-    if crate::cbv_raw::copy_on() && loc % SLOT_ALIGN != 0 {
-        note(&TABLE_UNALIGNED, 8, &|| format!("descriptor-table CBV BufferLocation {loc:#x} size {size} is not 256-byte aligned; cbv_raw=copy covers root CBVs only, this descriptor is created as given (unsupported)"));
-    }
-}
+pub use tombox_xshader::cbv_raw_hlsl::{in_table, table_cbv_ranges};
 
 unsafe fn vslot(o: *mut c_void, i: usize) -> usize {
     unsafe { *(*(o as *const *const usize)).add(i) }
@@ -651,8 +704,13 @@ pub fn detail_text(d: &Detail) -> String {
 
 static TRACED: AtomicUsize = AtomicUsize::new(0);
 
+fn trace_cap() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("TOMBOX_CBRAW_CAP_N").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64))
+}
+
 unsafe fn trace_target(list: *mut c_void, pso: Option<usize>, job: &Job) {
-    if TRACED.load(Ordering::Relaxed) >= 64 {
+    if TRACED.load(Ordering::Relaxed) >= trace_cap() {
         return;
     }
     let Some(pso) = pso else { return };
@@ -661,7 +719,7 @@ unsafe fn trace_target(list: *mut c_void, pso: Option<usize>, job: &Job) {
         return;
     }
     for d in &job.detail {
-        if TRACED.fetch_add(1, Ordering::Relaxed) >= 64 {
+        if TRACED.fetch_add(1, Ordering::Relaxed) >= trace_cap() {
             return;
         }
         record("d3d12_xs", "cbv_copy", &format!("target PS {ps:016x} draw on list {list:p}: {}", detail_text(d)));
@@ -787,7 +845,14 @@ pub unsafe fn resolve_with(list: *mut c_void, mask: u8, pso: Option<usize>, pred
     for &(side, idx, va) in &job.no_room {
         note(&NO_ROOM, 4, &|| format!("root CBV param {idx} side {side} va={va:#x}: the copy ring could not grow (DEFAULT-heap chunk creation failed); bound as given, as cbv_raw=off does"));
     }
+    let timed = !job.copies.is_empty();
+    if timed {
+        unsafe { crate::gpuprof::pass_begin(list, crate::gpuprof::TAG_CBV_COPY) };
+    }
     unsafe { run(list, &job, zero, ty, pred) };
+    if timed {
+        unsafe { crate::gpuprof::pass_end(list) };
+    }
     for &(side, idx, va) in job.unresolved.iter().chain(job.no_room.iter()) {
         unsafe { bind(list, side, idx, va) };
     }
@@ -1023,6 +1088,66 @@ mod tests {
 
     fn src(res: usize, base: u64, len: u64) -> impl Fn(u64) -> Option<Src> {
         move |va| (va >= base && va < base + len).then(|| Src { res, off: va - base, left: base + len - va, state: 0xac3 })
+    }
+
+    #[test]
+    fn copy_mode_pso_create_reuses_the_translation_metadata_and_never_translates_again() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../input/shader_cache/titles/GbxGame/src/f861c56a34758d84_0200000000000000.xbox");
+        let Ok(blob) = std::fs::read(&path) else {
+            println!("Trackmania PS f861c56a34758d84 not on disk ({}): check not run", path.display());
+            return;
+        };
+        let hash = crate::shader_xlat::fnv1a(&blob);
+        let mode = tombox_xshader::pack_key::Mode { cbv_raw: tombox_xshader::pack_key::CbvRaw::Copy, loop_grad: false, fma: Default::default() };
+        let count = || crate::shader_xlat::RUNTIME_SOURCES.with(|c| c.get());
+        let n0 = count();
+        let _ = crate::shader_xlat::runtime_source(&blob, hash, &[2, 0, 0, 0, 0, 0, 0, 0], &tombox_xshader::hlsl::InputInterp::default(), None, &mode);
+        assert_eq!(count(), n0 + 1);
+        let meta = shader_cb(hash).expect("the copy-mode translation records the shader's constant buffer sizes");
+        let &(reg, space, bytes) = meta.sizes.first().expect("f861 declares constant buffers");
+        let mut desc = vec![0u8; 0x58];
+        desc[0x18..0x20].copy_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
+        desc[0x20..0x28].copy_from_slice(&(blob.len() as u64).to_le_bytes());
+        let (pso, rs) = (0x7f00_c0de_0001usize, 0x7f00_c0de_0002usize);
+        let mut out = pso as *mut c_void;
+        let n1 = count();
+        unsafe { record_pso(0, desc.as_ptr(), &mut out, &GFX_STAGES) };
+        let got = with(|e| {
+            e.rs_params.insert(rs, vec![(5, reg, space, 0)]);
+            let ok = e.materialize(pso, &shader_cb);
+            let r = (ok, e.pso_stages.get(&pso).cloned(), e.declared(Some(pso), rs, 5));
+            e.rs_params.remove(&rs);
+            e.pso_stages.remove(&pso);
+            e.pso_sizes.remove(&pso);
+            e.cb_limits.remove(&pso);
+            r
+        });
+        assert_eq!(count(), n1, "a PSO create in copy mode must not run the translator again");
+        assert_eq!(got.0, true);
+        assert_eq!(got.1, Some(vec![(5, hash)]));
+        assert_eq!(got.2, Some(bytes));
+    }
+
+    #[test]
+    fn pso_sizes_come_from_the_recorded_translation_metadata() {
+        let m = ShaderCb { sizes: vec![(13, 0, 0x140), (2, 1, 0x40)], limits: vec![(13, 0, 0x44)] };
+        assert_eq!(decode_meta(&encode_meta(&m)), Some(m.clone()));
+        assert_eq!(decode_meta(b"TBCBM1\x01"), None);
+        assert_eq!(decode_meta(b"junk"), None);
+        let mut e = Engine::default();
+        e.rs_params.insert(0x77, vec![(3, 13, 0, 0)]);
+        e.pso_stages.insert(0x99, vec![(1, 0xaaa), (5, 0xbbb)]);
+        let only_ps = |h: u64| (h == 0xbbb).then(|| m.clone());
+        assert!(!e.materialize(0x99, &only_ps));
+        assert_eq!(e.declared(Some(0x99), 0x77, 3), None);
+        let both = |h: u64| match h {
+            0xaaa => Some(ShaderCb::default()),
+            0xbbb => Some(m.clone()),
+            _ => None,
+        };
+        assert!(e.materialize(0x99, &both));
+        assert_eq!(e.declared(Some(0x99), 0x77, 3), Some(0x140));
+        assert_eq!(e.limit(Some(0x99), 0x77, 3), Some(0x44));
     }
 
     #[test]

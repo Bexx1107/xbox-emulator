@@ -52,6 +52,7 @@ pub struct Translated {
     pub uses_typed_atomic64: bool,
     pub user_data_base: Option<usize>,
     pub cb_limits: BTreeMap<u32, u64>,
+    pub fmask: Vec<(u32, u32, u32)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -193,7 +194,8 @@ uint tb_cvt_u(float x) { if (tb_nan(x) || x <= 0.0) return 0u; if (x >= 42949672
 #define TB_WV(e, d) (((exec_lo & 1u) != 0u) ? (uint)(e) : (d))
 #endif
 uint tb_f16rtz(float x) { uint h = f32tof16(x); float b = f16tof32(h); if (abs(b) > abs(x) && (h & 0x7fffu) != 0u) h = (h & 0x8000u) | ((h & 0x7fffu) - 1u); return h; }
-float tb_rtfmt(float x, uint k, uint c) { if (k == 0u) return x; float h = f16tof32(tb_f16rtz(x)); if (k == 2u && h <= 65504.0) h = min(h, c == 2u ? 64512.0 : 65024.0); return h; }
+float tb_rtfmt(float x, uint k, uint c) { if (k == 0u) return x; uint kk = k > 2u ? k - 2u : k; float h = f16tof32(tb_f16rtz(x)); if (kk == 2u && h <= 65504.0) h = min(h, c == 2u ? 64512.0 : 65024.0); return h; }
+float tb_psclamp(float x, uint k, uint c) { if (k == 3u) return isnan(x) ? 65504.0 : clamp(x, -65504.0, 65504.0); if (k == 4u) { float m = c == 2u ? 64512.0 : 65024.0; return isnan(x) ? m : min(x, m); } return x; }
 #ifndef TB_RTFMT0
 #define TB_RTFMT0 0u
 #endif
@@ -387,6 +389,30 @@ fn ssrc_name(code: u32) -> Result<String, String> {
     }
 }
 
+fn ps_clamp_lines(osig: &[SigElement]) -> String {
+    let targets: Vec<(usize, u32, usize)> = osig
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.sysval == 64 && !matches!(e.comp_type, 1 | 2) && e.index <= 7)
+        .map(|(ei, e)| (ei, e.index, sig_type(e).1))
+        .collect();
+    ps_clamp_epilogue(&targets)
+}
+
+pub fn ps_clamp_epilogue(targets: &[(usize, u32, usize)]) -> String {
+    let mut out = String::new();
+    for &(ei, index, comps) in targets {
+        for (c, x) in XYZW.iter().enumerate().take(comps.min(4)) {
+            out.push_str(&format!("    o.o{ei}.{x} = tb_psclamp(o.o{ei}.{x}, TB_RTFMT{index}, {c}u);\n"));
+        }
+    }
+    out
+}
+
+pub fn ps_helpers() -> &'static str {
+    CUBE_HELPERS
+}
+
 fn sig_type(e: &SigElement) -> (String, usize) {
     // Component count = number of mask bits (elements can be packed into a shared register,
     // e.g. TEXCOORD4.xy + TEXCOORD5.zw, so the highest bit is not the count).
@@ -466,6 +492,8 @@ struct Emitter<'a> {
     uses_smem_bounds: bool,
     cb_lim: HashMap<u32, Option<u64>>,
     tex: BTreeMap<u32, u32>,       // slot -> dim
+    fmask: BTreeMap<u32, u32>,
+    fmask_loc: BTreeSet<(u32, u32, u32)>,
     samp: BTreeSet<u32>,
     samp_cmp: BTreeSet<u32>,
     uav: BTreeMap<u32, u32>,       // slot -> dim
@@ -584,9 +612,14 @@ pub fn bl_alias_space(k: u32, space: u32) -> u32 {
     TB_BLALIAS_SPACE + (k - 1) * 100_000 + space
 }
 
+pub fn dg_vertex_id_on() -> bool {
+    static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("TOMBOX_XS_DG_VERTEXID").map(|v| v.trim() != "0").unwrap_or(true))
+}
+
 pub fn msaa_dim_on() -> bool {
     static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("TOMBOX_XS_MSAA_DIM").map(|v| v.trim() == "1").unwrap_or(false))
+    *M.get_or_init(|| std::env::var("TOMBOX_XS_MSAA_DIM").map(|v| v.trim() != "0").unwrap_or(true))
 }
 
 pub fn psv_image_dim_ms(kind: u32, da_dim: u32, ms: bool) -> u32 {
@@ -1205,6 +1238,8 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         uses_smem_bounds: false,
         cb_lim: HashMap::new(),
         tex: BTreeMap::new(),
+        fmask: BTreeMap::new(),
+        fmask_loc: BTreeSet::new(),
         samp: BTreeSet::new(),
         samp_cmp: BTreeSet::new(),
         uav: BTreeMap::new(),
@@ -1341,7 +1376,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         (_, Some("ms")) => "ms_6_8",
         _ => profile,
     };
-    Ok(Translated { hlsl, entry: "main", profile, mip_uavs: em.uav_mips.iter().copied().collect(), mip_srvs: em.tex_mips.iter().copied().collect(), needs_gmem: em.uses_bvh, needs_global: em.uses_global, uses_typed_atomic64: !em.uav_u64.is_empty(), user_data_base: em.ud_active().then(|| em.user_base()), cb_limits: em.cb_limits() })
+    Ok(Translated { hlsl, entry: "main", profile, mip_uavs: em.uav_mips.iter().copied().collect(), mip_srvs: em.tex_mips.iter().copied().collect(), needs_gmem: em.uses_bvh, needs_global: em.uses_global, uses_typed_atomic64: !em.uav_u64.is_empty(), user_data_base: em.ud_active().then(|| em.user_base()), cb_limits: em.cb_limits(), fmask: em.fmask_loc.iter().copied().collect() })
 }
 
 impl<'a> Emitter<'a> {
@@ -2472,6 +2507,16 @@ impl<'a> Emitter<'a> {
                         let writes = ins.mnemonic.contains("store") || ins.mnemonic.contains("atomic") || self.uav_force.contains(&tslot);
                         let is_uav = self.kind_at(*ttable, *off, writes)? == Some(1);
                         let dim = self.gcn_image_dim(*ttable, *off, is_uav, da_dim);
+                        if !is_uav && dim == 1 && msaa_dim_on() && ins.mnemonic == "image_load" && *off & BINDLESS == 0 && *off >= 32 && self.gcn_image_dim(*ttable, *off - 32, false, 1) == 6 {
+                            let ms = self.bind_id(*ttable, *off - 32, 32);
+                            if ms & BINDLESS == 0 {
+                                self.tex.entry(ms).or_insert(6);
+                                self.fmask.insert(tslot, ms);
+                                if let Some((param, _)) = self.root_param_at(*ttable, self.user_base()) {
+                                    self.fmask_loc.insert((param as u32, *off / 32, (*off - 32) / 32));
+                                }
+                            }
+                        }
                         if tslot & BINDLESS != 0 {
                             if is_uav { self.bl_uav.insert(tslot); } else { self.bl_srv.insert(tslot); }
                         }
@@ -6182,6 +6227,14 @@ impl<'a> Emitter<'a> {
                 } else {
                     "0".to_string()
                 };
+                let fm = if is_uav || with_mip { None } else { self.fmask.get(&slot).copied() };
+                if let Some(ms) = fm {
+                    let t = self.tmp;
+                    self.tmp += 1;
+                    self.line(&format!("uint t{t}w, t{t}h, t{t}n; tex{ms}.GetDimensions(t{t}w, t{t}h, t{t}n); uint t{t} = t{t}n >= 8u ? 0x76543210u : (t{t}n >= 4u ? 0x88883210u : (t{t}n >= 2u ? 0x88888810u : 0x88888880u));"));
+                    let vals = (0..4).filter(|ch| (ins.aux.mask >> ch) & 1 != 0).map(|ch| if ch == 0 { format!("t{t}") } else { "0u".to_string() }).collect();
+                    return self.mimg_write_lanes(ins, vd, vals, Lane::Uint);
+                }
                 let e = if dim == 6 {
                     if is_uav {
                         return Err("multisampled UAV load unsupported".into());
@@ -7179,7 +7232,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                     let _ = writeln!(init, "    {v} = {val};");
                 }
             }
-            if ex.stage == Stage::Vertex && !self.vs_lds_out && self.durango.is_none() {
+            if ex.stage == Stage::Vertex && !self.vs_lds_out && (self.durango.is_none() || dg_vertex_id_on()) {
                 for (ei, e) in ex.input_sig.iter().enumerate() {
                     let v = match e.sysval {
                         6 => "v0",
@@ -7221,6 +7274,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         h.push_str(&body);
         if guard_mark() && !no_out && !self.is_gs && body.contains("uint tb_guard = 0u;") && h.contains("float4 o0 : SV_Target0;") {
             let _ = writeln!(h, "    if (tb_guard >= {}u) o.o0 = float4(1000.0, 0.0, 1000.0, 1.0);", loop_guard(1000000).saturating_sub(1));
+        }
+        if is_ps && !no_out && !self.is_gs {
+            h.push_str(&ps_clamp_lines(&ex.output_sig));
         }
         h.push_str(if no_out || self.is_gs { "}\n" } else { "    return o;\n}\n" });
         Ok(h)

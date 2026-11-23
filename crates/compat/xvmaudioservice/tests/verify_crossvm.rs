@@ -159,6 +159,72 @@ fn crossvm_audio_property_values_over_0x104_bytes_follow_the_console_memcpy() {
 }
 
 #[test]
+fn crossvm_audio_spatial_stream_creators_check_args_and_activate_the_pc_stream() {
+    run_step("spatial_stream");
+}
+
+#[test]
+fn crossvm_audio_dcas_control_block_follows_the_console_layout() {
+    use console_sandbox::crossvm::dcas;
+    let mut store = vec![0u8; 0x8000 + 0x40];
+    let off = (0x20 - (store.as_ptr() as usize & 0x1f)) & 0x1f;
+    let b = &mut store[off..off + 0x8000];
+    let mut fmt = vec![0u8; 0x12];
+    fmt[0..2].copy_from_slice(&3u16.to_le_bytes());
+    fmt[2..4].copy_from_slice(&1u16.to_le_bytes());
+    fmt[4..8].copy_from_slice(&48000u32.to_le_bytes());
+    fmt[8..12].copy_from_slice(&192000u32.to_le_bytes());
+    fmt[12..14].copy_from_slice(&4u16.to_le_bytes());
+    fmt[14..16].copy_from_slice(&32u16.to_le_bytes());
+    let (frames, st, dy, props, meta) = (481u32, 2u32, 3u32, 0x28u32, 0x10u32);
+    let shape = dcas::write(b, "TomBox spatial", frames, 0x1e0, st, dy, props, meta, &fmt).unwrap();
+    let n = st + dy;
+    let frame = (frames * 4 + 0x1f) & !0x1f;
+    let data = ((0x1c + 2 * n * props + 2 * n * meta + 0x1f) & !0x1f) + 2 * n * frame;
+    assert_eq!(shape, dcas::Shape { objects: n, properties: props, metadata: meta, frame_bytes: frame }, "fd8a4 / fcd60: objects = static + dynamic, per-object frame bytes align32(frames * 4)");
+    assert_eq!((u32_at(b, 0), u32_at(b, 4), u32_at(b, 0x30)), (0x326, 0x5341_4344, 6), "fd8a4 header: 0x326, 'DCAS', control state 6");
+    assert_eq!((u32_at(b, 0x34), u32_at(b, 0x48)), (0x1e0, 1), "PC oracle at activation: frames per packet 0x1e0, flags = valid (Start / Stop / Reset need (flags & 0x81) == 1)");
+    assert!(b[8..0x30].iter().chain(&b[0x38..0x48]).chain(&b[0x4c..0x54]).all(|&x| x == 0), "fd8a4 zeroes the rest of the 0x4c control bytes");
+    assert_eq!(dcas::total(535, 2, 0, 0x20, 0).unwrap(), 0x2220 + 0x340, "PC oracle: 535 frames, 2 static, 0x20 property bytes -> data 0x2220");
+    assert_eq!((u32_at(b, 0x204), u32_at(b, 0x208), u32_at(b, 0x20c), u32_at(b, 0x210)), (frames, st, dy, data + 0x340), "fd8a4 endpoint block at +0x204");
+    assert_eq!(wide_at(b, 0x184, 0x40), "TomBox spatial");
+    assert_eq!(&b[0x214..0x214 + 0x12], &fmt[..]);
+    let d = &b[0x340..];
+    assert_eq!((u32_at(d, 0), u32_at(d, 4), u32_at(d, 8), u32_at(d, 0xc), u32_at(d, 0x10), u32_at(d, 0x14), u32_at(d, 0x18)), (0x1c, data, n, props, meta, frame, 0x5341_4244), "fcd60 data header 'DBAS'");
+    assert_eq!(dcas::validate(b), 0, "fe6c0 accepts the host header");
+    let (ps, r) = dcas::parse(b).unwrap();
+    assert_eq!(ps, shape, "fd780 recomputes the same data size");
+    let p1 = 0x1c + (props * n) as usize;
+    let m0 = p1 + (props * n) as usize;
+    let m1 = m0 + (meta * n) as usize;
+    let s0 = (m1 + (meta * n) as usize + 0x1f) & !0x1f;
+    assert_eq!(r, dcas::Regions { properties: [0x1c, p1], metadata: [m0, m1], samples: [s0, s0 + (frame * n) as usize] }, "fe608 ping-pong regions");
+    assert_eq!(r.samples[1] + (frame * n) as usize, data as usize, "the second sample set ends at the data size");
+    let mut bad = b[..0x400].to_vec();
+    bad[4] ^= 1;
+    assert_eq!(dcas::validate(&bad), 0x887c_0045u32 as i32, "fe6c0: wrong magic");
+    let mut bad = b[..0x400].to_vec();
+    bad[0..4].copy_from_slice(&0x325u32.to_le_bytes());
+    assert_eq!(dcas::validate(&bad), 0x887c_0045u32 as i32, "fe6c0: wrong header size");
+    let mut bad = b[..0x400].to_vec();
+    bad[0x208..0x210].fill(0);
+    assert_eq!(dcas::validate(&bad), 0x887c_0045u32 as i32, "fe6c0: static + dynamic == 0");
+    let mut bad = b[..0x400].to_vec();
+    bad[0x210..0x214].copy_from_slice(&0x33fu32.to_le_bytes());
+    assert_eq!(dcas::validate(&bad), 0x887c_0045u32 as i32, "fe6c0: total below 0x340");
+    let mut bad = b.to_vec();
+    bad[0x340 + 0xc..0x340 + 0x10].copy_from_slice(&(props + 0x20).to_le_bytes());
+    assert_eq!(dcas::parse(&bad).unwrap_err(), 0x887c_0045u32 as i32, "fd780: data size no longer matches the shape");
+    assert_eq!(dcas::total(0x4000_0000, 1, 0, 0, 0).unwrap_err(), 0x8007_0216u32 as i32, "fd1fc: overflow is ERROR_ARITHMETIC_OVERFLOW");
+    let mut ext = fmt.clone();
+    ext[0x10..0x12].copy_from_slice(&0x101u16.to_le_bytes());
+    ext.resize(0x12 + 0x101, 0);
+    assert_eq!(dcas::write(b, "x", frames, 0x1e0, st, dy, props, meta, &ext).unwrap_err(), 0x8007_0057u32 as i32, "fd8a4: cbSize above 0x100 is E_INVALIDARG");
+    assert_eq!(dcas::write(&mut store[off + 1..off + 1 + 0x7000], "x", frames, 0x1e0, st, dy, props, meta, &fmt).unwrap_err(), 0x887c_0054u32 as i32, "fcd60: data base must be 32-byte aligned");
+    println!("dcas: {n} objects, data {data:#x} bytes, samples at {s0:#x}");
+}
+
+#[test]
 fn inner() {
     let Ok(step) = std::env::var(STEP) else { return };
     let dir = std::env::temp_dir().join(format!("xvmaudio_crossvm_{}", std::process::id()));
@@ -183,6 +249,9 @@ fn inner() {
         "capture" => capture(),
         "notify" => notify(),
         "media" => media(),
+        "spatial_stream" => spatial_stream(),
+        "spatial_pump" => spatial_pump(),
+        "spatial_variants" => spatial_variants(),
         _ => objects(&mix),
     }
     println!("STEP OK");
@@ -1483,6 +1552,459 @@ fn notify() {
     crossvm::set_hello(1);
     let mut e = envelope(crossvm::RELEASE_OBJECT, sess);
     assert_eq!(send(&mut e), 0);
+}
+
+fn spatial_args(mask: u32, min: u32, max: u32, category: u32, tag: u16, channels: u16, bits: u16, extra: u16) -> Vec<u8> {
+    let mut a = vec![0u8; 0x10 + 0x12 + extra as usize];
+    a[0..4].copy_from_slice(&mask.to_le_bytes());
+    a[4..8].copy_from_slice(&min.to_le_bytes());
+    a[8..12].copy_from_slice(&max.to_le_bytes());
+    a[12..16].copy_from_slice(&category.to_le_bytes());
+    let f = &mut a[0x10..];
+    let align = channels * bits / 8;
+    f[0..2].copy_from_slice(&tag.to_le_bytes());
+    f[2..4].copy_from_slice(&channels.to_le_bytes());
+    f[4..8].copy_from_slice(&48000u32.to_le_bytes());
+    f[8..12].copy_from_slice(&(48000 * align as u32).to_le_bytes());
+    f[12..14].copy_from_slice(&align.to_le_bytes());
+    f[14..16].copy_from_slice(&bits.to_le_bytes());
+    f[16..18].copy_from_slice(&extra.to_le_bytes());
+    a
+}
+
+fn spatial_stream() {
+    use std::sync::atomic::Ordering;
+    crossvm::set_hello(2);
+    let good = spatial_args(0x6, 0, 0, 6, 3, 1, 32, 0);
+    let before = crossvm::SPATIAL_ACTIVATIONS.load(Ordering::SeqCst);
+    let (hr, e) = create(crossvm::SPATIAL_STREAM_TYPE, 1, 0, crossvm::METHOD_SPATIAL_STREAM, &good);
+    assert_eq!(hr, 0, "type 0xf / 0x36 activates the PC ISpatialAudioObjectRenderStream and creates the guest object");
+    assert_eq!(crossvm::SPATIAL_ACTIVATIONS.load(Ordering::SeqCst), before + 1, "the PC accepted the decoded static-mask activation params");
+    let o = u32_at(&e, 0x1c);
+    assert_eq!(&e[0x10 + crossvm::SPATIAL_REPLY.clsid..0x10 + crossvm::SPATIAL_REPLY.clsid + 16], &[0xff, 0xe7, 0x71, 0x93, 0x2d, 0xdf, 0x62, 0x49, 0x95, 0x85, 0x40, 0x42, 0x4d, 0x05, 0x45, 0x50], "123d94: the 0x36 reply carries the endpoint CLSID at A+0x70");
+    assert_eq!(send(&mut envelope(crossvm::RELEASE_OBJECT, o)), 0);
+    let (hr, _) = create(crossvm::SPATIAL_STREAM_TYPE, 1, 0, crossvm::METHOD_SPATIAL_STREAM, &spatial_args(0x6, 0, 0, 6, 3, 1, 32, 0x37));
+    assert_eq!(hr, -2147024809, "124e00: cbSize + 0x12 above 0x48 is E_INVALIDARG");
+    let (hr, _) = create(crossvm::SPATIAL_STREAM_TYPE, 1, 0, crossvm::METHOD_SPATIAL_HRTF_STREAM, &good);
+    assert_eq!(hr, -2147024809, "type 0xf takes 0x36 or 0x82 only");
+    let mut packed = good.clone();
+    packed.resize(crossvm::SPATIAL_ARG_OPTIONS + 4 - 0x14, 0);
+    let before = crossvm::SPATIAL_ACTIVATIONS.load(Ordering::SeqCst);
+    let (hr, e) = create(crossvm::SPATIAL_STREAM_TYPE, 1, 0, crossvm::METHOD_SPATIAL_STREAM2, &packed);
+    assert_eq!(hr, 0, "0x82 (what XD 13fc58 sends; validator 123708) activates the PC stream with options from A+0x70");
+    assert_eq!(crossvm::SPATIAL_ACTIVATIONS.load(Ordering::SeqCst), before + 1);
+    assert_eq!(send(&mut envelope(crossvm::RELEASE_OBJECT, u32_at(&e, 0x1c))), 0);
+    let (hr, e) = create(crossvm::SPATIAL_STREAM_TYPE, 1, 0, crossvm::METHOD_SPATIAL_STREAM, &spatial_args(0, 0, 1, 6, 3, 1, 32, 0));
+    if hr == 0 {
+        assert_eq!(send(&mut envelope(crossvm::RELEASE_OBJECT, u32_at(&e, 0x1c))), 0);
+    }
+    if console_sandbox::wasapi::spatial(None).and_then(|s| s.max_dynamic()) == Ok(0) {
+        assert!(hr < 0 && hr != 0x8000_4001u32 as i32, "with no dynamic objects on this PC, max dynamic 1 gets the PC activation error ({hr:#x})");
+    }
+    let (hr, _) = create(crossvm::SPATIAL_HRTF_STREAM_TYPE, 1, 0, crossvm::METHOD_SPATIAL_STREAM, &good);
+    assert_eq!(hr, -2147024809, "125160: type 0x10 takes 0x37 or 0x83");
+    let (hr, _) = create(crossvm::SPATIAL_METADATA_STREAM_TYPE, 1, 0, crossvm::METHOD_SPATIAL_STREAM, &good);
+    assert_eq!(hr, -2147024809, "1255d0: type 0x16 takes 0x38 or 0x84");
+    let pcm = spatial_args(0x6, 0, 0, 6, 1, 2, 16, 0);
+    let before = crossvm::SPATIAL_ACTIVATIONS.load(Ordering::SeqCst);
+    let (hr, _) = create(crossvm::SPATIAL_STREAM_TYPE, 1, 0, crossvm::METHOD_SPATIAL_STREAM, &pcm);
+    assert!(hr < 0 && hr != 0x8000_4001u32 as i32, "a format the PC spatial client rejects returns the PC error ({hr:#x})");
+    assert_eq!(crossvm::SPATIAL_ACTIVATIONS.load(Ordering::SeqCst), before);
+    println!("spatial stream: static mask 0x6 activated on the PC, 16-bit stereo PCM -> {:#010x}", hr as u32);
+    crossvm::set_hello(1);
+}
+
+fn spatial_pump() {
+    use console_sandbox::crossvm::{dcas, pingpong};
+    use std::sync::atomic::Ordering;
+    crossvm::set_hello(2);
+    let r = &crossvm::SPATIAL_REPLY2;
+    let mut packed = spatial_args(0x6, 0, 0, 6, 3, 1, 32, 0);
+    packed.resize(crossvm::SPATIAL_ARG_OPTIONS + 4 - 0x14, 0);
+    let (hr, e) = create(crossvm::SPATIAL_STREAM_TYPE, 1, 0, crossvm::METHOD_SPATIAL_STREAM2, &packed);
+    assert_eq!(hr, 0, "0xf / 0x82 creates the guest spatial stream");
+    let o = u32_at(&e, 0x1c);
+    let a = &e[0x10..];
+    assert_eq!(&a[r.clsid..r.clsid + 16], &[0xff, 0xe7, 0x71, 0x93, 0x2d, 0xdf, 0x62, 0x49, 0x95, 0x85, 0x40, 0x42, 0x4d, 0x05, 0x45, 0x50], "123c08: CLSID 9371e7ff at p+0x60, which 1455b0 maps to the client output endpoint f8c94");
+    assert_eq!(u32_at(a, r.extra), 0, "p+0x58 = host stream+0x6d8; the PC oracle gives 0 for a static stream");
+    assert_eq!((u32_at(a, r.event), u32_at(a, r.event + 0x24)), (2, crossvm::EVENT_KIND_GAMECORE), "p+0x84: kind 2 period-event descriptor");
+    assert_eq!(u32_at(a, r.memory), 3, "p+0x1ac: kind 3 memory descriptor naming the DCAS");
+    let (base, page, shape, regions) = crossvm::spatial_control(o).expect("spatial host state");
+    assert_eq!(u32_at(a, r.memory + 0x24), page as u32, "the memory descriptor names the DCAS pool page");
+    let total = u32::from_le_bytes(unsafe { *((base + dcas::TOTAL) as *const [u8; 4]) }) as usize;
+    let dcas_bytes = unsafe { core::slice::from_raw_parts(base as *const u8, total) };
+    assert_eq!(dcas::validate(dcas_bytes), 0, "fe6c0 accepts the DCAS the host wrote");
+    let (ps, pr) = dcas::parse(dcas_bytes).unwrap();
+    assert_eq!((ps, pr), (shape, regions), "fd780 recomputes the shape");
+    let frames = u32_at(dcas_bytes, dcas::FRAMES);
+    let pc_frames = console_sandbox::wasapi::spatial(None).unwrap().max_frames(&packed[0x10..0x22]).unwrap();
+    assert_eq!((frames, u32_at(dcas_bytes, dcas::STATIC_OBJECTS), u32_at(dcas_bytes, dcas::DYNAMIC_OBJECTS), shape.properties), (pc_frames, 2, 0, 0x20), "the DCAS shape follows the PC: max frame count, popcount(mask) static objects, 0x20-byte records");
+    let ctl = unsafe { pingpong::Control::at(base as *mut u8) };
+    assert_eq!((ctl.state(), ctl.flags()), (6, pingpong::FLAG_VALID), "state 6, flags valid");
+    let mut ev = envelope(crossvm::SPATIAL_RESET, o);
+    assert_eq!(send(&mut ev), 0, "0x46 (13b780) on an initialized, stopped stream");
+    let mut ev = envelope(crossvm::SPATIAL_PHASE_THREE, o);
+    assert_eq!(send(&mut ev), 0, "0x39 PhaseThree activates the static PC objects (137cf0)");
+    assert_eq!(crossvm::spatial_static_objects(o).unwrap(), vec![2, 4], "FrontLeft and FrontRight are active on the PC");
+    let mut ev = envelope(crossvm::SPATIAL_PRE_STOP, o);
+    assert_eq!(send(&mut ev), 1, "0x45 PreStopStream on a stream that never started is S_FALSE");
+    let mut ev = envelope(crossvm::SPATIAL_PRE_START, o);
+    assert_eq!(send(&mut ev), 0);
+    assert_eq!(ev[0x10], 1, "13b84c: the stream needs a real start");
+    let mut ev = envelope(crossvm::SPATIAL_PRE_START, o);
+    assert_eq!(send(&mut ev), 0x8889_010au32 as i32, "13b84c: second PreStart is SPTLAUDCLNT_E_STREAM_NOT_STOPPED");
+    let mut ev = envelope(crossvm::SPATIAL_RESET, o);
+    assert_eq!(send(&mut ev), 0x8889_010au32 as i32, "13b780: Reset while started");
+    assert_eq!(ctl.transport(true), 0, "ff210: guest Start needs flags valid");
+    let mut ev = envelope(crossvm::START, o);
+    assert_eq!(send(&mut ev), 0, "id 7 starts the PC stream");
+    let c = crossvm::spatial_counters(o).unwrap();
+    let props = shape.properties as usize;
+    let fb = shape.frame_bytes as usize;
+    let data = base + dcas::DATA;
+    let write_pass = |eos: bool| -> bool {
+        let Ok(i) = ctl.write_acquire() else { return false };
+        let packet = ctl.frames_per_packet(frames);
+        for k in 0..2usize {
+            let rec = (data + regions.properties[i as usize] + k * props) as *mut u8;
+            unsafe {
+                core::ptr::write_bytes(rec, 0, props);
+                (rec as *mut u32).write(k as u32 + 1);
+                (rec.add(4) as *mut u32).write(packet);
+                (rec.add(8) as *mut u32).write(2 << k);
+                (rec.add(0xc) as *mut u32).write(if eos { 0xa | 1 } else { 3 });
+                (rec.add(0x1c) as *mut f32).write(if k == 0 { 1.0 } else { 0.5 });
+                core::ptr::write_bytes((data + regions.samples[i as usize] + k * fb) as *mut u8, 0, fb);
+            }
+        }
+        assert_eq!(ctl.write_commit(i, 2, packet), 0, "4c1de CommitWrite");
+        true
+    };
+    let t0 = std::time::Instant::now();
+    let mut written = 0u64;
+    while (c.buffers.load(Ordering::SeqCst) < 6 || written < 3) && t0.elapsed().as_secs() < 5 {
+        if write_pass(false) {
+            written += 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(c.buffers.load(Ordering::SeqCst) >= 6, "the pump copied guest buffers into the PC objects: passes {} reads {} starved {} buffers {} errors {} last {:#x}", c.passes.load(Ordering::SeqCst), c.reads.load(Ordering::SeqCst), c.starved.load(Ordering::SeqCst), c.buffers.load(Ordering::SeqCst), c.errors.load(Ordering::SeqCst), c.last_error.load(Ordering::SeqCst));
+    assert_eq!(c.silent.load(Ordering::SeqCst), c.buffers.load(Ordering::SeqCst), "TOMBOX_AUDIO_MUTE: every PC buffer is zero-filled");
+    assert!(c.volumes.load(Ordering::SeqCst) >= 1, "the 0.5 record volume reached ISpatialAudioObject::SetVolume");
+    assert!(ctl.frames_committed() > 0, "CommitWrite adds frames per packet to DCAS+0x28");
+    let t0 = std::time::Instant::now();
+    while !write_pass(true) && t0.elapsed().as_secs() < 2 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let t0 = std::time::Instant::now();
+    while c.end_of_stream.load(Ordering::SeqCst) < 2 && t0.elapsed().as_secs() < 3 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(c.end_of_stream.load(Ordering::SeqCst), 2, "flags 0xa reach SetEndOfStream on both PC objects");
+    assert!(crossvm::spatial_static_objects(o).unwrap().is_empty(), "objects past end of stream are released");
+    assert_eq!(c.errors.load(Ordering::SeqCst), 0, "no PC spatial call failed (last {:#x})", c.last_error.load(Ordering::SeqCst));
+    let mut ev = envelope(crossvm::SPATIAL_PRE_STOP, o);
+    assert_eq!(send(&mut ev), 0, "0x45 PreStopStream");
+    let mut ev = envelope(crossvm::STOP, o);
+    assert_eq!(send(&mut ev), 0, "id 8 stops the PC stream");
+    assert_eq!(ctl.transport(false), 0);
+    assert_eq!(ctl.flags() & pingpong::FLAG_STARTED, 0, "ff330 clears started");
+    println!("spatial pump: {} passes, {} reads, {} starved, {} buffers (all zero-filled), {} guest writes, {} frames committed, PC max frames {frames}", c.passes.load(Ordering::SeqCst), c.reads.load(Ordering::SeqCst), c.starved.load(Ordering::SeqCst), c.buffers.load(Ordering::SeqCst), written, ctl.frames_committed());
+    assert_eq!(send(&mut envelope(crossvm::RELEASE_OBJECT, o)), 0);
+    assert!(crossvm::spatial_control(o).is_none());
+    crossvm::set_hello(1);
+}
+
+#[test]
+fn crossvm_audio_spatial_pump_reads_guest_records_into_the_pc_stream() {
+    run_step("spatial_pump");
+}
+
+#[test]
+fn crossvm_audio_ping_pong_state_machine_follows_the_console_tables() {
+    use console_sandbox::crossvm::pingpong::*;
+    let mut store = vec![0u64; 0x20];
+    let base = store.as_mut_ptr() as *mut u8;
+    let c = unsafe { Control::at(base) };
+    let raw = |o: usize| unsafe { (base.add(o) as *const u32).read() };
+    let set = |s: u32| unsafe { (base.add(STATE) as *mut u32).write(s) };
+    let clear = || unsafe { core::ptr::write_bytes(base, 0, 0x100) };
+    for s in 0..STATES as u32 {
+        clear();
+        unsafe { (base.add(FRAMES_PER_PACKET) as *mut u32).write(480) };
+        set(s);
+        let n = WRITE_ACQUIRE[s as usize];
+        let r = c.write_acquire();
+        match WRITER_INDEX[n as usize] {
+            3 => assert_eq!((r, c.state()), (Err(E_INVALID_CONTROL), FLUSH[n as usize]), "fd5c4 fault from {s}"),
+            2 => assert_eq!((r, c.state(), raw(WRITE_STARVED)), (Err(E_WRITE_STARVED), n, 1), "fd5c4 starve from {s}"),
+            i => assert_eq!((r, c.state(), raw(BUFFER_FRAMES + i as usize * 4)), (Ok(i), n, 480), "fd5c4 acquire from {s}"),
+        }
+        clear();
+        set(s);
+        let n = WRITE_COMMIT[s as usize];
+        let hr = c.write_commit(1, 2, 480);
+        assert_eq!((c.state(), raw(BUFFER_OBJECTS + 4)), (n, 2), "4c1de from {s}");
+        if WRITER_INDEX[n as usize] == 3 {
+            assert_eq!((hr, c.frames_committed()), (E_INVALID_CONTROL, 0));
+        } else {
+            assert_eq!((hr, c.frames_committed()), (0, 480));
+        }
+        clear();
+        set(s);
+        c.write_cancel();
+        assert_eq!(c.state(), WRITE_CANCEL[s as usize], "4bde0 cancel from {s}");
+        clear();
+        set(s);
+        let n = READ_ACQUIRE[s as usize];
+        let r = c.read_acquire();
+        match READER_INDEX[n as usize] {
+            3 => assert_eq!((r, c.state()), (Err(E_INVALID_CONTROL), FLUSH[n as usize]), "fd498 fault from {s}"),
+            2 => assert_eq!((r, c.state(), raw(READ_STARVED)), (Err(E_READ_STARVED), n, 1), "fd498 starve from {s}"),
+            i => assert_eq!((r, c.state()), (Ok(i), n), "fd498 acquire from {s}"),
+        }
+        clear();
+        set(s);
+        let n = READ_COMMIT[s as usize];
+        let hr = c.read_commit(0);
+        assert_eq!((hr, c.state()), (if READER_INDEX[n as usize] == 3 { E_INVALID_CONTROL } else { 0 }, n), "fcc84 from {s}");
+        clear();
+        set(s);
+        unsafe { (base.add(FRAMES_COMMITTED) as *mut u64).write(999) };
+        c.flush();
+        assert_eq!((c.state(), raw(FLAGS) & FLAG_DISCONTINUITY, c.frames_committed()), (FLUSH[s as usize], FLAG_DISCONTINUITY, 0), "ff194 from {s}");
+        if WRITE_ACQUIRE[s as usize] != FAULTED {
+            assert_eq!(WRITE_CANCEL[WRITE_ACQUIRE[s as usize] as usize], s, "cancel undoes exactly one writer hold ({s})");
+        }
+    }
+    clear();
+    set(0x20);
+    assert_eq!(c.state(), FAULTED, "f9cd0: a state above 0x10 is forced to 0x10");
+    assert_eq!(raw(STATE), FAULTED);
+    clear();
+    set(6);
+    unsafe { (base.add(FRAMES_PER_PACKET) as *mut u32).write(480) };
+    let mut path = vec![c.state()];
+    let mut idx = Vec::new();
+    for _ in 0..2 {
+        idx.push(c.write_acquire().unwrap());
+        path.push(c.state());
+        assert_eq!(c.write_commit(*idx.last().unwrap(), 2, 480), 0);
+        path.push(c.state());
+        let i = c.read_acquire().unwrap();
+        assert_eq!(i, *idx.last().unwrap(), "the reader gets the buffer the writer committed");
+        path.push(c.state());
+        assert_eq!(c.read_commit(i), 0);
+        path.push(c.state());
+    }
+    assert_eq!(path, vec![6, 7, 8, 11, 14, 15, 0, 3, 6], "PC sample 6 -> 7 -> 8 -> 0 lies on the ping-pong cycle");
+    assert_eq!(idx, vec![0, 1]);
+    assert_eq!(c.frames_committed(), 960);
+    assert_eq!(c.read_acquire(), Err(E_READ_STARVED), "nothing committed: the reader starves");
+    assert_eq!((c.state(), c.counters()), (6, (1, 0)));
+    let a = c.write_acquire().unwrap();
+    assert_eq!(c.write_commit(a, 1, 480), 0);
+    let b = c.write_acquire().unwrap();
+    assert_eq!(c.write_commit(b, 1, 480), 0);
+    assert_ne!(a, b, "two passes fill both buffers");
+    assert_eq!(c.write_acquire(), Err(E_WRITE_STARVED), "both buffers full: the writer starves");
+    assert_eq!((c.read_acquire(), c.read_commit(a)), (Ok(a), 0), "oldest first");
+    assert_eq!((c.read_acquire(), c.read_commit(b)), (Ok(b), 0));
+    assert_eq!(c.take_counters(), (1, 1));
+    assert_eq!(c.counters(), (0, 0));
+    assert_eq!(c.write_commit(2, 1, 480), E_BAD_WRITE_INDEX, "4c1de: index above 1");
+    assert_eq!(c.read_commit(2), 0x8007_0057u32 as i32, "fcc84: index above 1");
+    unsafe { (base.add(FRAMES_PER_PACKET) as *mut u32).write(0) };
+    assert_eq!(c.frames_per_packet(535), 535, "4c300: 0 frames per packet means the max");
+    unsafe { (base.add(FRAMES_PER_PACKET) as *mut u32).write(600) };
+    assert_eq!(c.frames_per_packet(535), 535);
+    unsafe { (base.add(FRAMES_PER_PACKET) as *mut u32).write(480) };
+    assert_eq!(c.frames_per_packet(535), 480);
+    clear();
+    assert_eq!(c.transport(true), E_INVALID_CONTROL, "ff210: (flags & 0x81) must be 1");
+    c.set_flags(FLAG_VALID | FLAG_POSITION_LATCHED, 0);
+    assert_eq!((c.transport(true), c.flags()), (0, FLAG_VALID | FLAG_STARTED | FLAG_POSITION_LATCHED));
+    assert_eq!((c.transport(false), c.flags()), (0, FLAG_VALID), "ff330 clears 0xa");
+    c.set_flags(FLAG_CLOSED, 0);
+    assert_eq!(c.reset(), E_INVALID_CONTROL);
+    c.set_flags(0, FLAG_CLOSED);
+    set(8);
+    assert_eq!((c.reset(), c.state()), (0, 14), "ff090 -> ff194: reset drops the full buffer");
+    drop(store);
+}
+
+fn hrtf_args(packed: bool) -> Vec<u8> {
+    let mut a = vec![0u8; if packed { 0xb0 } else { 0xa8 }];
+    a[0..4].copy_from_slice(&6u32.to_le_bytes());
+    a[12..16].copy_from_slice(&6u32.to_le_bytes());
+    a[0x10..0x14].copy_from_slice(&[1, 1, 1, 1]);
+    a[0x14..0x18].copy_from_slice(&0u32.to_le_bytes());
+    a[0x18..0x1c].copy_from_slice(&1.0f32.to_le_bytes());
+    a[0x1c..0x20].copy_from_slice(&1.0e-5f32.to_le_bytes());
+    a[0x20..0x24].copy_from_slice(&1.0f32.to_le_bytes());
+    a[0x24..0x28].copy_from_slice(&100.0f32.to_le_bytes());
+    a[0x38..0x3c].copy_from_slice(&1u32.to_le_bytes());
+    for (i, v) in [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0].iter().enumerate() {
+        a[0x3c + i * 4..0x40 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let f = spatial_args(0, 0, 0, 0, 3, 1, 32, 0);
+    a[0x60..0x72].copy_from_slice(&f[0x10..0x22]);
+    a
+}
+
+fn metadata_args(packed: bool) -> Vec<u8> {
+    let mut a = vec![0u8; if packed { 0x74 } else { 0x58 }];
+    a[0..4].copy_from_slice(&6u32.to_le_bytes());
+    a[12..16].copy_from_slice(&6u32.to_le_bytes());
+    a[0x10..0x20].copy_from_slice(&[0x11; 16]);
+    let f = spatial_args(0, 0, 0, 0, 3, 1, 32, 0);
+    if packed {
+        a[0x20..0x24].copy_from_slice(&8u32.to_le_bytes());
+        a[0x24..0x36].copy_from_slice(&f[0x10..0x22]);
+    } else {
+        a[0x20..0x22].copy_from_slice(&8u16.to_le_bytes());
+        a[0x22..0x34].copy_from_slice(&f[0x10..0x22]);
+    }
+    a
+}
+
+fn hrtf_pump(o: u32, a: &[u8], lay: &crossvm::SpatialLayout) {
+    use console_sandbox::crossvm::{dcas, pingpong};
+    use std::sync::atomic::Ordering;
+    let r = &lay.reply;
+    assert_eq!(&a[r.clsid..r.clsid + 4], &[0xff, 0xe7, 0x71, 0x93], "123f20 / 1240b8: endpoint CLSID");
+    assert_eq!((u32_at(a, r.event), u32_at(a, r.memory)), (2, 3));
+    let (base, page, shape, regions) = crossvm::spatial_control(o).unwrap();
+    assert_eq!(u32_at(a, r.memory + 0x24), page as u32);
+    assert_eq!((shape.objects, shape.properties, shape.metadata), (2, crossvm::SPATIAL_HRTF_PROPERTY_BYTES, 0), "PC oracle: HRTF DCAS records are 0xb4 bytes");
+    let ctl = unsafe { pingpong::Control::at(base as *mut u8) };
+    assert_eq!(send(&mut envelope(crossvm::SPATIAL_PHASE_THREE, o)), 0);
+    assert_eq!(crossvm::spatial_static_objects(o).unwrap(), vec![2, 4]);
+    assert_eq!(send(&mut envelope(crossvm::SPATIAL_PRE_START, o)), 0);
+    assert_eq!(send(&mut envelope(crossvm::START, o)), 0);
+    let c = crossvm::spatial_counters(o).unwrap();
+    let data = base + dcas::DATA;
+    let props = shape.properties as usize;
+    let fb = shape.frame_bytes as usize;
+    let frames = u32::from_le_bytes(unsafe { *((base + dcas::FRAMES) as *const [u8; 4]) });
+    let t0 = std::time::Instant::now();
+    let mut writes = 0;
+    while (c.hrtf_properties.load(Ordering::SeqCst) < 10 || c.buffers.load(Ordering::SeqCst) < 2) && t0.elapsed().as_secs() < 5 {
+        if let Ok(i) = ctl.write_acquire() {
+            let packet = ctl.frames_per_packet(frames);
+            for k in 0..2usize {
+                let rec = (data + regions.properties[i as usize] + k * props) as *mut u8;
+                unsafe {
+                    core::ptr::write_bytes(rec, 0, props);
+                    (rec.add(4) as *mut u32).write(packet);
+                    (rec.add(8) as *mut u32).write(2 << k);
+                    (rec.add(0xc) as *mut u32).write(0x13);
+                    (rec.add(0x1c) as *mut f32).write(1.0);
+                    (rec.add(crossvm::HRTF_DIRTY) as *mut u32).write(0x1f);
+                    (rec.add(crossvm::HRTF_GAIN) as *mut f32).write(0.5);
+                    for (j, v) in [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0].iter().enumerate() {
+                        (rec.add(crossvm::HRTF_ORIENTATION + j * 4) as *mut f32).write(*v);
+                    }
+                    (rec.add(crossvm::HRTF_ENVIRONMENT) as *mut u32).write(1);
+                    let d: [u32; 5] = [0, 1.0f32.to_bits(), 1.0e-5f32.to_bits(), 1.0f32.to_bits(), 100.0f32.to_bits()];
+                    core::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, rec.add(crossvm::HRTF_DECAY), 0x14);
+                    let dir: [u32; 4] = [0, 0, 0, 0];
+                    core::ptr::copy_nonoverlapping(dir.as_ptr() as *const u8, rec.add(crossvm::HRTF_DIRECTIVITY), 0x10);
+                    core::ptr::write_bytes((data + regions.samples[i as usize] + k * fb) as *mut u8, 0, fb);
+                }
+            }
+            assert_eq!(ctl.write_commit(i, 2, packet), 0);
+            writes += 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    println!("hrtf pump: {} passes, {} buffers (zero-filled {}), {} HRTF property calls, {} guest writes, errors {} last {:#x}", c.passes.load(Ordering::SeqCst), c.buffers.load(Ordering::SeqCst), c.silent.load(Ordering::SeqCst), c.hrtf_properties.load(Ordering::SeqCst), writes, c.errors.load(Ordering::SeqCst), c.last_error.load(Ordering::SeqCst));
+    assert!(c.buffers.load(Ordering::SeqCst) >= 2 && c.hrtf_properties.load(Ordering::SeqCst) >= 10, "the HRTF records reached the PC ISpatialAudioObjectForHrtf setters");
+    assert_eq!(c.silent.load(Ordering::SeqCst), c.buffers.load(Ordering::SeqCst));
+    assert_eq!(c.errors.load(Ordering::SeqCst), 0, "last {:#x}", c.last_error.load(Ordering::SeqCst));
+    assert_eq!(send(&mut envelope(crossvm::SPATIAL_PRE_STOP, o)), 0);
+    assert_eq!(send(&mut envelope(crossvm::STOP, o)), 0);
+    assert_eq!(send(&mut envelope(crossvm::RELEASE_OBJECT, o)), 0);
+}
+
+fn spatial_variants() {
+    use console_sandbox::wasapi;
+    crossvm::set_hello(2);
+    let sp = wasapi::spatial(None).unwrap();
+    for (kind, method, args) in [
+        (crossvm::SPATIAL_HRTF_STREAM_TYPE, crossvm::METHOD_SPATIAL_HRTF_STREAM, hrtf_args(false)),
+        (crossvm::SPATIAL_HRTF_STREAM_TYPE, crossvm::METHOD_SPATIAL_HRTF_STREAM2, hrtf_args(true)),
+        (crossvm::SPATIAL_METADATA_STREAM_TYPE, crossvm::METHOD_SPATIAL_METADATA_STREAM, metadata_args(false)),
+        (crossvm::SPATIAL_METADATA_STREAM_TYPE, crossvm::METHOD_SPATIAL_METADATA_STREAM2, metadata_args(true)),
+    ] {
+        let lay = crossvm::spatial_layout(kind, method).unwrap();
+        let mut full = vec![0u8; 0x14];
+        full.extend_from_slice(&args);
+        let fmt = full[lay.format..lay.format + 0x12].to_vec();
+        assert_eq!(u16::from_le_bytes([fmt[0], fmt[1]]), 3, "format at A+{:#x} for type {kind:#x} method {method:#x}", lay.format);
+        let extra = if kind == crossvm::SPATIAL_HRTF_STREAM_TYPE {
+            wasapi::SpatialExtra::Hrtf { decay: Some(full[0x28..0x3c].try_into().unwrap()), directivity: Some(full[0x3c..0x4c].try_into().unwrap()), environment: Some(1), orientation: Some(full[0x50..0x74].try_into().unwrap()) }
+        } else {
+            let n = if method == crossvm::METHOD_SPATIAL_METADATA_STREAM2 { u32_at(&full, 0x34) } else { u16::from_le_bytes([full[0x34], full[0x35]]) as u32 };
+            assert_eq!(n, 8, "max metadata items at A+0x34");
+            wasapi::SpatialExtra::Metadata { format_id: [0x11; 16], max_items: 8 }
+        };
+        let direct = sp.activate_stream(&wasapi::SpatialStreamParams { format: fmt, mask: 6, min: 0, max: 0, category: 6, options: 0, extra }).map(|_| ()).err();
+        let (hr, e) = create(kind, 1, 0, method, &args);
+        match direct {
+            Some(pc) => assert_eq!(hr, pc, "type {kind:#x} method {method:#x}: the host returns the PC activation error"),
+            None if kind == crossvm::SPATIAL_HRTF_STREAM_TYPE => {
+                assert_eq!(hr, 0, "type {kind:#x} method {method:#x}: the PC HRTF stream backs a guest object");
+                hrtf_pump(u32_at(&e, 0x1c), &e[0x10..], &lay);
+            }
+            None => assert_eq!(hr, 0x8000_4001u32 as i32, "type {kind:#x} method {method:#x}: PC metadata stream activated; the DCAS metadata bytes are not decoded"),
+        }
+        println!("spatial variant type {kind:#x} method {method:#x}: PC ActivateSpatialAudioStream -> {:#010x}", hr as u32);
+        let mut short = args.clone();
+        let fo = lay.format - 0x14 + 0x10;
+        short[fo..fo + 2].copy_from_slice(&0x37u16.to_le_bytes());
+        let (hr, _) = create(kind, 1, 0, method, &short);
+        assert_eq!(hr, -2147024809, "type {kind:#x} method {method:#x}: cbSize + 0x12 above 0x48");
+    }
+    crossvm::set_hello(1);
+}
+
+#[test]
+fn crossvm_audio_hrtf_and_metadata_streams_forward_the_console_params_to_the_pc() {
+    run_step("spatial_variants");
+}
+
+#[test]
+fn crossvm_audio_spatial_activation_blobs_follow_the_console_layouts() {
+    use console_sandbox::wasapi::{spatial_params_blob, SpatialExtra, SpatialStreamParams};
+    let at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let fmt = vec![3u8; 0x12];
+    let plain = SpatialStreamParams { format: fmt.clone(), mask: 6, min: 1, max: 2, category: 6, options: 1, extra: SpatialExtra::Plain };
+    let (b, _) = spatial_params_blob(&plain, 0x1234);
+    assert_eq!(b.len(), 0x2c, "124e00: VT_BLOB 0x2c");
+    assert_eq!((at(&b, 0), u32_at(&b, 8), u32_at(&b, 0xc), u32_at(&b, 0x10), u32_at(&b, 0x14), at(&b, 0x18), at(&b, 0x20), u32_at(&b, 0x28)), (plain.format.as_ptr() as u64, 6, 1, 2, 6, 0x1234, 0, 1));
+    let h = SpatialStreamParams { format: fmt.clone(), mask: 6, min: 0, max: 0, category: 6, options: 1, extra: SpatialExtra::Hrtf { decay: Some([1; 0x14]), directivity: None, environment: Some(3), orientation: Some([2; 0x24]) } };
+    let (b, _) = spatial_params_blob(&h, 0x99);
+    assert_eq!(b.len(), 0x4c, "125160: VT_BLOB 0x4c");
+    assert_eq!((at(&b, 0x18), at(&b, 0x20), at(&b, 0x30), u32_at(&b, 0x48)), (0x99, 0, 0, 1), "event 0x18, notify 0x20, absent directivity 0x30, options 0x48");
+    assert_ne!(at(&b, 0x28), 0);
+    assert_ne!(at(&b, 0x38), 0);
+    assert_ne!(at(&b, 0x40), 0);
+    if let SpatialExtra::Hrtf { decay: Some(d), environment: Some(e), .. } = &h.extra {
+        assert_eq!(at(&b, 0x28), d.as_ptr() as u64);
+        assert_eq!(at(&b, 0x38), e as *const u32 as u64);
+    }
+    let m = SpatialStreamParams { format: fmt.clone(), mask: 6, min: 0, max: 0, category: 6, options: 1, extra: SpatialExtra::Metadata { format_id: [0x22; 16], max_items: 9 } };
+    let (b, _) = spatial_params_blob(&m, 0x77);
+    assert_eq!(b.len(), 0x48, "1255d0: VT_BLOB 0x48");
+    assert_eq!((&b[0x20..0x30], u32_at(&b, 0x30), at(&b, 0x34), at(&b, 0x3c), u32_at(&b, 0x44)), (&[0x22u8; 16][..], 9, 0, 0, 1), "GUID 0x20, max items 0x30, activation params 0x34, notify 0x3c, options 0x44");
+    for (kind, method, fmt_at, clsid, memory) in [(0xf, 0x36, 0x24, 0x70, 0x1bc), (0xf, 0x82, 0x24, 0x74, 0x1c0), (0x10, 0x37, 0x74, 0xc0, 0x20c), (0x10, 0x83, 0x74, 0xc4, 0x210), (0x16, 0x38, 0x36, 0x82, 0x1ce), (0x16, 0x84, 0x38, 0x88, 0x1d4)] {
+        let l = crossvm::spatial_layout(kind, method).unwrap();
+        assert_eq!((l.format, l.reply.clsid, l.reply.memory), (fmt_at, clsid, memory), "type {kind:#x} method {method:#x}");
+        assert_eq!(l.reply.event, l.reply.clsid + 0x24, "event descriptor follows CLSID, u32, u64, u64");
+        assert!(crossvm::spatial_layout_end(&l) <= 0x800);
+    }
+    assert!(crossvm::spatial_layout(0x10, 0x36).is_none() && crossvm::spatial_layout(0x16, 0x82).is_none());
 }
 
 fn media() {

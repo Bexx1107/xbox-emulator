@@ -115,6 +115,9 @@ pub fn built_dll(crate_dir: &str, file: &str) -> Option<PathBuf> {
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| Path::new(crate_dir).join("..").join("..").join("..").join("target"));
+    if let Some(p) = std::env::current_exe().ok().and_then(|e| profile_dir_of(&e)).map(|d| d.join(file)).filter(|p| p.is_file()) {
+        return Some(p);
+    }
     ["debug", "release"]
         .iter()
         .map(|p| target.join(p).join(file))
@@ -179,7 +182,21 @@ pub fn check_crate(crate_dir: &str, dll: &str, exports_txt: &str) {
 }
 
 fn profile_dir_of(exe: &std::path::Path) -> Option<std::path::PathBuf> {
-    exe.ancestors().skip(1).find(|a| matches!(a.file_name().and_then(|n| n.to_str()), Some("debug") | Some("release")) && a.parent().is_some()).map(|a| a.to_path_buf())
+    if let Some(a) = exe.ancestors().skip(1).find(|a| matches!(a.file_name().and_then(|n| n.to_str()), Some("debug") | Some("release")) && a.parent().is_some()) {
+        return Some(a.to_path_buf());
+    }
+    let marker = exe.ancestors().skip(1).find(|a| matches!(a.file_name().and_then(|n| n.to_str()), Some("deps") | Some("build")))?;
+    let profile = marker.parent()?;
+    profile.parent()?;
+    Some(profile.to_path_buf())
+}
+
+fn profile_args(profile: &std::path::Path) -> Vec<String> {
+    match profile.file_name().and_then(|n| n.to_str()) {
+        Some("debug") | None => Vec::new(),
+        Some("release") => vec!["--release".into()],
+        Some(other) => vec!["--profile".into(), other.into()],
+    }
 }
 
 pub fn build_cdylib(cargo: &str, manifest_dir: &str, package: &str, dll: &str) -> std::path::PathBuf {
@@ -204,9 +221,7 @@ pub fn build_cdylib_with_features(cargo: &str, manifest_dir: &str, package: &str
     if !features.is_empty() {
         cmd.args(["--features", features]);
     }
-    if profile.file_name().and_then(|n| n.to_str()) == Some("release") {
-        cmd.arg("--release");
-    }
+    cmd.args(profile_args(&profile));
     let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {cargo} build -p {package}: {e}"));
     let reader = child.stderr.take().map(|mut e| {
         std::thread::spawn(move || {

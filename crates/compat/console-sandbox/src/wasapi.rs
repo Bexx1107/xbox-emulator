@@ -56,6 +56,9 @@ extern "system" {
 extern "system" {
     fn SetEvent(h: usize) -> i32;
     fn Sleep(ms: u32);
+    fn CreateEventW(a: *mut c_void, manual: i32, initial: i32, name: *const u16) -> usize;
+    fn CloseHandle(h: usize) -> i32;
+    fn WaitForSingleObject(h: usize, ms: u32) -> u32;
 }
 
 #[repr(C)]
@@ -819,6 +822,177 @@ pub fn endpoint_offload(id: Option<&str>) -> Result<u32, i32> {
     Ok(any)
 }
 
+const IID_ISPATIAL_AUDIO_OBJECT_RENDER_STREAM: Guid = Guid { data1: 0xBAB5F473, data2: 0xB423, data3: 0x477B, data4: [0x85, 0xF5, 0xB5, 0xA3, 0x32, 0xA0, 0x41, 0x53] };
+const VT_BLOB: u16 = 0x41;
+pub const SPATIAL_PARAMS2_BYTES: u32 = 0x2c;
+const E_OUTOFMEMORY_HR: i32 = 0x8007_000Eu32 as i32;
+
+pub struct SpatialStreamParams {
+    pub format: Vec<u8>,
+    pub mask: u32,
+    pub min: u32,
+    pub max: u32,
+    pub category: u32,
+    pub options: u32,
+    pub extra: SpatialExtra,
+}
+
+pub enum SpatialExtra {
+    Plain,
+    Hrtf { decay: Option<[u8; 0x14]>, directivity: Option<[u8; 0x10]>, environment: Option<u32>, orientation: Option<[u8; 0x24]> },
+    Metadata { format_id: [u8; 16], max_items: u32 },
+}
+
+const IID_ISPATIAL_AUDIO_OBJECT_RENDER_STREAM_FOR_HRTF: Guid = Guid { data1: 0xE08DEEF9, data2: 0x5363, data3: 0x406E, data4: [0x9F, 0xDC, 0x08, 0x0E, 0xE2, 0x47, 0xBB, 0xE0] };
+const IID_ISPATIAL_AUDIO_OBJECT_RENDER_STREAM_FOR_METADATA: Guid = Guid { data1: 0xBBC9C907, data2: 0x48D5, data3: 0x4A2E, data4: [0xA0, 0xC7, 0xF7, 0xF0, 0xD6, 0x7C, 0x1F, 0xB1] };
+pub const SPATIAL_HRTF_PARAMS2_BYTES: u32 = 0x4c;
+pub const SPATIAL_METADATA_PARAMS2_BYTES: u32 = 0x48;
+
+pub fn spatial_params_blob(p: &SpatialStreamParams, event: usize) -> (Vec<u8>, Guid) {
+    let put = |b: &mut Vec<u8>, o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
+    let size = match p.extra {
+        SpatialExtra::Plain => SPATIAL_PARAMS2_BYTES,
+        SpatialExtra::Hrtf { .. } => SPATIAL_HRTF_PARAMS2_BYTES,
+        SpatialExtra::Metadata { .. } => SPATIAL_METADATA_PARAMS2_BYTES,
+    } as usize;
+    let mut b = vec![0u8; size];
+    put(&mut b, 0, &(p.format.as_ptr() as usize as u64).to_le_bytes());
+    put(&mut b, 8, &p.mask.to_le_bytes());
+    put(&mut b, 0xc, &p.min.to_le_bytes());
+    put(&mut b, 0x10, &p.max.to_le_bytes());
+    put(&mut b, 0x14, &p.category.to_le_bytes());
+    put(&mut b, 0x18, &(event as u64).to_le_bytes());
+    let iid = match &p.extra {
+        SpatialExtra::Plain => {
+            put(&mut b, 0x28, &p.options.to_le_bytes());
+            IID_ISPATIAL_AUDIO_OBJECT_RENDER_STREAM
+        }
+        SpatialExtra::Hrtf { decay, directivity, environment, orientation } => {
+            let ptr = |o: Option<*const u8>| o.map(|x| x as usize as u64).unwrap_or(0).to_le_bytes();
+            put(&mut b, 0x28, &ptr(decay.as_ref().map(|d| d.as_ptr())));
+            put(&mut b, 0x30, &ptr(directivity.as_ref().map(|d| d.as_ptr())));
+            put(&mut b, 0x38, &ptr(environment.as_ref().map(|d| d as *const u32 as *const u8)));
+            put(&mut b, 0x40, &ptr(orientation.as_ref().map(|d| d.as_ptr())));
+            put(&mut b, 0x48, &p.options.to_le_bytes());
+            IID_ISPATIAL_AUDIO_OBJECT_RENDER_STREAM_FOR_HRTF
+        }
+        SpatialExtra::Metadata { format_id, max_items } => {
+            put(&mut b, 0x20, format_id);
+            put(&mut b, 0x30, &max_items.to_le_bytes());
+            put(&mut b, 0x44, &p.options.to_le_bytes());
+            IID_ISPATIAL_AUDIO_OBJECT_RENDER_STREAM_FOR_METADATA
+        }
+    };
+    (b, iid)
+}
+
+pub struct SpatialStream {
+    com: Com,
+    event: usize,
+}
+
+unsafe impl Send for SpatialStream {}
+
+impl SpatialStream {
+    pub fn available_dynamic(&self) -> Result<u32, i32> {
+        unsafe {
+            let mut n = 0u32;
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(self.com.0, 3)(self.com.0, &mut n);
+            if hr < 0 { Err(hr) } else { Ok(n) }
+        }
+    }
+}
+
+impl Drop for SpatialStream {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.event) };
+    }
+}
+
+unsafe impl Sync for SpatialStream {}
+
+impl SpatialStream {
+    pub fn event(&self) -> usize {
+        self.event
+    }
+    unsafe fn call0(&self, n: usize) -> i32 {
+        slot::<unsafe extern "system" fn(*mut c_void) -> i32>(self.com.0, n)(self.com.0)
+    }
+    pub fn start(&self) -> i32 {
+        unsafe { self.call0(5) }
+    }
+    pub fn stop(&self) -> i32 {
+        unsafe { self.call0(6) }
+    }
+    pub fn reset(&self) -> i32 {
+        unsafe { self.call0(7) }
+    }
+    pub fn begin_updating(&self) -> Result<(u32, u32), i32> {
+        unsafe {
+            let (mut n, mut f) = (0u32, 0u32);
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32, *mut u32) -> i32>(self.com.0, 8)(self.com.0, &mut n, &mut f);
+            if hr < 0 { Err(hr) } else { Ok((n, f)) }
+        }
+    }
+    pub fn end_updating(&self) -> i32 {
+        unsafe { self.call0(9) }
+    }
+    pub fn activate_object(&self, kind: u32) -> Result<SpatialObject, i32> {
+        unsafe {
+            let mut o = core::ptr::null_mut();
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32>(self.com.0, 10)(self.com.0, kind, &mut o);
+            if hr < 0 || o.is_null() { Err(hr) } else { Ok(SpatialObject(Com(o))) }
+        }
+    }
+}
+
+pub struct SpatialObject(Com);
+
+pub const HRTF_SET_GAIN: usize = 8;
+pub const HRTF_SET_ORIENTATION: usize = 9;
+pub const HRTF_SET_ENVIRONMENT: usize = 10;
+pub const HRTF_SET_DISTANCE_DECAY: usize = 11;
+pub const HRTF_SET_DIRECTIVITY: usize = 12;
+
+unsafe impl Send for SpatialObject {}
+
+impl SpatialObject {
+    pub fn buffer(&self) -> Result<(*mut u8, u32), i32> {
+        unsafe {
+            let (mut p, mut n) = (core::ptr::null_mut::<u8>(), 0u32);
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut *mut u8, *mut u32) -> i32>(self.0 .0, 3)(self.0 .0, &mut p, &mut n);
+            if hr < 0 || p.is_null() { Err(hr) } else { Ok((p, n)) }
+        }
+    }
+    pub fn set_end_of_stream(&self, frames: u32) -> i32 {
+        unsafe { slot::<unsafe extern "system" fn(*mut c_void, u32) -> i32>(self.0 .0, 4)(self.0 .0, frames) }
+    }
+    pub fn set_volume(&self, v: f32) -> i32 {
+        unsafe { slot::<unsafe extern "system" fn(*mut c_void, f32) -> i32>(self.0 .0, 8)(self.0 .0, v) }
+    }
+    pub fn set_hrtf_gain(&self, v: f32) -> i32 {
+        unsafe { slot::<unsafe extern "system" fn(*mut c_void, f32) -> i32>(self.0 .0, HRTF_SET_GAIN)(self.0 .0, v) }
+    }
+    pub fn set_hrtf_environment(&self, v: u32) -> i32 {
+        unsafe { slot::<unsafe extern "system" fn(*mut c_void, u32) -> i32>(self.0 .0, HRTF_SET_ENVIRONMENT)(self.0 .0, v) }
+    }
+    pub unsafe fn set_hrtf_block(&self, n: usize, p: *const u8) -> i32 {
+        slot::<unsafe extern "system" fn(*mut c_void, *const u8) -> i32>(self.0 .0, n)(self.0 .0, p)
+    }
+}
+
+pub unsafe fn com_init() {
+    CoInitializeEx(core::ptr::null_mut(), 0);
+}
+
+pub fn wait_event(h: usize, ms: u32) -> bool {
+    unsafe { WaitForSingleObject(h, ms) == 0 }
+}
+
+pub fn signal_event(h: usize) {
+    unsafe { SetEvent(h) };
+}
+
 pub struct Spatial(Com);
 
 pub fn spatial(id: Option<&str>) -> Result<Spatial, i32> {
@@ -875,6 +1049,27 @@ impl Spatial {
             let mut n = 0u32;
             let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, i32, *const u8, *mut u32) -> i32>(c2.0, 12)(c2.0, category, offload as i32, fmt.as_ptr(), &mut n);
             if hr < 0 { Err(hr) } else { Ok(n) }
+        }
+    }
+    pub fn activate_stream(&self, p: &SpatialStreamParams) -> Result<SpatialStream, i32> {
+        unsafe {
+            let event = CreateEventW(core::ptr::null_mut(), 0, 0, core::ptr::null());
+            if event == 0 {
+                return Err(E_OUTOFMEMORY_HR);
+            }
+            let (blob, iid) = spatial_params_blob(p, event);
+            let mut pv: PropVariant = core::mem::zeroed();
+            pv.vt = VT_BLOB;
+            let raw = &mut pv as *mut PropVariant as *mut u8;
+            core::ptr::write_unaligned(raw.add(8) as *mut u32, blob.len() as u32);
+            core::ptr::write_unaligned(raw.add(16) as *mut *const u8, blob.as_ptr());
+            let mut st = core::ptr::null_mut();
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *const PropVariant, *const Guid, *mut *mut c_void) -> i32>(self.0 .0, 10)(self.0 .0, &pv, &iid, &mut st);
+            if hr < 0 {
+                CloseHandle(event);
+                return Err(hr);
+            }
+            Ok(SpatialStream { com: Com(st), event })
         }
     }
     pub fn static_position(&self, kind: u32) -> Result<[f32; 3], i32> {

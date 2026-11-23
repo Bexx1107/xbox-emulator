@@ -1408,6 +1408,7 @@ unsafe extern "system" fn create_rtv_traced(this: *mut DeviceWrapper, res: *mut 
     let real = unsafe { (*this).real };
     let inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = unsafe { core::mem::transmute(*real_vtbl(real).add(15)) };
     crate::rtcap::note_view(dest, res as usize, unsafe { inc(real, 2) } as usize);
+    unsafe { crate::blendclamp::note_rtv(dest, res as usize, pdesc) };
     unsafe { crate::rtcap::register_view_target(res, 4) };
     crate::replay::note_view(dest, 'r', res as usize, if pdesc.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts(pdesc, 24) }) });
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(*real_vtbl(real).add(20)) };
@@ -1596,7 +1597,7 @@ pub(crate) fn shader_root_container(rts: &[u8], raw: bool) -> Vec<u8> {
     let console = wrap_root_signature(rts);
     let container = crate::rs_xbox::pc_blob(&console).unwrap_or(console);
     if !raw {
-        return match crate::cbv_raw::alias_blob(&container) {
+        return match crate::cbv_raw::copy_mode_blob(&container) {
             Ok(Some(b)) => b,
             Ok(None) => container,
             Err(e) => {
@@ -2087,7 +2088,7 @@ pub(crate) fn vtable() -> *const usize {
         v[75] = crate::device_x::unregister_page_pool_x as usize;
         v[87] = crate::device_x::device87_release_x as usize;
         crate::device_ext_a::install(&mut v);
-        if crate::rtcap::enabled() || crate::passcap::on() {
+        if crate::rtcap::enabled() || crate::passcap::on() || crate::blendclamp::lazy() {
             v[20] = create_rtv_traced as usize;
             v[21] = create_dsv_traced as usize;
         }
@@ -2111,6 +2112,7 @@ pub(crate) fn vtable() -> *const usize {
 pub fn wrap_device(real: *mut c_void) -> *mut c_void {
     if !real.is_null() {
         unsafe { crate::shader_xlat::probe_typed_atomic64(real) };
+        crate::blend_probe::note_device(real);
     }
     if crate::rtcap::enabled() && !real.is_null() {
         unsafe { patch_real_device(real) };

@@ -921,7 +921,114 @@ elease`, the log shows one install and every interface is emulated.
     - DONE 0x64/0x65/0x66: handlers 11ac20/11a930/11ad30 call statics slots 8/9/10 (stub 119f50 etc.) with u32 A+0, HRESULT only. Guest local path 119de0 = AudioSrv RPC 2b29a846 v1.6 procs 0x10 s_pbmPlayToStreamStateChanged, 0x12 s_pbmCastingAppStateChanged, 0x13 s_pbmVoipCallStateChanged; value > 1 -> E_INVALIDARG. The PC statics slots forward to PC AudioSes f6820 (same trace lines as XD), so the host calls them on the PC: state 2 -> 0x80070057, state 0 -> S_OK. An id on an object that is not a 0x61 object is E_INVALIDARG [I: the console would call through a different vtable].
     - DONE 0x7b (CreateObject type 0x19): validator a6bc0 requires method 0x7b and a NUL WCHAR at args+0x3fe, key = string <= 0x1ff chars at args+0. Host a72b0 -> a007c -> a0110: RPC 99b833a0 v2.8 XD proc 0x58 (handle sm+0xa0, string, out), then 4a794/a2e18 wrap the control. XD proc 0x58 = PC cd682e75 proc 0x59 AudioSessionManagerGetExistingSession (audiosrv 77ba0) [I: by signature and the n -> n+1 trace-line shift in this region; PC 0x57 GetAudioSessions, 0x58 GetCurrentSession]. Server parses the key with CAudioSessionInstanceId::Initialize (b180) -> 0x80004005 on failure; lookup 1fd50 -> 0x80070002 when absent. PC IAudioSessionManager2 has no 6ba459f9, so the host walks the PC session enumerator and matches the instance id, with the same own-process filter as 0x77 (host choice).
     - DONE (console semantics) 0x2d property values > 0x104 bytes: MMDevAPI 5f240 does IPropertyStore::GetValue; vt & 0xefff == 0 -> tag 0, len 0; else 22bbc serialises to an unbounded CoTaskMem buffer and an unchecked memcpy (crt memcpy, thunk 28ff7) copies it to R+0x18, then writes tag at R+0x14 and u64 len at R+0x11c, so for len > 0x104 the len overwrites data bytes 0x104..0x10c, and returns S_OK. The host now does exactly this (put_property) for any length that fits the envelope payload. A value larger than the 0x800 payload overruns the console's 0x810 heap block (undefined on console); the host returns E_OUTOFMEMORY there (host-defined; never reached by any PC property seen so far).
-    - OPEN spatial DCAS: the DCAS writers (magic 0x53414344) are located but not decoded: Fortnite AudioSes b1b40 (validator b2978), XD fd8a4 (validator fe6c0), PC AudioSes e371c (validator e4430); the XD spatial creators for types 0xf/0x10/0x16 (registrar 31a0: 124e00, 125160, 125980) and the spatial stream ids 0x39/0x44/0x45/0x46 (registrar 3280, 12e9e0...). Missing: the DCAS record layout written by fd8a4 (field offsets after the magic, object-count/format fields that fe6c0 checks) and the per-id argument layouts of 0x39/0x44-0x46; until decoded those ids stay E_NOTIMPL in the envelope.
+    - OPEN spatial DCAS: superseded by round 10 below.
+  - Round 10 (2026-11-22, spatial DCAS). Decoded from XD AudioSes (identical checks in Fortnite b2978/b1b40 and PC e4430/e371c, so no per-generation difference). Correction: registrar 31a0 maps 0xf->124e00, 0x10->125160, 4->125980, 0x16->1255d0 (125980 is type 4, not 0x16). Tests: verify_crossvm crossvm_audio_dcas_control_block_follows_the_console_layout and crossvm_audio_spatial_stream_creators_check_args_and_activate_the_pc_stream (muted; no PC stream is ever started).
+    - DONE (layout, crossvm::dcas) DCAS is the CSpatialCrossProcess shared block. The host is the server (CSpatialCrossProcessServerEndpoint::Initialize feac0 -> fd8a4 writes it; CSpatialCrossProcessServerInputEndpoint reads guest objects); the guest attaches as client (fe018 -> fe6c0 + fd780, CSpatialCrossProcessClientOutputEndpoint writes). Header: +0 0x326, +4 'DCAS', +8..+0x54 zeroed control (+0x30 state = 6), +0x54..+0x184 control object (vtable 14d0d0), +0x184 WCHAR[0x40] name, +0x204 frames, +0x208 static objects, +0x20c dynamic objects, +0x210 total = data + 0x340, +0x214 WAVEFORMATEX (cbSize <= 0x100, else E_INVALIDARG). fe6c0: [0]==0x326, [4]=='DCAS', [0x208]+[0x20c] != 0, [0x210] >= 0x340, else 0x887c0045. Data at +0x340 (fcd60): +0 0x1c, +4 data bytes, +8 objects, +0xc property bytes/object, +0x10 metadata bytes/object, +0x14 align32(frames*4), +0x18 'DBAS'; data base must be 32-aligned (0x887c0054). Size (fd1fc) = align32(0x1c + 2N*prop + 2N*meta) + 2N*align32(frames*4), overflow 0x80070216. Regions (fe608, ping-pong index 0/1; accessors 4c430 / fd35c / 4c4aa index [p + i*0x18 + 0x28/0x30/0x38]): prop0 +0x1c, prop1, meta0, meta1, samples0 = align32(end), samples1.
+    - DONE (args) 0x39/0x44/7/0x45/8/0x46 for spatial stream objects (registrar 3280): every validator (12e070, 12e100, a2490, 12e148, a24d8, 12e0b8) checks the id and hands over env+0x10. 0x39 -> CSpatialAudioRenderStreamBase::InitializeInternalPhaseThree (1361f0), no args; 0x44 -> PreStartStream (13b84c), writes one bool byte at A+0; 7 -> 13cb3c then 13b684 (start); 0x45 -> PreStopStream (13b9a4), no args; 8 -> 13cedc then 13b700 unless S_FALSE (stop); 0x46 -> 13b780, no args. Ids 7/8 must route by object kind once spatial objects exist.
+    - PARTIAL type 0xf method 0x36 (124e00): A+0x14 static mask, +0x18 min dynamic, +0x1c max dynamic, +0x20 category, +0x24 WAVEFORMATEX (cbSize + 0x12 <= 0x48 else E_INVALIDARG); passed as VT_BLOB 0x2c SpatialAudioObjectRenderStreamActivationParams2 (event and notify null, options 0) to ISpatialAudioClient::ActivateSpatialAudioStream with IID bab5f473 (127208). The host does the same on the PC (works on this PC: static mask 0x6 activates; 16-bit PCM -> 0x88890008 from the PC), then returns E_NOTIMPL and creates no guest object. Missing: the 0x36 reply written by 123d94 (relative to A+0x14: +0x58 obj+0x6d8, +0x5c 16 bytes, +0x6c u32, +0x70 u64, +0x78 u64, +0x1a4 u32 from the 127208 out buffer offsets 0/0x10/0x20/0x28/0x3a8, meanings not decoded), the 0xa0 server-endpoint params the host passes to feac0 (+0x18 property bytes and +0x1c metadata bytes per object, +0x30 count and +0x20 16 bytes; builder not found), and the per-object property record the guest writes (needed to render position and volume; without it a pump would drop them). Methods: 0xf takes 0x36/0x82, 0x10 0x37/0x83 (ISpatialAudioObjectRenderStreamForHrtf e08deef9), 0x16 0x38/0x84 (ForMetadata bbc9c907); wrong method -> E_INVALIDARG [I], same cbSize check. Missing: the 0x82/0x83/0x84 packed parsers 123708/1237fc and the HRTF/metadata params past the format (both return E_NOTIMPL).
+    - OPEN type 4 (125980 -> 124574): builds a 0x28 host object (vtable 14da50, init 12617c, QI 170850) with no args; still served by the generic object path.
+  - Round 11 (2026-11-22, spatial reply). Corrections to round 10: the guest sends method 0x82, not 0x36 (XD 13fc58 builds type 0xf, flag 1, parent = client+0x30, method 0x82). 123708 is only a validator (method 0x82, cbSize + 0x12 <= 0x48 at A+0x34, returns A+0x14). 0x82 request relative to p = A+0x14: +0 static mask, +4 min dynamic, +8 max dynamic, +0xc category, +0x10 WAVEFORMATEX, +0x5c options (ActivationParams2 +0x28). The host now serves 0x82 like 0x36, passing the options through to the PC; the test covers it. The 0x84 validator 1237fc puts the format at A+0x38, so the metadata layout differs and stays E_NOTIMPL.
+    - DONE (decode) 0x82 reply: host packer 123c08, guest unpacker 13d7a4 into the 0x4e8 endpoint-info buffer, copied to stream+0x1c0 by 1362a4. Offsets relative to p:
+      - +0x58: stream+0x6d8, the extra dynamic-slot count. Host 135dd8 sets it to 1 only when static objects > 0, stream+0x1b9 is set and stream+0x70 == 1, otherwise 0. PhaseThree 1361f0 adds it to max dynamic.
+      - +0x60 (buf+0): endpoint CLSID. It must be 9371e7ff-df2d-4962-9585-40424d054550, which 1455b0 (CreateSpatialCrossProcessEndpoint) maps to the client output endpoint f8c94. The other CLSID, 6b78656b-c0e1-4190-83ee-ef91c2908926, maps to f7310.
+      - +0x70 (buf+0x10): u32.
+      - +0x74 (buf+0x20): u64 AudioSrv stream token. Start 13cb3c passes it to NdrClientCall3 on 149f38 proc 8 (1a418). The same slot in the regular Initialize reply (+0x84) is the stream token too.
+      - +0x7c (buf+0x28): u64, copied to stream+0x1a0 and logged by 135c62.
+      - +0x84: kind 2 period-event descriptor plus 0x120 bytes.
+      - +0x1a8 (buf+0x3a8): u32, copied to stream+0x568.
+      - +0x1ac: kind 3 memory descriptor plus 0x120 bytes, naming the DCAS section.
+      - Same shape as the regular Initialize reply (CLSID, u32, u64, u64, event, u32, memory). Only event slot 3 and the memory slot are used.
+    - DONE (PC oracle, same AudioSes code; e4430 == fe6c0) DCAS sizes chosen by the server. Activating a static stream on this PC maps a DCAS into the process. Name \BaseNamedObjects\AudioEngineDuplicateHandleApiPort-<n>, frames 535, static 2, dynamic 0, DBAS property bytes 0x20, metadata bytes 0 (plain stream), frame bytes 0x860, data 0x2220. crossvm::dcas reproduces these sizes exactly.
+      - The XD value for property bytes (feac0 params +0x18) was not found statically. The 0xa0 builder is in the audio engine, which is not in any dump; no audioeng/audiodg/audiosrv in the XD or Fortnite System32.
+    - PARTIAL (PC oracle) 0x20-byte object record, ping-pong set i at data+0x1c+i*N*0x20:
+      - +0: u32 per-object cookie.
+      - +4: u32 frames in the pass.
+      - +8: u32 AudioObjectType, written once a buffer was taken.
+      - +0xc: u32 flags. 3 = buffer written. 2 = active, no buffer. 0xa = SetEndOfStream; the end-of-stream frame count is not stored in the record.
+      - +0x1c: f32 volume (default 1.0).
+      - Not decoded: +0x10..+0x18, presumably position. This PC has 0 dynamic objects, so `unsupported | no dynamic objects: spatial sound format not enabled on the host endpoint`, and SetPosition could not be observed. Activating with max dynamic 1 gives 0x80070057 here.
+      - The meaning of flags bit 1 is open.
+    - OPEN: the ping-pong control protocol at DCAS+8. GetPingPongWriteIndex fd5c4 runs a 0x11-state machine on DCAS+0x30 with transition tables 1716d0 / 171630 and state table control+0x44.
+      - Fields seen moving on the PC: +0x8 u64, +0x30 state 6->7->8->0, +0x34/+0x38/+0x3c frame counts, +0x48 counter, +0x54.
+      - The host needs it to read guest records without racing. Until it is decoded, the 0xf/0x82 creator keeps activating the PC stream and then returning E_NOTIMPL, and no guest object or pump exists. Ids 0x39/0x44/7/0x45/8/0x46 therefore have no spatial object to act on.
+  - Round 12 (2026-11-22, spatial ping-pong and the 0xf creator). The round 11 "OPEN: ping-pong control protocol" item is closed. Code: crossvm::pingpong, the SpatialHost / SpatialPump in crossvm.rs, and the SpatialStream / SpatialObject wrappers in wasapi.rs.
+    - DONE (decode, XD AudioSes; the PC shares the code) The ping-pong state machine on DCAS+0x30, 17 states, with 16 meaning faulted. f9cd0 forces any state above 0x10 to 0x10.
+      - Transition tables:
+        - write acquire 1716d0 (fd5c4 GetPingPongWriteIndex)
+        - write commit 171590 (4c1de CommitWrite)
+        - write cancel 171530 (4bde0, the GetAvailableObjectCount error path)
+        - read acquire 171680 (fd498)
+        - read commit 1715e0 (fcc84 CommitRead)
+        - flush 171630 (ff194, which also ORs flags with 0x10 and zeroes DCAS+0x28)
+      - Index maps, built by f73a4 at endpoint+0x240 (esi=0, edi=1, ecx=2, eax=3): reader [1,1,1,1,1,1,2,2,0,0,0,0,0,0,2,2,3], writer [0,0,2,0,0,2,0,0,1,1,2,1,1,2,1,1,3]. 0/1 is a buffer, 2 is starved, 3 is a fault.
+      - Endpoint+0x2c8 points at DCAS+0x30; fd8a4 sets it.
+      - Error codes: 0x887c0061 write starved (counter at DCAS+0x50); 0x887c0062 read starved (counter at DCAS+0x4c, then fdfa0 backoff); 0x887c0045 fault; 0x887c006f CommitWrite index above 1; E_INVALIDARG for a CommitRead index above 1.
+      - The PC sample 6->7->8->0 lies on the cycle 6,7,8,11,14,15,0,3,6 (write, commit, read, commit, twice).
+    - DONE (decode) Control fields, DCAS-relative. fd8a4 zeroes DCAS+8..+0x54.
+      - +0x08 u64: position (fe2a0 swaps it in from the packet).
+      - +0x10 u64: position at which a dynamic grant applies.
+      - +0x18 / +0x1c: dynamic requested / granted. fcac4 copies +0x18 into +0x1c and clears flag 0x40.
+      - +0x20 / +0x24: per-buffer object count from CommitWrite.
+      - +0x28 u64: frames committed. CommitWrite adds the frames per packet when the count is non-zero; fe3d0 clamps it.
+      - +0x34: frames per packet. 4c300 / 4c526 use min(+0x34, max), with 0 meaning max. The PC has 0x1e0 at activation.
+      - +0x38 / +0x3c: per-buffer snapshot of +0x34, taken on write acquire.
+      - +0x40 / +0x44: per-buffer dynamic counts summed by 4c36e.
+      - +0x48: flags. 1 valid, 2 started (ff210), 4|8 position latched (fe2a0), 0x10 discontinuity (ff194; fe2a0 clears it), 0x20 event set (fef18), 0x40 grant pending, 0x80 closed. Start, Stop and Reset need (flags & 0x81) == 1; Stop clears 0xa.
+      - The PC has flags 1 at activation, so dcas::write now writes +0x34 and +0x48.
+      - +0x54 is the start of the control object; it is not a control field.
+    - DONE 0xf / 0x36 and 0xf / 0x82 create a real guest object.
+      - Allocation: a pool page holds a DCAS written by dcas::write with frames = PC MaxFrameCount, frames per packet = the PC device period at the format rate, static = popcount(mask & ~1), dynamic = max, 0x20-byte records and no metadata.
+      - Reply, per 123c08 / 123d94: endpoint CLSID 9371e7ff, a kind 2 period event, and a kind 3 memory descriptor naming the pool page.
+      - Routing on that object:
+        - 0x39 PhaseThree activates one PC ISpatialAudioObject per static bit (137cf0).
+        - 0x44 / 0x45 / 0x46 follow the started-flag part of 13b84c / 13b9a4 / 13b780 (0x8889010a and S_FALSE). The +0x20 slot 3 call is open; see below.
+        - 7 / 8 call the PC ISpatialAudioObjectRenderStream Start / Stop.
+      - The pump thread waits on the PC event. Each pass it calls BeginUpdating, publishes the frames per packet to +0x34, and reads one buffer. It copies samples (zero-filled when TOMBOX_AUDIO_MUTE=1), SetVolume and SetEndOfStream into the PC objects, then calls CommitRead and EndUpdating and signals the guest event. Starved passes count at +0x4c.
+      - Tests (all pass):
+        - crossvm_audio_ping_pong_state_machine_follows_the_console_tables: every state through every operation, plus the PC path.
+        - crossvm_audio_spatial_pump_reads_guest_records_into_the_pc_stream: mask 6 on the PC, zero samples only, muted.
+        - The updated creator and DCAS tests.
+    - OPEN, 0x82 reply fields that the host packer copies from AudioSrv's 0x4e8 buffer. The host leaves each of them 0, which is also what the regular Initialize path writes in the same slots:
+      - p+0x70 (buf+0x10). PC oracle: 0x85c0 in every run (535 * 0x40, not a live PID). The guest never reads stream+0x1d0.
+      - p+0x7c (buf+0x28). PC oracle: an AudioSrv counter that rises by 2 per activation. The guest copies it to stream+0x1a0 and compares it in 1368a2 / 137099. Its meaning is unknown.
+      - p+0x1a8 (buf+0x3a8). PC oracle: 0. The guest only logs it.
+      - p+0x74 token. The host consumes it itself (13cb3c NdrClientCall3 to AudioSrv), and our host keys the stream by object id instead.
+      - What is missing for all four: the console AudioSrv / audio engine that fills the buffer is in no dump.
+    - OPEN, DCAS +0x204 frame count. The PC DCAS for 48 kHz float mono, category 6, mask 6 has 535 frames (frame bytes 0x860). ISpatialAudioClient::GetMaxFrameCount and ISpatialAudioClient2::GetMaxFrameCountForCategory (every category, offload 0) both give 480, and so does BeginUpdating. The host writes 480, which still holds every pass the writer can make (frames per packet <= 480). The rule that gives 535 is in the audio engine, which is in no dump; the PC rejects other rates, so they could not be tried. p+0x70 = 0x85c0 = 535 * 0x40 on the PC, so it is probably derived from the same number.
+    - PARTIAL, host stream checks. 13b84c / 13b9a4 / 13b780 first call [host stream+0x20] vtable slot 3 (CFG hash 0xf0f0bee85a575870) when +0xa0 == 0 and return its failure. +0xa0 == 2 returns E_UNEXPECTED, and 13cb3c calls [+0x6b0] slot 5 when the start fails. The interfaces behind +0x20 and +0x6b0 are not identified, so the host routes only the started / initialized checks.
+    - DONE (PC oracle, same AudioSes client writer) Record-to-sample slot mapping. After BeginUpdating, FL then FR activation and GetBuffer, the FL buffer is at data+samples[0] and the FR buffer at samples[0] + 0x860. The records are at props[0] + k*0x20 with type 2 / 4, frames 0x1e0, flags 3 and volume 1.0. CommitWrite stores 2 at +0x20 and adds 480 to +0x28, and the state moves 6 -> 7 -> 8. The host pump reads exactly this layout. The PC engine writes +0x34 itself (487 at activation, then 480).
+    - OPEN, p+0x58 (host stream+0x6d8). 135dd8 sets it to 1 only when static > 0, stream+0x1b9 is set and stream+0x70 == 1. The PC oracle gives 0 for a static stream, so the host writes 0. What sets +0x1b9 and +0x70 on the host stream was not traced.
+    - OPEN, still not served:
+      - HRTF (0x10) and metadata (0x16) creators.
+      - Dynamic objects: record type 1 is skipped and counted. This PC has 0 dynamic objects, so +0x10..+0x18 (position) could not be observed.
+      - The dynamic-grant fields +0x10/+0x18/+0x1c and flag 0x40: the host never grants.
+      - Position publishing (fe2a0, +0x08, flags 4|8).
+      - The meaning of record flag bit 1.
+      - Whether the host should consume the record after a read: the host leaves records as the guest wrote them.
+  - Round 13 (2026-11-22, HRTF and metadata spatial streams). Code: crossvm::spatial_layout / spatial_extra / the HRTF part of SpatialPump, and wasapi::spatial_params_blob / SpatialExtra / the HRTF setters.
+    - DONE (decode) Requests. Offsets are from A, the payload; p = A+0x14 is what the validators return.
+      - HRTF 0x37 / 0x83 (125160, validator 123780; cbSize at A+0x84).
+        - Field offsets: +0x14 mask, +0x18 min, +0x1c max, +0x20 category, +0x24..+0x27 four "present" bytes, +0x28 distance decay (0x14 bytes), +0x3c directivity (0x10 bytes), +0x4c environment, +0x50 orientation (3x3 f32), +0x74 WAVEFORMATEX, +0xc0 options (0x83 only).
+        - The PC blob is 0x4c bytes: event at 0x18, notify at 0x20, the four pointers at 0x28/0x30/0x38/0x40 (null when absent), options at 0x48.
+      - Metadata 0x38 / 0x84 (1255d0, validator 1237fc).
+        - Field offsets: +0x24 metadata format GUID, +0x34 max item count (u16 for 0x38, u32 for 0x84), WAVEFORMATEX at +0x36 (0x38) or +0x38 (0x84), +0x84 options (0x84 only).
+        - The PC blob is 0x48 bytes: GUID at 0x20, count at 0x30, MetadataActivationParams at 0x34 (always null from the console), notify at 0x3c, options at 0x44.
+    - DONE (decode) Replies. They have the same shape as 123c08 / 123d94; A-relative offsets are below.
+      - HRTF 0x37 (1240b8): +0x58 slot A+0xbc, CLSID 0xc0, event 0xe4, memory 0x20c.
+      - HRTF 0x83 (123f20): CLSID 0xc4, event 0xe8, memory 0x210.
+      - Metadata 0x38 (1243e4): +0x58 slot A+0x7e, CLSID 0x82, event 0xa6, memory 0x1ce, then a qword at A+0x2f2.
+      - Metadata 0x84 (124250): +0x58 slot A+0x80, CLSID 0x88, event 0xac, memory 0x1d4, then a qword at A+0x2f8.
+    - DONE (PC oracle, HRTF) The PC activates ISpatialAudioObjectRenderStreamForHrtf even though IsSpatialAudioStreamAvailable says 0x88890107. The DCAS has 0xb4-byte records and no metadata.
+      - The first 0x20 bytes match the plain record.
+      - +0x20 is a per-pass dirty mask: 1 gain (+0x24), 2 orientation (+0x28, 0x24 bytes), 4 environment (+0x4c), 8 distance decay (+0x50, 0x14 bytes), 0x10 directivity (+0x64, 0x10 bytes).
+      - Record flag 0x10 means HRTF properties are present.
+      - The host creates the guest object with 0xb4-byte records. The pump forwards each dirty property to ISpatialAudioObjectForHrtf slots 8-12, and the plain SetVolume path is not used.
+      - Test: crossvm_audio_hrtf_and_metadata_streams_forward_the_console_params_to_the_pc runs 0x37 and 0x83 on the PC with zero samples and makes 10 HRTF setter calls with no errors.
+    - OPEN, HRTF dirty bit 0x20 / record +0x74. The PC sets it once at activation with +0x74 = 1. Which setter it belongs to is unknown (SetPosition on a static object returns 0x88890104 here). The host counts it and does not forward it. Record bytes +0x78..+0xb4 were zero in every probe.
+    - unsupported | no spatial audio metadata format is registered on this PC endpoint. ActivateSpatialAudioStream for ISpatialAudioObjectRenderStreamForMetadata returns 0x88890203 for the test GUID.
+      - The host forwards the exact console params, and the test checks that the host returns the PC error unchanged.
+      - If a PC with a metadata format activates it, the host returns E_NOTIMPL. Both of these come from the audio engine, which is not in any dump: the DCAS metadata bytes per object (feac0 params +0x1c) and the reply qword at p+0x2e4 (the 7th out argument of 127208, filled through 126718).
+    - OPEN, type 4 (125980 -> 124574). It ignores the args and creates a 0x28-byte object (vtable 14da50) around a 0x30-byte inner object (28a30 / 28ab8), then queries it for IID de889ace-f1ef-48b9-b599-1a9bf1541cc5. That IID is not registered on the PC and its ids are not decoded, so type 4 still falls through to the generic object.
 - chad.dll XDspSubmitCommandWithEnvelope: the DSP microcode that consumes the envelope is not in any dump, so the per-partition gain is inferred from the GDK description. See the chad exports.txt note for the known differences from the console's 8-float snapshot.
 - xmem/acphal test race: gcxaudioext tests crash with 0xc0000005 when the first ApuAlloc (xmem.dll + acphal.dll) runs at the same time as MMDevice COM enumeration on another thread. Loading the DLLs alone does not crash. The suspected cause is xmem IAT patching (iat.rs write_slot sets PAGE_READWRITE) racing live modules. The gcxaudioext tests are serialized to avoid it, and the root cause is not fixed.
 
@@ -1232,3 +1339,41 @@ Headless runs straight into each title's test scene, on the staged release of 11
 
 ## gather4_l footprint ignores sampler bias/clamp (tombox-xshader, #196) - 2026-11-23
 - OPEN: image_gather4_l / _l_o / _c_l / _c_l_o on 2D and 2D-array images choose the footprint mip from the unbiased explicit LOD. The S# LOD_BIAS, MIN_LOD and MAX_LOD are not applied to that choice, so a sampler with a non-zero bias or a LOD clamp that excludes the chosen mip gathers from a different level than RDNA2 does. Next step: read those S# fields in the shader where the descriptor is visible and apply them before the mip pick, with a WARP exec test that uses a non-zero clamp.
+
+## Trackmania MSAA resolve: Texture2DMS + FMASK (tombox-xshader / d3d12_xs) - 2026-11-22
+- 🟨 Race frames black after DRIVE. The first black pass is TM's custom MSAA resolve, PS `0ff9ad9a34cd4e65` (13 more TM shaders read MSAA the same way).
+- FIXED behind `TOMBOX_XS_MSAA_DIM=1`:
+  - PSV kind 3 (Texture2DMS) SRVs used to be translated as Texture2D with the sample index dropped. They are now Texture2DMS with a per-sample Load.
+  - FMASK reads return the identity map from the MS texture's sample count (2x 0x88888810, 4x 0x88883210, 8x 0x76543210). Our PC MSAA targets are never compressed, so identity is exact.
+  - The FMASK slot is found by the console compiler's layout: a 2D image_load whose descriptor sits 32 bytes after a kind-3 descriptor in the same table.
+  - WARP proof: `tombox-xshader/tests/fmask_identity_warp.rs`. The real 0ff9 HLSL averages two distinct samples.
+- OPEN: race frames are still black with the fix on. The WARP test shows the shader writes exactly 0 when CB b1 is degenerate (word 0 = sample count; words 4..9 = tonemap A..F). The race-time b1 contents and the draw's pipeline statistics are being probed (`TOMBOX_PASSCAP_PS`, probes.txt).
+- OPEN, the FMASK descriptor marker is not confirmed:
+  - The title's FMASK view is an MS view of the colour resource with map 0x1920 and raw Xbox desc +0x34 = 4. The colour view uses map 0x1688.
+  - The meaning of +0x34 has not been checked against the console d3d12_xs.dll; there is no decompiler offline yet.
+  - `fmask_check.rs` cross-checks the layout rule against that marker at bind time (needs `TOMBOX_RTCAP=1`). It logs `fmask_check MISMATCH` once per shader with both values. Without RTCAP it logs that the check did not run.
+- CONFIRMED in probe2 (2026-11-22): the FMASK marker. The FMASK view is map 0x1920 with desc+0x34 = 4, and the layout rule pairs it with the kind-3 slot 32 bytes earlier. b1 at race time is sane (w0 = 2 samples, tonemap words non-degenerate). The PSO is sane too. So the resolve shader is no longer the suspect.
+- OPEN, the clipper drops the fullscreen triangle before 0ff9 runs. Pipeline statistics for the draw: IAVertices=3, VSInvocations=3, CInvocations=1, CPrimitives=0, PSInvocations=0.
+  - VS `a3e24288e5858796` (read offline): xy = SV_VertexID corners (-1.01 / 3.03), w = 1.0, z = b13 dword 13 (byte 0x34, VS-visible root param 5). It has no VB fetch or input layout.
+  - The PSO has DepthClipEnable=1, copied from the title's own D3D12 desc; nothing in d3d12_xs changes it. So a NaN or out-of-range b13.w13 is the only remaining way this triangle can clip.
+  - Probe2 root[5] (va 0x9b60aa0) reads w13 = 0.0, but the probe's root-CBV map was not cleared on root-signature change. root[1] (NaN w12..13) is a root-constants param in this signature, so that entry is stale, and root[5] may be stale as well.
+  - Fix in progress: passcap now clears the map on Xbox slot 34 and labels the root signature. A rerun is needed to read the real b13.
+
+## blendclamp: small-float overflow is vendor dependent; shader Inf/NaN mapping unverified (d3d12_xs / tombox-xshader) - 2026-11-22
+- Measured: WARP and this PC's GPU both saturate blended and unblended finite overflow to the largest finite value in fp16 and R11G11B10 (40000+40000 gives 0x7bff / 0x7bf,0x7bf,0x3df). That matches the console's round-toward-zero conversion, so blendclamp's full-target passes only change shader-written Inf/NaN on these adapters. Probe: `cargo test -p d3d12_xs --lib hw_blend_overflow_probe -- --ignored --nocapture` (WARP: `warp_blend_overflow_matrix`). Other vendors and drivers are not measured.
+- NEW, gated `TOMBOX_BLEND_CLAMP=ps` (read once at start): the PS colour outputs for fp16/R11G11B10 targets are clamped in the shader (TB_RTFMT kinds 3/4), with NaN going to +max, and the full-target passes are off. The WARP proof that its output is identical to eager blendclamp for shader +Inf, -Inf and NaN, alone and in additive chains: `warp_ps_clamp_matches_eager_blendclamp_for_shader_inf_and_nan`. It needs export_fmt on. The ps mode also clamps unblended shader Inf/NaN, which the eager passes never touched.
+- OPEN: NaN -> +max copies what the eager MIN-blend clamp does on WARP. It has not been checked against RDNA2/Xbox colour export or CB conversion: there are no RDNA2 ISA docs or Mesa ac/radv sources on this machine, and the run is offline only. If the console keeps Inf/NaN (round-toward-zero leaves both unchanged), both the eager clamp and ps mode are less exact than no clamp for shader-written Inf/NaN. Next step: check the CB/export NaN and Inf behaviour in the RDNA2 docs or Mesa, or on an RDNA2 card with tools/rdna2-hwprobe.
+- OPEN: eager blendclamp also clamps R32G32B32A32_FLOAT (fmt 2) to +-65504 after blended draws. That is not the fp32 range and looks unintended. ps mode leaves fmt 2 alone.
+- ROOT CAUSE FOUND (2026-11-22, offline): every Durango-ABI vertex shader that reads SV_VertexID or SV_InstanceID gets v0/v3 = 0. In tombox-xshader hlsl.rs the VS entry init `v0 = (uint)(i.iN)` / `v3 = ...` is behind `self.durango.is_none()`, so TM's Durango VSs never load the vertex ID. For VS a3e24288 all three vertices land on (-1.01, -1.01, z, 1): a zero-area triangle, which matches CInvocations=1 / CPrimitives=0. The same VS is used in the menu, so the menu resolve should be degenerate too.
+- FIX behind `TOMBOX_XS_DG_VERTEXID=1`: Durango VSs get the same v0/v3 init. Gate off: HLSL is byte-identical. Gate on: a3e24288 gains only `v0 = (uint)(i.i0);`. The translated VS declares no SV_ClipDistance / SV_CullDistance. Needs a run, then making it the default once proven.
+
+## CBV raw/off path still goes black in TM (unaligned root CBVs); copy is the fix (d3d12_xs) - 2026-11-22
+- Console titles bind root CBVs at addresses that are not 256-byte aligned (console ABI, not a TM quirk). PC D3D12 requires 256-byte alignment.
+- `TOMBOX_CBV_RAW=copy` is now the global default: unaligned root CBVs are copied on the GPU timeline into an aligned ring; aligned CBVs are bound directly with no copy (fast path, other titles pay nothing).
+- OPEN: `auto`/`on` (raw rewrite) hangs TM at the f861 draw; `off` reaches the map but the race stalls and goes black (fast_20261122_194832_trackmania_tm_vertexid_off2, 1% low 2.6 fps). Both stay opt-in only. The raw path needs its own fix before it can be used again.
+- DONE: `TOMBOX_XS_MSAA_DIM` and `TOMBOX_XS_DG_VERTEXID` are now on by default (`=0` opts out). Proven in fast_20261122_194423_trackmania_tm_vertexid: the race renders, 0ff9 PSInvocations = 2073600.
+- OPEN, TM race: the stadium big screen is black (tm_vertexid run frame_065.6s). It is not an OS media gap.
+  - GbxGame.exe carries its own decoders: libvpx/webm, Vorbis, and Bink with the Bink_YCrCb_RGBA shaders. It imports no Media Foundation or XMF API, and the run log has no media lines.
+  - The likely cause is that the screen content comes from the title's online services (Nadeo ads or club media), which we redirect to the local server under the offline-only rule. It could also be a texture/upload path in our layer.
+  - Not confirmed. The next step is to find the screen's draw (PS hash + SRV) with a passcap probe and check whether its texture was ever written.
+- 2026-11-22, passcap: the probe now also records root 32-bit constants (Xbox slots 38/40, cleared on a root-signature change). PS c924bb75 exports root constants b0 words 0..3 (user SGPRs s3..s6, the Durango layout), so its black output can now be checked against the actual constant values.

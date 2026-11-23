@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::gcdcom::Guid;
@@ -110,6 +110,24 @@ pub const MEDIA_PLAY_TO_STREAM_STATE: u32 = 0x64;
 pub const MEDIA_CASTING_APP_STATE: u32 = 0x65;
 pub const MEDIA_VOIP_CALL_STATE: u32 = 0x66;
 pub const METHOD_ARGS: usize = 0x14;
+pub const SPATIAL_STREAM_TYPE: u32 = 0xf;
+pub const SPATIAL_HRTF_STREAM_TYPE: u32 = 0x10;
+pub const SPATIAL_METADATA_STREAM_TYPE: u32 = 0x16;
+pub const METHOD_SPATIAL_STREAM: u32 = 0x36;
+pub const METHOD_SPATIAL_HRTF_STREAM: u32 = 0x37;
+pub const METHOD_SPATIAL_METADATA_STREAM: u32 = 0x38;
+pub const METHOD_SPATIAL_STREAM2: u32 = 0x82;
+pub const METHOD_SPATIAL_HRTF_STREAM2: u32 = 0x83;
+pub const METHOD_SPATIAL_METADATA_STREAM2: u32 = 0x84;
+pub const SPATIAL_ARG_MASK: usize = 0x14;
+pub const SPATIAL_ARG_MIN: usize = 0x18;
+pub const SPATIAL_ARG_MAX: usize = 0x1c;
+pub const SPATIAL_ARG_CATEGORY: usize = 0x20;
+pub const SPATIAL_ARG_FORMAT: usize = 0x24;
+pub const SPATIAL_FORMAT_MAX: usize = 0x48;
+pub const SPATIAL_ARG_OPTIONS: usize = 0x70;
+pub const SPATIAL_PROPERTY_BYTES: u32 = 0x20;
+pub const CLSID_SPATIAL_CLIENT_OUTPUT_ENDPOINT: Guid = Guid { data1: 0x9371E7FF, data2: 0xDF2D, data3: 0x4962, data4: [0x95, 0x85, 0x40, 0x42, 0x4D, 0x05, 0x45, 0x50] };
 pub const METHOD_REPLY_COUNT: usize = 0x14;
 pub const BLOB_ID: usize = 0x1c;
 pub const BLOB_ID_CHARS: usize = 0x37;
@@ -272,11 +290,12 @@ struct Object {
     pc_sessions: Vec<Arc<wasapi::PcSession>>,
     pc_session: Option<Arc<wasapi::PcSession>>,
     media: Option<(wasapi::MediaManager, i64)>,
+    spatial: Option<SpatialHost>,
 }
 
 impl Object {
     fn new(kind: u32, parent: u32, device: Option<String>) -> Self {
-        Object { kind, parent, device, stream: None, volumes: None, properties: None, notify: false, notify_id: 0, watch: None, list_cursor: 0, pc_sessions: Vec::new(), pc_session: None, media: None }
+        Object { kind, parent, device, stream: None, volumes: None, properties: None, notify: false, notify_id: 0, watch: None, list_cursor: 0, pc_sessions: Vec::new(), pc_session: None, media: None, spatial: None }
     }
 }
 
@@ -512,6 +531,11 @@ fn scalar_to_level(v: f32, caps: &wasapi::EndpointCaps) -> f32 {
 }
 
 unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
+    if id != CREATE_OBJECT && id != RELEASE_OBJECT {
+        if let Some(hr) = spatial_call(id, object, a) {
+            return hr;
+        }
+    }
     match id {
         CREATE_OBJECT => create_object(a, room),
         RELEASE_OBJECT => {
@@ -887,6 +911,9 @@ unsafe fn create_object(a: *mut u8, room: usize) -> i32 {
         },
         _ => None,
     };
+    if let Some(hr) = spatial_stream_create(kind, method, parent, a, room) {
+        return hr;
+    }
     let mut sessions = Vec::new();
     let mut session = None;
     let mut session_parent = None;
@@ -966,6 +993,915 @@ unsafe fn create_object(a: *mut u8, room: usize) -> i32 {
     s.objects.insert(n, o);
     wr(a, 0xc, n);
     S_OK
+}
+
+pub fn spatial_stream_methods(kind: u32) -> Option<(u32, u32)> {
+    match kind {
+        SPATIAL_STREAM_TYPE => Some((METHOD_SPATIAL_STREAM, METHOD_SPATIAL_STREAM2)),
+        SPATIAL_HRTF_STREAM_TYPE => Some((METHOD_SPATIAL_HRTF_STREAM, METHOD_SPATIAL_HRTF_STREAM2)),
+        SPATIAL_METADATA_STREAM_TYPE => Some((METHOD_SPATIAL_METADATA_STREAM, METHOD_SPATIAL_METADATA_STREAM2)),
+        _ => None,
+    }
+}
+
+pub struct SpatialLayout {
+    pub format: usize,
+    pub options: Option<usize>,
+    pub reply: SpatialReply,
+    pub tail: Option<usize>,
+}
+
+pub const SPATIAL_HRTF_FLAGS: usize = 0x24;
+pub const SPATIAL_HRTF_DECAY: usize = 0x28;
+pub const SPATIAL_HRTF_DIRECTIVITY: usize = 0x3c;
+pub const SPATIAL_HRTF_ENVIRONMENT: usize = 0x4c;
+pub const SPATIAL_HRTF_ORIENTATION: usize = 0x50;
+pub const SPATIAL_METADATA_FORMAT_ID: usize = 0x24;
+pub const SPATIAL_METADATA_MAX_ITEMS: usize = 0x34;
+
+pub fn spatial_layout(kind: u32, method: u32) -> Option<SpatialLayout> {
+    Some(match (kind, method) {
+        (SPATIAL_STREAM_TYPE, METHOD_SPATIAL_STREAM) => SpatialLayout { format: SPATIAL_ARG_FORMAT, options: None, reply: SPATIAL_REPLY, tail: None },
+        (SPATIAL_STREAM_TYPE, METHOD_SPATIAL_STREAM2) => SpatialLayout { format: SPATIAL_ARG_FORMAT, options: Some(SPATIAL_ARG_OPTIONS), reply: SPATIAL_REPLY2, tail: None },
+        (SPATIAL_HRTF_STREAM_TYPE, METHOD_SPATIAL_HRTF_STREAM) => SpatialLayout { format: 0x74, options: None, reply: SpatialReply { extra: 0xbc, clsid: 0xc0, endpoint_value: 0xd0, token: 0xd4, stream_id: 0xdc, event: 0xe4, stream_value: 0x208, memory: 0x20c }, tail: None },
+        (SPATIAL_HRTF_STREAM_TYPE, METHOD_SPATIAL_HRTF_STREAM2) => SpatialLayout { format: 0x74, options: Some(0xc0), reply: SpatialReply { extra: 0xbc, clsid: 0xc4, endpoint_value: 0xd4, token: 0xd8, stream_id: 0xe0, event: 0xe8, stream_value: 0x20c, memory: 0x210 }, tail: None },
+        (SPATIAL_METADATA_STREAM_TYPE, METHOD_SPATIAL_METADATA_STREAM) => SpatialLayout { format: 0x36, options: None, reply: SpatialReply { extra: 0x7e, clsid: 0x82, endpoint_value: 0x92, token: 0x96, stream_id: 0x9e, event: 0xa6, stream_value: 0x1ca, memory: 0x1ce }, tail: Some(0x2f2) },
+        (SPATIAL_METADATA_STREAM_TYPE, METHOD_SPATIAL_METADATA_STREAM2) => SpatialLayout { format: 0x38, options: Some(0x84), reply: SpatialReply { extra: 0x80, clsid: 0x88, endpoint_value: 0x98, token: 0x9c, stream_id: 0xa4, event: 0xac, stream_value: 0x1d0, memory: 0x1d4 }, tail: Some(0x2f8) },
+        _ => return None,
+    })
+}
+
+pub fn spatial_layout_end(l: &SpatialLayout) -> usize {
+    l.tail.map(|t| t + 8).unwrap_or(l.reply.memory + SPATIAL_DESCRIPTOR_BYTES).max(l.options.map(|o| o + 4).unwrap_or(0)).max(l.format + 0x12)
+}
+
+unsafe fn spatial_extra(kind: u32, method: u32, a: *const u8) -> wasapi::SpatialExtra {
+    let copy = |o: usize, n: usize| core::slice::from_raw_parts(a.add(o), n).to_vec();
+    match kind {
+        SPATIAL_HRTF_STREAM_TYPE => {
+            let has = |i: usize| *a.add(SPATIAL_HRTF_FLAGS + i) != 0;
+            wasapi::SpatialExtra::Hrtf {
+                decay: has(0).then(|| copy(SPATIAL_HRTF_DECAY, 0x14).try_into().unwrap()),
+                directivity: has(1).then(|| copy(SPATIAL_HRTF_DIRECTIVITY, 0x10).try_into().unwrap()),
+                environment: has(2).then(|| rd(a, SPATIAL_HRTF_ENVIRONMENT)),
+                orientation: has(3).then(|| copy(SPATIAL_HRTF_ORIENTATION, 0x24).try_into().unwrap()),
+            }
+        }
+        SPATIAL_METADATA_STREAM_TYPE => wasapi::SpatialExtra::Metadata {
+            format_id: copy(SPATIAL_METADATA_FORMAT_ID, 16).try_into().unwrap(),
+            max_items: if method == METHOD_SPATIAL_METADATA_STREAM2 { rd::<u32>(a, SPATIAL_METADATA_MAX_ITEMS) } else { rd::<u16>(a, SPATIAL_METADATA_MAX_ITEMS) as u32 },
+        },
+        _ => wasapi::SpatialExtra::Plain,
+    }
+}
+
+unsafe fn spatial_stream_create(kind: u32, method: u32, parent: u32, a: *mut u8, room: usize) -> Option<i32> {
+    spatial_stream_methods(kind)?;
+    let Some(lay) = spatial_layout(kind, method) else { return Some(E_INVALIDARG) };
+    if room < spatial_layout_end(&lay) {
+        return Some(E_INVALIDARG);
+    }
+    let head = core::slice::from_raw_parts(a.add(lay.format), 0x12);
+    let flen = u16::from_le_bytes([head[0x10], head[0x11]]) as usize + 0x12;
+    if flen > SPATIAL_FORMAT_MAX || lay.format + flen > room {
+        return Some(E_INVALIDARG);
+    }
+    let params = wasapi::SpatialStreamParams {
+        format: core::slice::from_raw_parts(a.add(lay.format), flen).to_vec(),
+        mask: rd(a, SPATIAL_ARG_MASK),
+        min: rd(a, SPATIAL_ARG_MIN),
+        max: rd(a, SPATIAL_ARG_MAX),
+        category: rd(a, SPATIAL_ARG_CATEGORY),
+        options: lay.options.map(|o| rd(a, o)).unwrap_or(0),
+        extra: spatial_extra(kind, method, a),
+    };
+    let dev = device_for(parent);
+    let sp = match wasapi::spatial(dev.as_deref()) {
+        Ok(sp) => sp,
+        Err(hr) => return Some(hr),
+    };
+    let stream = match sp.activate_stream(&params) {
+        Ok(st) => st,
+        Err(hr) => {
+            compat_common::record_raw("crossvm-audio", "CreateObject", &format!("spatial stream type {kind:#x} method {method:#x} mask {:#x} min {} max {} category {}: PC ActivateSpatialAudioStream -> {:#010x}", params.mask, params.min, params.max, params.category, hr as u32));
+            return Some(hr);
+        }
+    };
+    SPATIAL_ACTIVATIONS.fetch_add(1, Ordering::SeqCst);
+    if kind == SPATIAL_METADATA_STREAM_TYPE {
+        drop(stream);
+        compat_common::record_raw("crossvm-audio", "CreateObject", &format!("spatial type {kind:#x} method {method:#x}: PC metadata stream activated, but the DCAS metadata bytes per object and the reply qword at p+0x2e4 come from the audio engine, which is in no dump; no guest object; E_NOTIMPL"));
+        return Some(E_NOTIMPL);
+    }
+    let props = if kind == SPATIAL_HRTF_STREAM_TYPE { SPATIAL_HRTF_PROPERTY_BYTES } else { SPATIAL_PROPERTY_BYTES };
+    let reply = &lay.reply;
+    let rate = wasapi::sample_rate(&params.format);
+    let frames = match sp.max_frames(&params.format) {
+        Ok(f) => f,
+        Err(hr) => return Some(hr),
+    };
+    let packet = match wasapi::device_info_for(dev.as_deref()) {
+        Ok(d) => ((d.default_period * rate as i64 / HNS) as u32).min(frames),
+        Err(hr) => return Some(hr),
+    };
+    let statics = (params.mask & !AUDIO_OBJECT_DYNAMIC).count_ones();
+    let dynamic = params.max;
+    let total = match dcas::total(frames, statics, dynamic, props, 0) {
+        Ok(t) => t,
+        Err(hr) => return Some(hr),
+    };
+    let pages = (total as usize).div_ceil(crate::logan::PAGE);
+    let Some(index) = crate::logan::pool_alloc(pages) else {
+        return Some(E_OUTOFMEMORY);
+    };
+    let base = crate::logan::pool() + index as usize * crate::logan::PAGE;
+    let name = format!("\\BaseNamedObjects\\AudioEngineDuplicateHandleApiPort-{index}");
+    let mem = core::slice::from_raw_parts_mut(base as *mut u8, total as usize);
+    let shape = match dcas::write(mem, &name, frames, packet, statics, dynamic, props, 0, &params.format).and_then(|sh| dcas::regions(&sh).map(|r| (sh, r))) {
+        Ok(v) => v,
+        Err(hr) => {
+            crate::logan::pool_release(index as usize);
+            return Some(hr);
+        }
+    };
+    let event_id = {
+        let mut s = state();
+        s.next_event += 1;
+        s.next_event
+    };
+    let event_name = event_name(event_id as u16);
+    let event = match crate::vab::create_event(&event_name) {
+        Ok(h) => h,
+        Err(e) => {
+            crate::logan::pool_release(index as usize);
+            return Some((0x8007_0000 | (e & 0xffff)) as i32);
+        }
+    };
+    let dynamic_now = stream.available_dynamic().unwrap_or(0);
+    core::ptr::write_bytes(a.add(reply.extra), 0, spatial_layout_end(&lay) - reply.extra);
+    core::ptr::copy_nonoverlapping(guid_bytes(&CLSID_SPATIAL_CLIENT_OUTPUT_ENDPOINT).as_ptr(), a.add(reply.clsid), 16);
+    write_event_descriptor(a.add(reply.event), EVENT_KIND_GAMECORE, event_id as u16);
+    wr(a, reply.memory, KIND_CROSS_VM_MEMORY);
+    core::ptr::copy_nonoverlapping(guid_bytes(&CLSID_XVM_BUFFER).as_ptr(), a.add(reply.memory + 4), 16);
+    core::ptr::copy_nonoverlapping(guid_bytes(&GUID_XVM_BUFFER).as_ptr(), a.add(reply.memory + 0x14), 16);
+    wr(a, reply.memory + 0x24, index as u32);
+    let pump = Arc::new(SpatialPump {
+        stream,
+        objects: Mutex::new(Vec::new()),
+        control: pingpong::Control::at(base as *mut u8),
+        base,
+        shape: shape.0,
+        regions: shape.1,
+        mask: params.mask,
+        hrtf: kind == SPATIAL_HRTF_STREAM_TYPE,
+        event: event as usize,
+        running: AtomicBool::new(false),
+        quit: AtomicBool::new(false),
+        counters: Arc::new(SpatialCounters::default()),
+    });
+    let worker = pump.clone();
+    let thread = match std::thread::Builder::new().name("tombox-spatial".into()).spawn(move || worker.run()) {
+        Ok(t) => t,
+        Err(_) => {
+            crate::logan::pool_release(index as usize);
+            return Some(E_OUTOFMEMORY);
+        }
+    };
+    let host = SpatialHost { pool_index: index, started: false, pump, thread: Some(thread) };
+    let mut s = state();
+    let n = s.next;
+    s.next += 1;
+    compat_common::record_raw("crossvm-audio", "CreateObject", &format!("spatial stream type {kind:#x} method {method:#x} mask {:#x} min {} max {} category {}: PC stream activated ({dynamic_now} dynamic available), DCAS {name} at pool page {index}: {frames} frames, {packet} per packet, {statics} static + {dynamic} dynamic, {total:#x} bytes, period event {event_name} -> object {n:#x}", params.mask, params.min, params.max, params.category));
+    let mut o = Object::new(kind, parent, dev);
+    o.spatial = Some(host);
+    s.objects.insert(n, o);
+    wr(a, 0xc, n);
+    Some(S_OK)
+}
+
+pub static SPATIAL_ACTIVATIONS: AtomicU32 = AtomicU32::new(0);
+
+pub struct SpatialReply {
+    pub extra: usize,
+    pub clsid: usize,
+    pub endpoint_value: usize,
+    pub token: usize,
+    pub stream_id: usize,
+    pub event: usize,
+    pub stream_value: usize,
+    pub memory: usize,
+}
+
+pub const SPATIAL_DESCRIPTOR_BYTES: usize = 0x124;
+pub const SPATIAL_REPLY: SpatialReply = SpatialReply { extra: 0x6c, clsid: 0x70, endpoint_value: 0x80, token: 0x84, stream_id: 0x8c, event: 0x94, stream_value: 0x1b8, memory: 0x1bc };
+pub const SPATIAL_REPLY2: SpatialReply = SpatialReply { extra: 0x6c, clsid: 0x74, endpoint_value: 0x84, token: 0x88, stream_id: 0x90, event: 0x98, stream_value: 0x1bc, memory: 0x1c0 };
+pub const SPATIAL_PHASE_THREE: u32 = 0x39;
+pub const SPATIAL_PRE_START: u32 = 0x44;
+pub const SPATIAL_PRE_STOP: u32 = 0x45;
+pub const SPATIAL_RESET: u32 = 0x46;
+pub const RECORD_COOKIE: usize = 0;
+pub const RECORD_FRAMES: usize = 4;
+pub const RECORD_TYPE: usize = 8;
+pub const RECORD_FLAGS: usize = 0xc;
+pub const RECORD_VOLUME: usize = 0x1c;
+pub const RECORD_BUFFER: u32 = 1;
+pub const RECORD_ACTIVE: u32 = 2;
+pub const RECORD_END_OF_STREAM: u32 = 8;
+pub const AUDIO_OBJECT_DYNAMIC: u32 = 1;
+pub const SPATIAL_HRTF_PROPERTY_BYTES: u32 = 0xb4;
+pub const RECORD_HRTF: u32 = 0x10;
+pub const HRTF_DIRTY: usize = 0x20;
+pub const HRTF_GAIN: usize = 0x24;
+pub const HRTF_ORIENTATION: usize = 0x28;
+pub const HRTF_ENVIRONMENT: usize = 0x4c;
+pub const HRTF_DECAY: usize = 0x50;
+pub const HRTF_DIRECTIVITY: usize = 0x64;
+pub const HRTF_UNKNOWN: usize = 0x74;
+pub const HRTF_DIRTY_GAIN: u32 = 1;
+pub const HRTF_DIRTY_ORIENTATION: u32 = 2;
+pub const HRTF_DIRTY_ENVIRONMENT: u32 = 4;
+pub const HRTF_DIRTY_DECAY: u32 = 8;
+pub const HRTF_DIRTY_DIRECTIVITY: u32 = 0x10;
+pub const HRTF_DIRTY_UNKNOWN: u32 = 0x20;
+const SPTLAUDCLNT_E_STREAM_NOT_STOPPED: i32 = 0x8889_010au32 as i32;
+
+#[derive(Default)]
+pub struct SpatialCounters {
+    pub passes: AtomicI64,
+    pub reads: AtomicI64,
+    pub starved: AtomicI64,
+    pub faults: AtomicI64,
+    pub buffers: AtomicI64,
+    pub silent: AtomicI64,
+    pub end_of_stream: AtomicI64,
+    pub volumes: AtomicI64,
+    pub dynamic_skipped: AtomicI64,
+    pub hrtf_properties: AtomicI64,
+    pub hrtf_unknown: AtomicI64,
+    pub errors: AtomicI64,
+    pub last_error: AtomicU32,
+}
+
+struct SpatialPump {
+    stream: wasapi::SpatialStream,
+    objects: Mutex<Vec<(u32, wasapi::SpatialObject, f32)>>,
+    control: pingpong::Control,
+    base: usize,
+    shape: dcas::Shape,
+    regions: dcas::Regions,
+    mask: u32,
+    hrtf: bool,
+    event: usize,
+    running: AtomicBool,
+    quit: AtomicBool,
+    counters: Arc<SpatialCounters>,
+}
+
+unsafe impl Send for SpatialPump {}
+unsafe impl Sync for SpatialPump {}
+
+struct SpatialHost {
+    pool_index: u16,
+    started: bool,
+    pump: Arc<SpatialPump>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for SpatialHost {
+    fn drop(&mut self) {
+        self.pump.running.store(false, Ordering::SeqCst);
+        self.pump.quit.store(true, Ordering::SeqCst);
+        wasapi::signal_event(self.pump.stream.event());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        let _ = self.pump.stream.stop();
+        self.pump.objects.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        crate::logan::pool_release(self.pool_index as usize);
+    }
+}
+
+impl SpatialPump {
+    fn object(&self, list: &mut Vec<(u32, wasapi::SpatialObject, f32)>, kind: u32) -> Option<usize> {
+        if let Some(i) = list.iter().position(|o| o.0 == kind) {
+            return Some(i);
+        }
+        if kind == AUDIO_OBJECT_DYNAMIC || kind & self.mask != kind || kind.count_ones() != 1 {
+            self.counters.dynamic_skipped.fetch_add(1, Ordering::SeqCst);
+            return None;
+        }
+        match self.stream.activate_object(kind) {
+            Ok(o) => {
+                list.push((kind, o, 1.0));
+                Some(list.len() - 1)
+            }
+            Err(hr) => {
+                self.fail(hr);
+                None
+            }
+        }
+    }
+
+    fn fail(&self, hr: i32) {
+        self.counters.errors.fetch_add(1, Ordering::SeqCst);
+        self.counters.last_error.store(hr as u32, Ordering::SeqCst);
+    }
+
+    unsafe fn pass(&self) {
+        let (_, frames) = match self.stream.begin_updating() {
+            Ok(v) => v,
+            Err(hr) => {
+                self.fail(hr);
+                return;
+            }
+        };
+        self.counters.passes.fetch_add(1, Ordering::SeqCst);
+        self.control.set_frames_per_packet(frames);
+        match self.control.read_acquire() {
+            Ok(index) => {
+                self.counters.reads.fetch_add(1, Ordering::SeqCst);
+                self.read(index, frames);
+                if self.control.read_commit(index) < 0 {
+                    self.counters.faults.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            Err(pingpong::E_READ_STARVED) => {
+                self.counters.starved.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(_) => {
+                self.counters.faults.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let hr = self.stream.end_updating();
+        if hr < 0 {
+            self.fail(hr);
+        }
+        wasapi::signal_event(self.event);
+    }
+
+    unsafe fn read(&self, index: u32, frames: u32) {
+        let data = self.base + dcas::DATA;
+        let props = self.shape.properties as usize;
+        let frame_bytes = self.shape.frame_bytes as usize;
+        let mut list = self.objects.lock().unwrap_or_else(|e| e.into_inner());
+        for k in 0..self.shape.objects as usize {
+            let r = (data + self.regions.properties[index as usize] + k * props) as *const u8;
+            let kind: u32 = rd(r, RECORD_TYPE);
+            let flags: u32 = rd(r, RECORD_FLAGS);
+            if kind == 0 || flags & (RECORD_BUFFER | RECORD_ACTIVE | RECORD_END_OF_STREAM | RECORD_HRTF) == 0 {
+                continue;
+            }
+            let Some(i) = self.object(&mut list, kind) else { continue };
+            let count: u32 = rd(r, RECORD_FRAMES);
+            let volume: f32 = rd(r, RECORD_VOLUME);
+            if self.hrtf && flags & RECORD_HRTF != 0 {
+                self.hrtf_properties(&list[i].1, r);
+            }
+            if !self.hrtf && volume != list[i].2 {
+                let hr = list[i].1.set_volume(volume);
+                if hr < 0 {
+                    self.fail(hr);
+                } else {
+                    list[i].2 = volume;
+                    self.counters.volumes.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            if flags & RECORD_BUFFER != 0 {
+                match list[i].1.buffer() {
+                    Ok((dst, len)) => {
+                        let n = (len as usize).min(count.min(frames) as usize * 4).min(frame_bytes);
+                        if wasapi::muted() {
+                            core::ptr::write_bytes(dst, 0, len as usize);
+                            self.counters.silent.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            let src = (data + self.regions.samples[index as usize] + k * frame_bytes) as *const u8;
+                            core::ptr::copy_nonoverlapping(src, dst, n);
+                            core::ptr::write_bytes(dst.add(n), 0, len as usize - n);
+                        }
+                        self.counters.buffers.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(hr) => self.fail(hr),
+                }
+            }
+            if flags & RECORD_END_OF_STREAM != 0 {
+                let hr = list[i].1.set_end_of_stream(if flags & RECORD_BUFFER != 0 { count.min(frames) } else { 0 });
+                if hr < 0 {
+                    self.fail(hr);
+                }
+                self.counters.end_of_stream.fetch_add(1, Ordering::SeqCst);
+                list.remove(i);
+            }
+        }
+    }
+
+    unsafe fn hrtf_properties(&self, o: &wasapi::SpatialObject, r: *const u8) {
+        let dirty: u32 = rd(r, HRTF_DIRTY);
+        let mut hrs = Vec::new();
+        if dirty & HRTF_DIRTY_GAIN != 0 {
+            hrs.push(o.set_hrtf_gain(rd(r, HRTF_GAIN)));
+        }
+        if dirty & HRTF_DIRTY_ORIENTATION != 0 {
+            hrs.push(o.set_hrtf_block(wasapi::HRTF_SET_ORIENTATION, r.add(HRTF_ORIENTATION)));
+        }
+        if dirty & HRTF_DIRTY_ENVIRONMENT != 0 {
+            hrs.push(o.set_hrtf_environment(rd(r, HRTF_ENVIRONMENT)));
+        }
+        if dirty & HRTF_DIRTY_DECAY != 0 {
+            hrs.push(o.set_hrtf_block(wasapi::HRTF_SET_DISTANCE_DECAY, r.add(HRTF_DECAY)));
+        }
+        if dirty & HRTF_DIRTY_DIRECTIVITY != 0 {
+            hrs.push(o.set_hrtf_block(wasapi::HRTF_SET_DIRECTIVITY, r.add(HRTF_DIRECTIVITY)));
+        }
+        if dirty & HRTF_DIRTY_UNKNOWN != 0 {
+            self.counters.hrtf_unknown.fetch_add(1, Ordering::SeqCst);
+        }
+        for hr in hrs {
+            if hr < 0 {
+                self.fail(hr);
+            } else {
+                self.counters.hrtf_properties.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn run(self: Arc<Self>) {
+        unsafe { wasapi::com_init() };
+        while !self.quit.load(Ordering::SeqCst) {
+            if !self.running.load(Ordering::SeqCst) {
+                wasapi::wait_event(self.stream.event(), 20);
+                continue;
+            }
+            if wasapi::wait_event(self.stream.event(), 50) && self.running.load(Ordering::SeqCst) && !self.quit.load(Ordering::SeqCst) {
+                unsafe { self.pass() };
+            }
+        }
+    }
+
+    fn prepare(&self) -> i32 {
+        let mut list = self.objects.lock().unwrap_or_else(|e| e.into_inner());
+        let mut bit = 2u32;
+        while bit != 0 {
+            if self.mask & bit != 0 && !list.iter().any(|o| o.0 == bit) {
+                match self.stream.activate_object(bit) {
+                    Ok(o) => list.push((bit, o, 1.0)),
+                    Err(hr) => return hr,
+                }
+            }
+            bit = bit.wrapping_shl(1);
+        }
+        S_OK
+    }
+}
+
+pub fn spatial_counters(object: u32) -> Option<Arc<SpatialCounters>> {
+    state().objects.get(&object)?.spatial.as_ref().map(|h| h.pump.counters.clone())
+}
+
+pub fn spatial_control(object: u32) -> Option<(usize, u16, dcas::Shape, dcas::Regions)> {
+    let s = state();
+    let h = s.objects.get(&object)?.spatial.as_ref()?;
+    Some((h.pump.base, h.pool_index, h.pump.shape, h.pump.regions))
+}
+
+pub fn spatial_static_objects(object: u32) -> Option<Vec<u32>> {
+    let s = state();
+    let h = s.objects.get(&object)?.spatial.as_ref()?;
+    let list = h.pump.objects.lock().unwrap_or_else(|e| e.into_inner());
+    Some(list.iter().map(|o| o.0).collect())
+}
+
+unsafe fn spatial_call(id: u32, object: u32, a: *mut u8) -> Option<i32> {
+    let mut s = state();
+    let h = s.objects.get_mut(&object)?.spatial.as_mut()?;
+    let pump = h.pump.clone();
+    Some(match id {
+        SPATIAL_PHASE_THREE => {
+            drop(s);
+            pump.prepare()
+        }
+        SPATIAL_PRE_START => {
+            wr(a, 0, 0u8);
+            if h.started {
+                return Some(SPTLAUDCLNT_E_STREAM_NOT_STOPPED);
+            }
+            h.started = true;
+            if !pump.running.load(Ordering::SeqCst) {
+                wr(a, 0, 1u8);
+            }
+            S_OK
+        }
+        START => {
+            drop(s);
+            let hr = pump.stream.start();
+            if hr < 0 {
+                return Some(hr);
+            }
+            pump.running.store(true, Ordering::SeqCst);
+            wasapi::signal_event(pump.event);
+            S_OK
+        }
+        SPATIAL_PRE_STOP => {
+            if !h.started {
+                return Some(S_FALSE);
+            }
+            h.started = false;
+            S_OK
+        }
+        STOP => {
+            drop(s);
+            let hr = pump.stream.stop();
+            if hr < 0 {
+                return Some(hr);
+            }
+            if hr != S_FALSE {
+                pump.running.store(false, Ordering::SeqCst);
+            }
+            hr
+        }
+        SPATIAL_RESET => {
+            if h.started {
+                SPTLAUDCLNT_E_STREAM_NOT_STOPPED
+            } else {
+                S_OK
+            }
+        }
+        _ => return None,
+    })
+}
+
+
+pub mod dcas {
+    pub const HEADER: u32 = 0x326;
+    pub const MAGIC: u32 = 0x5341_4344;
+    pub const DATA: usize = 0x340;
+    pub const DATA_HEADER: u32 = 0x1c;
+    pub const DATA_MAGIC: u32 = 0x5341_4244;
+    pub const NAME: usize = 0x184;
+    pub const NAME_CHARS: usize = 0x40;
+    pub const FRAMES: usize = 0x204;
+    pub const STATIC_OBJECTS: usize = 0x208;
+    pub const DYNAMIC_OBJECTS: usize = 0x20c;
+    pub const TOTAL: usize = 0x210;
+    pub const FORMAT: usize = 0x214;
+    pub const FORMAT_EXTRA_MAX: usize = 0x100;
+    pub const STATE: usize = 0x30;
+    pub const STATE_INITIAL: u32 = 6;
+    pub const E_INVALID_CONTROL: i32 = 0x887c_0045u32 as i32;
+    pub const E_MISALIGNED: i32 = 0x887c_0054u32 as i32;
+    pub const E_OVERFLOW: i32 = 0x8007_0216u32 as i32;
+    const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Shape {
+        pub objects: u32,
+        pub properties: u32,
+        pub metadata: u32,
+        pub frame_bytes: u32,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Regions {
+        pub properties: [usize; 2],
+        pub metadata: [usize; 2],
+        pub samples: [usize; 2],
+    }
+
+    pub fn align32(v: u32) -> Result<u32, i32> {
+        if v & 0x1f == 0 {
+            return Ok(v);
+        }
+        let r = (v - (v & 0x1f)).wrapping_add(0x20);
+        if r < v { Err(E_OVERFLOW) } else { Ok(r) }
+    }
+
+    pub fn data_size(sample_bytes: u32, properties: u32, metadata: u32, objects: u32) -> Result<u32, i32> {
+        let frame = align32(sample_bytes)? as u64;
+        let n = objects as u64;
+        let p = properties as u64 * n * 2;
+        let m = metadata as u64 * n * 2;
+        let s = frame * n * 2;
+        if p > u32::MAX as u64 || m > u32::MAX as u64 || s > u32::MAX as u64 {
+            return Err(E_OVERFLOW);
+        }
+        let head = align32(u32::try_from(DATA_HEADER as u64 + p + m).map_err(|_| E_OVERFLOW)?)? as u64;
+        u32::try_from(head + s).map_err(|_| E_OVERFLOW)
+    }
+
+    pub fn regions(shape: &Shape) -> Result<Regions, i32> {
+        let n = shape.objects as usize;
+        let p0 = DATA_HEADER as usize;
+        let p1 = p0 + shape.properties as usize * n;
+        let m0 = p1 + shape.properties as usize * n;
+        let m1 = m0 + shape.metadata as usize * n;
+        let end = m1 + shape.metadata as usize * n;
+        let s0 = align32(u32::try_from(end).map_err(|_| E_OVERFLOW)?)? as usize;
+        let s1 = s0 + shape.frame_bytes as usize * n;
+        Ok(Regions { properties: [p0, p1], metadata: [m0, m1], samples: [s0, s1] })
+    }
+
+    pub fn total(frames: u32, static_objects: u32, dynamic_objects: u32, properties: u32, metadata: u32) -> Result<u32, i32> {
+        let objects = static_objects.checked_add(dynamic_objects).ok_or(E_OVERFLOW)?;
+        let bytes = frames.checked_mul(4).ok_or(E_OVERFLOW)?;
+        data_size(bytes, properties, metadata, objects)?.checked_add(DATA as u32).ok_or(E_OVERFLOW)
+    }
+
+    fn put(b: &mut [u8], o: usize, v: u32) {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn get(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn write(b: &mut [u8], name: &str, frames: u32, packet: u32, static_objects: u32, dynamic_objects: u32, properties: u32, metadata: u32, format: &[u8]) -> Result<Shape, i32> {
+        let total = total(frames, static_objects, dynamic_objects, properties, metadata)?;
+        if format.len() < 0x12 {
+            return Err(E_INVALIDARG);
+        }
+        let extra = u16::from_le_bytes([format[0x10], format[0x11]]) as usize;
+        if extra > FORMAT_EXTRA_MAX || format.len() < 0x12 + extra {
+            return Err(E_INVALIDARG);
+        }
+        if b.len() < total as usize {
+            return Err(0x8007_000Eu32 as i32);
+        }
+        if (b.as_ptr() as usize + DATA) & 0x1f != 0 {
+            return Err(E_MISALIGNED);
+        }
+        b[..DATA].fill(0);
+        put(b, 0, HEADER);
+        put(b, 4, MAGIC);
+        put(b, STATE, STATE_INITIAL);
+        put(b, super::pingpong::FRAMES_PER_PACKET, packet);
+        put(b, super::pingpong::FLAGS, super::pingpong::FLAG_VALID);
+        let w: Vec<u16> = name.encode_utf16().take(NAME_CHARS - 1).collect();
+        for (i, c) in w.iter().enumerate() {
+            b[NAME + i * 2..NAME + i * 2 + 2].copy_from_slice(&c.to_le_bytes());
+        }
+        put(b, FRAMES, frames);
+        put(b, STATIC_OBJECTS, static_objects);
+        put(b, DYNAMIC_OBJECTS, dynamic_objects);
+        put(b, TOTAL, total);
+        b[FORMAT..FORMAT + 0x12 + extra].copy_from_slice(&format[..0x12 + extra]);
+        let objects = static_objects + dynamic_objects;
+        let shape = Shape { objects, properties, metadata, frame_bytes: align32(frames * 4)? };
+        let d = &mut b[DATA..total as usize];
+        d.fill(0);
+        put(d, 0, DATA_HEADER);
+        put(d, 4, total - DATA as u32);
+        put(d, 8, objects);
+        put(d, 0xc, properties);
+        put(d, 0x10, metadata);
+        put(d, 0x14, shape.frame_bytes);
+        put(d, 0x18, DATA_MAGIC);
+        Ok(shape)
+    }
+
+    pub fn validate(b: &[u8]) -> i32 {
+        if b.len() < DATA {
+            return E_INVALID_CONTROL;
+        }
+        if get(b, 0) != HEADER || get(b, 4) != MAGIC || get(b, STATIC_OBJECTS).wrapping_add(get(b, DYNAMIC_OBJECTS)) == 0 || (get(b, TOTAL) as usize) < DATA {
+            return E_INVALID_CONTROL;
+        }
+        0
+    }
+
+    pub fn parse(b: &[u8]) -> Result<(Shape, Regions), i32> {
+        let hr = validate(b);
+        if hr < 0 {
+            return Err(hr);
+        }
+        let total = get(b, TOTAL) as usize;
+        if b.len() < total {
+            return Err(E_INVALID_CONTROL);
+        }
+        let d = &b[DATA..total];
+        let size = d.len() as u32;
+        if size <= DATA_HEADER {
+            return Err(E_INVALID_CONTROL);
+        }
+        let shape = Shape { objects: get(d, 8), properties: get(d, 0xc), metadata: get(d, 0x10), frame_bytes: get(d, 0x14) };
+        if data_size(shape.frame_bytes, shape.properties, shape.metadata, shape.objects)? != size {
+            return Err(E_INVALID_CONTROL);
+        }
+        Ok((shape, regions(&shape)?))
+    }
+}
+
+pub mod pingpong {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    pub const STATES: usize = 17;
+    pub const FAULTED: u32 = 16;
+    pub const WRITE_ACQUIRE: [u32; STATES] = [1, 16, 2, 4, 16, 5, 7, 16, 9, 16, 10, 12, 16, 13, 15, 16, 16];
+    pub const WRITE_COMMIT: [u32; STATES] = [16, 2, 16, 16, 5, 16, 16, 8, 16, 10, 16, 16, 13, 16, 16, 0, 16];
+    pub const WRITE_CANCEL: [u32; STATES] = [0, 0, 2, 3, 3, 5, 6, 6, 8, 8, 10, 11, 11, 13, 14, 14, 16];
+    pub const READ_ACQUIRE: [u32; STATES] = [3, 4, 5, 16, 16, 16, 6, 7, 11, 12, 13, 16, 16, 16, 14, 15, 16];
+    pub const READ_COMMIT: [u32; STATES] = [16, 16, 16, 6, 7, 8, 16, 16, 16, 16, 16, 14, 15, 0, 16, 16, 16];
+    pub const FLUSH: [u32; STATES] = [6, 7, 6, 3, 4, 3, 6, 7, 14, 15, 14, 11, 12, 11, 14, 15, 6];
+    pub const READER_INDEX: [u32; STATES] = [1, 1, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0, 2, 2, 3];
+    pub const WRITER_INDEX: [u32; STATES] = [0, 0, 2, 0, 0, 2, 0, 0, 1, 1, 2, 1, 1, 2, 1, 1, 3];
+    pub const INDEX_STARVED: u32 = 2;
+    pub const INDEX_FAULT: u32 = 3;
+
+    pub const POSITION: usize = 0x08;
+    pub const GRANT_POSITION: usize = 0x10;
+    pub const DYNAMIC_REQUESTED: usize = 0x18;
+    pub const DYNAMIC_GRANTED: usize = 0x1c;
+    pub const BUFFER_OBJECTS: usize = 0x20;
+    pub const FRAMES_COMMITTED: usize = 0x28;
+    pub const STATE: usize = 0x30;
+    pub const FRAMES_PER_PACKET: usize = 0x34;
+    pub const BUFFER_FRAMES: usize = 0x38;
+    pub const DYNAMIC_IN_USE: usize = 0x40;
+    pub const FLAGS: usize = 0x48;
+    pub const READ_STARVED: usize = 0x4c;
+    pub const WRITE_STARVED: usize = 0x50;
+
+    pub const FLAG_VALID: u32 = 1;
+    pub const FLAG_STARTED: u32 = 2;
+    pub const FLAG_POSITION: u32 = 4;
+    pub const FLAG_POSITION_LATCHED: u32 = 8;
+    pub const FLAG_DISCONTINUITY: u32 = 0x10;
+    pub const FLAG_EVENT_SET: u32 = 0x20;
+    pub const FLAG_GRANT_PENDING: u32 = 0x40;
+    pub const FLAG_CLOSED: u32 = 0x80;
+
+    pub const E_INVALID_CONTROL: i32 = 0x887c_0045u32 as i32;
+    pub const E_WRITE_STARVED: i32 = 0x887c_0061u32 as i32;
+    pub const E_READ_STARVED: i32 = 0x887c_0062u32 as i32;
+    pub const E_BAD_WRITE_INDEX: i32 = 0x887c_006fu32 as i32;
+    pub const E_NOT_STARTED: i32 = 0x887c_0013u32 as i32;
+    const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Control {
+        base: usize,
+    }
+
+    impl Control {
+        pub unsafe fn at(base: *mut u8) -> Self {
+            Control { base: base as usize }
+        }
+
+        fn u32(&self, o: usize) -> &AtomicU32 {
+            unsafe { &*((self.base + o) as *const AtomicU32) }
+        }
+
+        fn u64(&self, o: usize) -> &AtomicU64 {
+            unsafe { &*((self.base + o) as *const AtomicU64) }
+        }
+
+        pub fn state(&self) -> u32 {
+            let s = self.u32(STATE).load(Ordering::SeqCst);
+            if s > FAULTED {
+                self.u32(STATE).swap(FAULTED, Ordering::SeqCst);
+                return FAULTED;
+            }
+            s
+        }
+
+        fn step(&self, table: &[u32; STATES]) -> u32 {
+            let mut s = self.state();
+            loop {
+                let next = table[s as usize];
+                match self.u32(STATE).compare_exchange(s, next, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => return next,
+                    Err(cur) if cur > FAULTED => return FAULTED,
+                    Err(cur) => s = cur,
+                }
+            }
+        }
+
+        pub fn flush(&self) {
+            self.u32(FLAGS).fetch_or(FLAG_DISCONTINUITY, Ordering::SeqCst);
+            self.u64(FRAMES_COMMITTED).store(0, Ordering::SeqCst);
+            self.step(&FLUSH);
+        }
+
+        pub fn write_acquire(&self) -> Result<u32, i32> {
+            let next = self.step(&WRITE_ACQUIRE);
+            match WRITER_INDEX[next as usize] {
+                INDEX_FAULT => {
+                    self.step(&FLUSH);
+                    Err(E_INVALID_CONTROL)
+                }
+                INDEX_STARVED => {
+                    self.u32(WRITE_STARVED).fetch_add(1, Ordering::SeqCst);
+                    Err(E_WRITE_STARVED)
+                }
+                i => {
+                    let packet = self.u32(FRAMES_PER_PACKET).load(Ordering::SeqCst);
+                    self.u32(BUFFER_FRAMES + i as usize * 4).store(packet, Ordering::SeqCst);
+                    Ok(i)
+                }
+            }
+        }
+
+        pub fn write_commit(&self, index: u32, objects: u32, packet_frames: u32) -> i32 {
+            if index > 1 {
+                return E_BAD_WRITE_INDEX;
+            }
+            self.u32(BUFFER_OBJECTS + index as usize * 4).swap(objects, Ordering::SeqCst);
+            let next = self.step(&WRITE_COMMIT);
+            if WRITER_INDEX[next as usize] == INDEX_FAULT {
+                return E_INVALID_CONTROL;
+            }
+            self.u64(FRAMES_COMMITTED).fetch_add(if objects != 0 { packet_frames as u64 } else { 0 }, Ordering::SeqCst);
+            0
+        }
+
+        pub fn write_cancel(&self) {
+            self.step(&WRITE_CANCEL);
+        }
+
+        pub fn read_acquire(&self) -> Result<u32, i32> {
+            let next = self.step(&READ_ACQUIRE);
+            match READER_INDEX[next as usize] {
+                INDEX_FAULT => {
+                    self.step(&FLUSH);
+                    Err(E_INVALID_CONTROL)
+                }
+                INDEX_STARVED => {
+                    self.u32(READ_STARVED).fetch_add(1, Ordering::SeqCst);
+                    Err(E_READ_STARVED)
+                }
+                i => Ok(i),
+            }
+        }
+
+        pub fn read_commit(&self, index: u32) -> i32 {
+            if index > 1 {
+                return E_INVALIDARG;
+            }
+            let next = self.step(&READ_COMMIT);
+            if READER_INDEX[next as usize] == INDEX_FAULT {
+                return E_INVALID_CONTROL;
+            }
+            0
+        }
+
+        pub fn frames_per_packet(&self, max: u32) -> u32 {
+            let v = self.u32(FRAMES_PER_PACKET).load(Ordering::SeqCst);
+            let m = v.min(max);
+            if m == 0 { max } else { m }
+        }
+
+        pub fn set_frames_per_packet(&self, frames: u32) {
+            self.u32(FRAMES_PER_PACKET).store(frames, Ordering::SeqCst);
+        }
+
+        pub fn buffer_objects(&self, index: u32) -> u32 {
+            self.u32(BUFFER_OBJECTS + index as usize * 4).load(Ordering::SeqCst)
+        }
+
+        pub fn buffer_frames(&self, index: u32) -> u32 {
+            self.u32(BUFFER_FRAMES + index as usize * 4).load(Ordering::SeqCst)
+        }
+
+        pub fn frames_committed(&self) -> u64 {
+            self.u64(FRAMES_COMMITTED).load(Ordering::SeqCst)
+        }
+
+        pub fn flags(&self) -> u32 {
+            self.u32(FLAGS).load(Ordering::SeqCst)
+        }
+
+        pub fn set_flags(&self, set: u32, clear: u32) {
+            self.u32(FLAGS).fetch_and(!clear, Ordering::SeqCst);
+            self.u32(FLAGS).fetch_or(set, Ordering::SeqCst);
+        }
+
+        pub fn counters(&self) -> (u32, u32) {
+            (self.u32(READ_STARVED).load(Ordering::SeqCst), self.u32(WRITE_STARVED).load(Ordering::SeqCst))
+        }
+
+        pub fn take_counters(&self) -> (u32, u32) {
+            (self.u32(READ_STARVED).swap(0, Ordering::SeqCst), self.u32(WRITE_STARVED).swap(0, Ordering::SeqCst))
+        }
+
+        pub fn transport(&self, start: bool) -> i32 {
+            if self.flags() & (FLAG_VALID | FLAG_CLOSED) != FLAG_VALID {
+                return E_INVALID_CONTROL;
+            }
+            if start {
+                self.set_flags(FLAG_STARTED, 0);
+            } else {
+                self.set_flags(0, FLAG_STARTED | FLAG_POSITION_LATCHED);
+            }
+            0
+        }
+
+        pub fn reset(&self) -> i32 {
+            if self.flags() & (FLAG_VALID | FLAG_CLOSED) != FLAG_VALID {
+                return E_INVALID_CONTROL;
+            }
+            self.flush();
+            0
+        }
+    }
 }
 
 unsafe fn is_format_supported(object: u32, a: *mut u8) -> i32 {

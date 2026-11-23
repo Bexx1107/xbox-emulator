@@ -23,8 +23,10 @@ pub const PSO_LIB_MISS: usize = 15;
 pub const PREWARM_HIT: usize = 16;
 pub const PREWARM_LATE: usize = 17;
 pub const PREWARM_UNUSED: usize = 18;
-pub const N: usize = 19;
-pub const NAMES: [&str; N] = ["pso_sync", "pso_inline", "pso_async", "pso_bind_wait", "xlat", "dxc", "committed", "placed", "heap", "upload", "io_read", "io_read_bg", "lock_wait", "frame_wait", "pso_lib_hit", "pso_lib_miss", "prewarm_hit", "prewarm_late", "prewarm_unused"];
+pub const TITLE_WAIT: usize = 19;
+pub const TITLE_SLEEP: usize = 20;
+pub const N: usize = 21;
+pub const NAMES: [&str; N] = ["pso_sync", "pso_inline", "pso_async", "pso_bind_wait", "xlat", "dxc", "committed", "placed", "heap", "upload", "io_read", "io_read_bg", "lock_wait", "frame_wait", "pso_lib_hit", "pso_lib_miss", "prewarm_hit", "prewarm_late", "prewarm_unused", "title_wait", "title_sleep"];
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static CNT: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
@@ -40,6 +42,13 @@ static ORIG_GTC: AtomicUsize = AtomicUsize::new(0);
 static ORIG_GTC64: AtomicUsize = AtomicUsize::new(0);
 static ORIG_RF: AtomicUsize = AtomicUsize::new(0);
 static ORIG_RFX: AtomicUsize = AtomicUsize::new(0);
+static ORIG_WSO: AtomicUsize = AtomicUsize::new(0);
+static ORIG_WSOX: AtomicUsize = AtomicUsize::new(0);
+static ORIG_WMO: AtomicUsize = AtomicUsize::new(0);
+static ORIG_WMOX: AtomicUsize = AtomicUsize::new(0);
+static ORIG_SLEEP: AtomicUsize = AtomicUsize::new(0);
+static ORIG_SLEEPX: AtomicUsize = AtomicUsize::new(0);
+static ORIG_STT: AtomicUsize = AtomicUsize::new(0);
 static HOOKED: std::sync::Once = std::sync::Once::new();
 
 thread_local! {
@@ -292,6 +301,56 @@ unsafe extern "system" fn gtc64_hook() -> u64 {
     unsafe { f() }
 }
 
+fn on_present_thread() -> bool {
+    let t = PRESENT_TID.load(Relaxed);
+    t != 0 && unsafe { GetCurrentThreadId() } == t
+}
+
+fn timed<R>(k: usize, f: impl FnOnce() -> R) -> R {
+    if !active() || !on_present_thread() {
+        return f();
+    }
+    let t0 = qpc();
+    let r = f();
+    add(k, qpc() - t0, false);
+    r
+}
+
+unsafe extern "system" fn wso_hook(h: *mut c_void, ms: u32) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void, u32) -> u32 = unsafe { core::mem::transmute(ORIG_WSO.load(Relaxed)) };
+    timed(TITLE_WAIT, || unsafe { f(h, ms) })
+}
+
+unsafe extern "system" fn wsox_hook(h: *mut c_void, ms: u32, alert: i32) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void, u32, i32) -> u32 = unsafe { core::mem::transmute(ORIG_WSOX.load(Relaxed)) };
+    timed(TITLE_WAIT, || unsafe { f(h, ms, alert) })
+}
+
+unsafe extern "system" fn wmo_hook(n: u32, hs: *const *mut c_void, all: i32, ms: u32) -> u32 {
+    let f: unsafe extern "system" fn(u32, *const *mut c_void, i32, u32) -> u32 = unsafe { core::mem::transmute(ORIG_WMO.load(Relaxed)) };
+    timed(TITLE_WAIT, || unsafe { f(n, hs, all, ms) })
+}
+
+unsafe extern "system" fn wmox_hook(n: u32, hs: *const *mut c_void, all: i32, ms: u32, alert: i32) -> u32 {
+    let f: unsafe extern "system" fn(u32, *const *mut c_void, i32, u32, i32) -> u32 = unsafe { core::mem::transmute(ORIG_WMOX.load(Relaxed)) };
+    timed(TITLE_WAIT, || unsafe { f(n, hs, all, ms, alert) })
+}
+
+unsafe extern "system" fn sleep_hook(ms: u32) {
+    let f: unsafe extern "system" fn(u32) = unsafe { core::mem::transmute(ORIG_SLEEP.load(Relaxed)) };
+    timed(TITLE_SLEEP, || unsafe { f(ms) })
+}
+
+unsafe extern "system" fn sleepx_hook(ms: u32, alert: i32) -> u32 {
+    let f: unsafe extern "system" fn(u32, i32) -> u32 = unsafe { core::mem::transmute(ORIG_SLEEPX.load(Relaxed)) };
+    timed(TITLE_SLEEP, || unsafe { f(ms, alert) })
+}
+
+unsafe extern "system" fn stt_hook() -> i32 {
+    let f: unsafe extern "system" fn() -> i32 = unsafe { core::mem::transmute(ORIG_STT.load(Relaxed)) };
+    timed(TITLE_SLEEP, || unsafe { f() })
+}
+
 fn io_kind() -> usize {
     if unsafe { GetCurrentThreadId() } == PRESENT_TID.load(Relaxed) { IO } else { IO_BG }
 }
@@ -321,15 +380,22 @@ unsafe extern "system" fn read_file_ex_hook(h: *mut c_void, buf: *mut c_void, n:
 fn install_title_hooks() {
     HOOKED.call_once(|| {
         tombox_xshader::shader_cache::COMPILE_HOOK.store(on_dxc as fn(u64) as usize, Relaxed);
-        let targets: [(&str, usize, &AtomicUsize); 5] = [
+        let targets: [(&str, usize, &AtomicUsize); 12] = [
             ("QueryPerformanceCounter", qpc_hook as usize, &ORIG_QPC),
             ("GetTickCount", gtc_hook as usize, &ORIG_GTC),
             ("GetTickCount64", gtc64_hook as usize, &ORIG_GTC64),
             ("ReadFile", read_file_hook as usize, &ORIG_RF),
             ("ReadFileEx", read_file_ex_hook as usize, &ORIG_RFX),
+            ("WaitForSingleObject", wso_hook as usize, &ORIG_WSO),
+            ("WaitForSingleObjectEx", wsox_hook as usize, &ORIG_WSOX),
+            ("WaitForMultipleObjects", wmo_hook as usize, &ORIG_WMO),
+            ("WaitForMultipleObjectsEx", wmox_hook as usize, &ORIG_WMOX),
+            ("Sleep", sleep_hook as usize, &ORIG_SLEEP),
+            ("SleepEx", sleepx_hook as usize, &ORIG_SLEEPX),
+            ("SwitchToThread", stt_hook as usize, &ORIG_STT),
         ];
         let n = unsafe { compat_common::gdk::hook::patch_module(GetModuleHandleW(core::ptr::null()), &targets) };
-        compat_common::record("d3d12_xs", "[frame_csv]", &format!("frame event counters on; title clock/file probes patched {n} import slots in the title exe (QueryPerformanceCounter, GetTickCount[64], ReadFile[Ex])"));
+        compat_common::record("d3d12_xs", "[frame_csv]", &format!("frame event counters on; title clock/file/wait probes patched {n} import slots in the title exe (QueryPerformanceCounter, GetTickCount[64], ReadFile[Ex], WaitForSingle/MultipleObjects[Ex] -> title_wait, Sleep[Ex]/SwitchToThread -> title_sleep; waits count only on the title's present thread)"));
     });
 }
 
@@ -340,6 +406,30 @@ mod tests {
     fn local(on: bool) -> Snap {
         T_ON.with(|c| c.set(on));
         T_ACC.with(|a| core::mem::take(&mut *a.borrow_mut()))
+    }
+
+    #[test]
+    fn title_wait_and_sleep_columns_follow_the_present_thread_only() {
+        let h = header();
+        assert!(h.contains(",title_wait_n,title_wait_ms,title_sleep_n,title_sleep_ms,bg_pso_n"));
+        let _ = local(true);
+        PRESENT_TID.store(0, Relaxed);
+        assert_eq!(timed(TITLE_WAIT, || 7), 7);
+        assert_eq!(local(true).n[TITLE_WAIT], 0);
+        note_present_thread();
+        timed(TITLE_WAIT, || ());
+        timed(TITLE_SLEEP, || ());
+        timed(TITLE_SLEEP, || ());
+        let s = local(false);
+        assert_eq!((s.n[TITLE_WAIT], s.n[TITLE_SLEEP]), (1, 2));
+        assert_eq!(s.bg_n[TITLE_WAIT] + s.bg_n[TITLE_SLEEP], 0);
+        let other = std::thread::spawn(|| {
+            T_ON.with(|c| c.set(true));
+            timed(TITLE_WAIT, || ());
+            T_ACC.with(|a| a.borrow().n[TITLE_WAIT])
+        }).join().unwrap();
+        assert_eq!(other, 0);
+        PRESENT_TID.store(0, Relaxed);
     }
 
     #[test]

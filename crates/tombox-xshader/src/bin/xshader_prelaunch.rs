@@ -160,7 +160,7 @@ fn resolve_mode_from(marker: Option<&str>, runtime_dll: Option<(&Path, Option<Ve
     let cbv_raw = match (cbraw_env, &parsed) {
         (Some(v), _) => CbvRaw::decide(Some(v), xbox_one),
         (None, Some((_, m))) => m.cbv_raw,
-        (None, None) => CbvRaw::Off,
+        (None, None) => CbvRaw::Copy,
     };
     let mode = Mode { cbv_raw, loop_grad, fma };
     match &parsed {
@@ -726,9 +726,23 @@ mod ui {
     }
 }
 
+fn scan_game(title: &str, game: &Path) -> String {
+    let out = shader_cache::game_scan_dir(title);
+    let t0 = Instant::now();
+    match tombox_xshader::game_scan::sync_dir(game, &out) {
+        Ok(r) if r.skipped => format!("game scan: {} unchanged since the last scan, {} kept ({:.1}s)", game.display(), out.display(), t0.elapsed().as_secs_f64()),
+        Ok(r) => {
+            let (files, mb, zips, gbx, ue, errs) = r.scan.as_ref().map(|s| (s.files, s.bytes >> 20, s.zip_entries, s.gbx, s.ue_entries, s.errors)).unwrap_or_default();
+            format!("game scan: {} shader containers in {} ({files} files, {mb} MB, {zips} zip entries, {gbx} GBX bodies, {ue} UE archive entries, {errs} unreadable); {} new in {} ({:.1}s); the runtime prewarm compiles them after the known variants", r.found, game.display(), r.written, out.display(), t0.elapsed().as_secs_f64())
+        }
+        Err(e) => format!("game scan of {} failed: {e}; shaders not seen before convert at runtime", game.display()),
+    }
+}
+
 fn usage() {
     eprintln!("usage: xshader_prelaunch --title <exe stem> [--name <display name>] [--dir <dump dir>]...");
     eprintln!("                         [--no-ui] [--yes] [--jobs n] [--retry-failed] [--summary <file>] [--skip-after <ms>] [--check] [--runtime-dll <d3d12_xs.dll>]");
+    eprintln!("                         [--game-dir <title install dir>]  (extracts the title's own shader containers into <pack root>/titles/<title>/game_scan for the runtime prewarm; read-only on the game files)");
     eprintln!("translates and DXC-compiles every known shader of the title that is not in the pack yet, then exits;");
     eprintln!("exit 0 done (failures are reported and left to runtime), 3 skipped, 2 setup problem, 4 stale translator (launch anyway).");
     eprintln!("pack root: {}", shader_cache::root().display());
@@ -745,6 +759,7 @@ fn main() {
     let mut retry_failed = false;
     let mut check = false;
     let mut runtime_dll: Option<PathBuf> = None;
+    let mut game_dir: Option<PathBuf> = None;
     let mut jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).max(1);
     let mut i = 0;
     let val = |i: usize| args.get(i + 1).cloned().unwrap_or_default();
@@ -757,6 +772,7 @@ fn main() {
             "--jobs" => jobs = val(i).parse().unwrap_or(jobs).max(1),
             "--summary" => summary_file = Some(PathBuf::from(val(i))),
             "--runtime-dll" => runtime_dll = Some(PathBuf::from(val(i))),
+            "--game-dir" => game_dir = Some(PathBuf::from(val(i))),
             "--skip-after" => skip_after = val(i).parse().ok().map(Duration::from_millis),
             "--no-ui" => {
                 no_ui = true;
@@ -792,6 +808,10 @@ fn main() {
         name = title.clone();
     }
     let started = Instant::now();
+    let scan_note = game_dir.as_deref().map(|g| scan_game(&title, g));
+    if let Some(n) = &scan_note {
+        eprintln!("[shader prelaunch] {n}");
+    }
     if !dxc::available() {
         println!("[shader prelaunch] {title}: dxcompiler.dll + dxil.dll not found (TOMBOX_DXC_DIR); nothing converted, every shader is left to runtime");
         std::process::exit(2);
@@ -854,7 +874,10 @@ fn main() {
     }
     let r = rep.lock().unwrap_or_else(|e| e.into_inner());
     let left = if skipped { sh.total.load(Ordering::Relaxed).saturating_sub(sh.done.load(Ordering::Relaxed)) } else { 0 };
-    let s = summary(o, &r, started.elapsed().as_secs_f64(), skipped, left);
+    let mut s = summary(o, &r, started.elapsed().as_secs_f64(), skipped, left);
+    if let Some(n) = &scan_note {
+        s.push_str(&format!("  {n}\n"));
+    }
     print!("{s}");
     if let Some(f) = &summary_file {
         let _ = std::fs::write(f, &s);
@@ -886,7 +909,7 @@ mod tests {
         assert_eq!(r.mode.cbv_raw, CbvRaw::Off);
         let r = resolve_mode_from(None, None, Some("1"), true, probed);
         assert_eq!((r.mode.cbv_raw, r.mode.fma), (CbvRaw::Forced, probed));
-        assert_eq!(resolve_mode_from(None, None, None, false, probed).mode, Mode { cbv_raw: CbvRaw::Off, loop_grad: false, fma: probed });
+        assert_eq!(resolve_mode_from(None, None, None, false, probed).mode, Mode { cbv_raw: CbvRaw::Copy, loop_grad: false, fma: probed });
         let p = Path::new("d3d12_xs.dll");
         let good = pack_key::translator_tag().to_vec();
         assert!(resolve_mode_from(None, Some((p, Some(good))), None, true, probed).stale.is_none());

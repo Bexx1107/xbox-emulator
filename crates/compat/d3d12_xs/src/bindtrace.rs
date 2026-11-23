@@ -375,6 +375,32 @@ fn fmt_words(bytes: &[u8]) -> String {
 }
 
 /// Text describing every table bound on `list` (graphics or compute).
+pub fn table_srv(list: usize, compute: bool, param: u32, slot: u32) -> Option<(usize, u32, u32)> {
+    with(|s| {
+        let h = *s.tables.get(&(list, compute))?.get(param as usize)?;
+        if h == 0 {
+            return None;
+        }
+        let heap = s.heaps.iter().find(|x| x.gpu != 0 && x.inc != 0 && h >= x.gpu && h < x.gpu + (x.count * x.inc) as u64)?;
+        let idx = (h - heap.gpu) as usize / heap.inc + slot as usize;
+        if idx >= heap.count {
+            return None;
+        }
+        let cpu = heap.cpu + idx * heap.inc;
+        let d = match s.descs.get(&cpu) {
+            Some(e) => e.d.clone(),
+            None => unsafe { desc_bytes(cpu, heap.inc) }.and_then(|b| s.by_bytes.get(&b).cloned())?,
+        };
+        match d {
+            Desc::Srv { res, desc } => {
+                let u = |o: usize| desc.map(|d| u32::from_le_bytes(d[o..o + 4].try_into().unwrap())).unwrap_or(0);
+                Some((res, u(4), u(8)))
+            }
+            _ => None,
+        }
+    })
+}
+
 pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -> String {
     // Collect under the lock, read memory after it (Map may take driver locks).
     struct Item {

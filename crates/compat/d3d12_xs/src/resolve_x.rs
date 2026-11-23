@@ -55,6 +55,12 @@ unsafe fn desc(res: *mut c_void) -> Option<[u8; 0x38]> {
 }
 
 unsafe extern "system" fn resolve_subresource_x(list: *mut c_void, dst: *mut c_void, dst_sub: u32, src: *mut c_void, src_sub: u32, format: u32) {
+    unsafe { crate::gpuprof::pass_begin(list, crate::gpuprof::TAG_RESOLVE) };
+    unsafe { resolve_inner(list, dst, dst_sub, src, src_sub, format) };
+    unsafe { crate::gpuprof::pass_end(list) };
+}
+
+unsafe fn resolve_inner(list: *mut c_void, dst: *mut c_void, dst_sub: u32, src: *mut c_void, src_sub: u32, format: u32) {
     let rect = match unsafe { (desc(dst), desc(src)) } {
         (Some(d), Some(s)) => overlap_rect(extent_of(&d), dst_sub, extent_of(&s), src_sub),
         _ => None,

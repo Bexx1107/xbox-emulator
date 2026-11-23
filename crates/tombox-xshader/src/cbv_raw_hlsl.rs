@@ -44,6 +44,22 @@ pub fn declared_sizes(h: &str) -> Vec<(u32, u32, u64)> {
 }
 
 #[cfg(test)]
+mod where_tests {
+    #[test]
+    fn only_picked_constant_buffers_become_raw_buffers() {
+        let h = "cbuffer CB0 : register(b0) { uint4 cb0[4]; };
+cbuffer CB1 : register(b1) { uint4 cb1[23]; };
+uint4 f(uint i) { return cb0[i] ^ cb1[i + 1]; }
+";
+        let o = super::rewrite_hlsl_where(h, &|r, sp| r == 1 && sp == 0).unwrap();
+        assert!(o.contains("cbuffer CB0 : register(b0) { uint4 cb0[4]; };"), "{o}");
+        assert!(o.contains("ByteAddressBuffer tb_cbr1 : register(t1, space4100000);"), "{o}");
+        assert!(o.contains("cb0[i] ^ tb_cbr1.Load4((i + 1) * 16u)"), "{o}");
+        assert_eq!(super::rewrite_hlsl_where(h, &|_, _| false).unwrap(), h);
+    }
+}
+
+#[cfg(test)]
 mod size_tests {
     #[test]
     fn declared_cbuffer_sizes_follow_the_register_and_space() {
@@ -126,6 +142,36 @@ fn rewrite_uses(s: &str, names: &[String]) -> Result<String, String> {
 }
 
 pub fn rewrite_hlsl(h: &str) -> Result<String, String> {
+    rewrite_sel(h, &|_, _| true, true)
+}
+
+pub fn table_cbv_ranges(rs: Option<&crate::meta::RootSig>) -> Vec<(u32, u32, u32)> {
+    let mut v = Vec::new();
+    for p in rs.map(|r| r.params.as_slice()).unwrap_or(&[]) {
+        if let crate::meta::RootParamKind::Table(ranges) = &p.kind {
+            v.extend(ranges.iter().filter(|r| r.range_type == 2).map(|r| (r.base_register, r.num.max(1), r.space)));
+        }
+    }
+    v
+}
+
+pub fn in_table(t: &[(u32, u32, u32)], reg: u32, space: u32) -> bool {
+    t.iter().any(|&(b, n, s)| s == space && reg >= b && reg - b < n)
+}
+
+pub fn rewrite_tables(h: &str, rs: Option<&crate::meta::RootSig>) -> Result<String, String> {
+    let t = table_cbv_ranges(rs);
+    if t.is_empty() {
+        return Ok(h.to_string());
+    }
+    rewrite_hlsl_where(h, &|r, sp| in_table(&t, r, sp))
+}
+
+pub fn rewrite_hlsl_where(h: &str, pick: &dyn Fn(u32, u32) -> bool) -> Result<String, String> {
+    rewrite_sel(h, pick, false)
+}
+
+fn rewrite_sel(h: &str, pick: &dyn Fn(u32, u32) -> bool, all: bool) -> Result<String, String> {
     if h.contains("ConstantBuffer<TbBlCb") {
         return Err("bindless constant buffer (ConstantBuffer<TbBlCb..>) in an Xbox One shader: raw-SRV constant binding does not cover it yet".into());
     }
@@ -133,9 +179,13 @@ pub fn rewrite_hlsl(h: &str) -> Result<String, String> {
     let mut body = String::with_capacity(h.len() + 256);
     for line in h.split_inclusive('\n') {
         if let Some((name, r, space)) = parse_decl(line) {
+            if !pick(r, space) {
+                body.push_str(line);
+                continue;
+            }
             body.push_str(&format!("ByteAddressBuffer tb_cbr{} : register(t{r}, space{});\n", &name[2..], map_space(space)?));
             names.push(name);
-        } else if line.trim_end() == crate::hlsl::CBFIT_CBUFFER {
+        } else if all && line.trim_end() == crate::hlsl::CBFIT_CBUFFER {
             body.push_str(crate::hlsl::CBFIT_RAW);
             body.push('\n');
         } else if line.trim_start().starts_with("cbuffer CB") {

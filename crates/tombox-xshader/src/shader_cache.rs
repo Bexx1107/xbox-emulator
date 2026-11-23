@@ -78,6 +78,10 @@ pub fn src_dir(title: &str) -> PathBuf {
     title_dir(title).join("src")
 }
 
+pub fn game_scan_dir(title: &str) -> PathBuf {
+    title_dir(title).join("game_scan")
+}
+
 fn fnv(seed: u64, parts: &[&[u8]]) -> u64 {
     let mut h = seed;
     for p in parts {

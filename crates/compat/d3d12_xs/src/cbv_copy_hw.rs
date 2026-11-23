@@ -700,3 +700,94 @@ fn hw_cbv_copy_nr_limit_copies_only_nr_bytes_and_zero_fills_the_slot() {
     same("copy without a limit", &full, &data[off..off + CB_BYTES]);
     eprintln!("NR*stride={nr:#x}: {nr} bytes copied, the remaining {} bytes of the slot read as zero", CB_BYTES - nr);
 }
+
+unsafe fn heap_handles(dev: usize) -> (usize, usize, u64) {
+    let hd = [0u32, 1, 1, 0];
+    let mut h: *mut c_void = core::ptr::null_mut();
+    assert!(unsafe { call!(dev, 14, (*const u32, *const Guid, *mut *mut c_void) -> i32, hd.as_ptr(), &IID_DESC_HEAP, &mut h) } >= 0);
+    let mut cpu = 0usize;
+    let ret = unsafe { call!(h, 9, (*mut usize) -> usize, &mut cpu) };
+    if ret != &mut cpu as *mut usize as usize {
+        cpu = ret;
+    }
+    let mut gpu = 0u64;
+    let ret = unsafe { call!(h, 10, (*mut u64) -> usize, &mut gpu) };
+    if ret != &mut gpu as *mut u64 as usize {
+        gpu = ret as u64;
+    }
+    (h as usize, cpu, gpu)
+}
+
+#[test]
+#[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_cbv_copy -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
+fn hw_cbv_copy_unaligned_descriptor_table_cbv_reads_through_a_raw_view_next_to_a_root_cbv() {
+    if skip() {
+        return;
+    }
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let g = gpu();
+    let f = fixture();
+    let rs_text = "RootFlags(0), CBV(b0, visibility=SHADER_VISIBILITY_PIXEL), DescriptorTable(CBV(b1), visibility=SHADER_VISIBILITY_PIXEL)";
+    let probe = format!("#define RS \"{rs_text}\"\n[RootSignature(RS)] float4 main() : SV_Position {{ return 0; }}");
+    let blob = compile(&probe, "vs_6_0");
+    let parsed = tombox_xshader::parse_root_signature(&blob).expect("parse root signature");
+    let tables = table_cbv_ranges(Some(&parsed));
+    assert_eq!(tables, vec![(1, 1, 0)]);
+    let (tbl, p) = crate::cbv_raw::table_blob(&blob).expect("table_blob").expect("a CBV range to rebind");
+    assert_eq!((p.ranges, p.root_cbvs.len()), (1, 0));
+    assert_eq!(crate::cbv_raw::root_cbv_params(&tbl), crate::cbv_raw::root_cbv_params(&blob), "the root CBV must stay a root CBV");
+    let rs = unsafe { root_sig(g.dev, &tbl) };
+    let ps_text = format!("cbuffer CB0 : register(b0) {{ uint4 cb0[{N}]; }};\ncbuffer CB1 : register(b1) {{ uint4 cb1[23]; }};\nuint4 main(float4 p : SV_Position) : SV_Target {{ uint i = (uint)p.x; return cb0[i] ^ cb1[i]; }}\n");
+    let copy_text = tombox_xshader::cbv_raw_hlsl::rewrite_hlsl_where(&ps_text, &|r, sp| in_table(&tables, r, sp)).expect("rewrite_hlsl_where");
+    assert!(copy_text.contains("cbuffer CB0 : register(b0)") && copy_text.contains("tb_cbr1.Load4"), "{copy_text}");
+    let vs = compile(VS, "vs_6_0");
+    let ps = compile(&copy_text, "ps_6_0");
+    let pso = unsafe { gfx_pso(g.dev, rs, &vs, &ps) };
+    let size = 4096usize;
+    let src = unsafe { buffer(g.dev, HEAP_UPLOAD, size as u64, 0, ST_GENERIC_READ, Some(size as u64)) };
+    let data = pattern(0x7777_0000, size);
+    unsafe { put(&src, 0, &data) };
+    let (root_off, table_off) = (0x200usize, 0x4b0usize);
+    let table_va = src.va + table_off as u64;
+    assert_ne!(table_va % SLOT_ALIGN, 0);
+    let (res, d) = crate::cbv_raw::raw_view(table_va, 368, &crate::gpu_va::lookup).expect("raw view of the table CBV");
+    assert_eq!(res, src.res);
+    let (heap, cpu, gpu_h) = unsafe { heap_handles(g.dev) };
+    unsafe { call!(g.dev, 18, (*mut c_void, *const u8, usize) -> (), res as *mut c_void, d.as_ptr(), cpu) };
+    let want: Vec<u8> = (0..CB_BYTES).map(|i| data[root_off + i] ^ data[table_off + i]).collect();
+    let mut r = unsafe { run_new(g, LIST_DIRECT) };
+    let l = r.list;
+    unsafe {
+        core::ptr::write_bytes(f.rb.cpu, 0xcd, PITCH as usize);
+        call!(l, P_RTS, (u32, *const usize, i32, *const usize) -> (), 1, &f.rtv, 0, core::ptr::null());
+        let vp = [0f32, 0.0, N as f32, 1.0, 0.0, 1.0];
+        call!(l, P_VIEWPORTS, (u32, *const f32) -> (), 1, vp.as_ptr());
+        let sc = [0i32, 0, N as i32, 1];
+        call!(l, P_SCISSORS, (u32, *const i32) -> (), 1, sc.as_ptr());
+        call!(l, P_TOPOLOGY, (u32) -> (), 4);
+        let heaps = [heap];
+        call!(l, 28, (u32, *const usize) -> (), 1, heaps.as_ptr());
+        call!(l, P_GRAPHICS_RS, (usize) -> (), rs);
+        call!(l, P_PSO, (usize) -> (), pso);
+        call!(l, 38, (u32, u64) -> (), 0, src.va + root_off as u64);
+        call!(l, 32, (u32, u64) -> (), 1, gpu_h);
+        call!(l, P_DRAW, (u32, u32, u32, u32) -> (), 3, 1, 0, 0);
+        barrier(l, f.rt, ST_RT, ST_COPY_SOURCE);
+        let mut dst = [0u8; 48];
+        dst[0..8].copy_from_slice(&(f.rb.res as u64).to_le_bytes());
+        dst[8..12].copy_from_slice(&1u32.to_le_bytes());
+        dst[24..28].copy_from_slice(&FMT_RGBA32_UINT.to_le_bytes());
+        dst[28..32].copy_from_slice(&(N as u32).to_le_bytes());
+        dst[32..36].copy_from_slice(&1u32.to_le_bytes());
+        dst[36..40].copy_from_slice(&1u32.to_le_bytes());
+        dst[40..44].copy_from_slice(&(PITCH as u32).to_le_bytes());
+        let mut s = [0u8; 48];
+        s[0..8].copy_from_slice(&(f.rt as u64).to_le_bytes());
+        call!(l, P_COPY_TEXTURE, (*const u8, u32, u32, u32, *const u8, *const c_void) -> (), dst.as_ptr(), 0, 0, 0, s.as_ptr(), core::ptr::null());
+        barrier(l, f.rt, ST_COPY_SOURCE, ST_RT);
+        execute(g, &mut r);
+        let out = get(&f.rb, 0, CB_BYTES);
+        same("root CBV ^ unaligned table CBV (raw view) output", &out, &want);
+    }
+    eprintln!("table CBV at +{:#x} from 256 read through a raw SRV next to a real root CBV: {} bytes bit-exact", table_va % SLOT_ALIGN, CB_BYTES);
+}

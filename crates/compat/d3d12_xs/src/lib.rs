@@ -34,6 +34,7 @@ mod xone_tex;
 mod heap_wrap;
 mod cmdlist_wrap;
 mod blendclamp;
+mod blend_probe;
 mod gpuprof;
 mod slowcall;
 mod console_slots;
@@ -68,6 +69,7 @@ mod upload;
 mod reaper;
 mod rtcap;
 mod passcap;
+mod fmask_check;
 #[cfg(test)]
 mod passcap_tests;
 mod bindtrace;
@@ -112,6 +114,8 @@ mod bop64;
 mod wait_probe;
 #[cfg(test)]
 mod hw_tests;
+#[cfg(test)]
+mod blendclamp_hw;
 mod driver_state;
 #[cfg(test)]
 mod driver_unload_tests;

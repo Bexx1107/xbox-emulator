@@ -33,11 +33,11 @@ pub enum Mode {
 
 pub fn parse_mode(v: Option<&str>) -> Result<Mode, String> {
     match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        None | Some("") | Some("auto") => Ok(Mode::Auto),
+        None | Some("") | Some("copy") => Ok(Mode::Copy),
+        Some("auto") => Ok(Mode::Auto),
         Some("1") | Some("on") => Ok(Mode::On),
         Some("0") | Some("off") => Ok(Mode::Off),
-        Some("copy") => Ok(Mode::Copy),
-        Some(other) => Err(format!("cbv_raw={other:?} is not one of auto, on, off, copy, 1, 0; using auto")),
+        Some(other) => Err(format!("cbv_raw={other:?} is not one of copy, auto, on, off, 1, 0; using copy")),
     }
 }
 
@@ -51,7 +51,7 @@ pub fn mode() -> Mode {
         let raw = mode_setting(std::env::var("TOMBOX_CBV_RAW").ok(), std::env::var("TOMBOX_CBRAW").ok(), compat_common::cfg("cbv_raw"));
         parse_mode(raw.as_deref()).unwrap_or_else(|e| {
             record("d3d12_xs", "cbv_raw", &e);
-            Mode::Auto
+            Mode::Copy
         })
     })
 }
@@ -108,7 +108,7 @@ pub fn enabled() -> bool {
         if on {
             record("d3d12_xs", "cbv_raw", &format!("{why}: constant buffers are bound as raw SRVs in space {}+n so a CBV may start at any 16-byte-aligned address like on the console", tombox_xshader::cbv_raw_hlsl::space_base()));
         } else if mode == Mode::Copy {
-            record("d3d12_xs", "cbv_raw", &format!("{why}: constant buffers stay PC CBVs; a root CBV whose address is not 256-byte aligned is copied on the GPU timeline into a 256-aligned emulator ring before each draw or dispatch and bound as a real root CBV (xbox_one_title={xbox_one})"));
+            record("d3d12_xs", "cbv_raw", &format!("{why}: root CBVs stay PC CBVs and one whose address is not 256-byte aligned is copied on the GPU timeline into a 256-aligned emulator ring before each draw or dispatch; descriptor-table CBV ranges are rebound as raw SRVs (space {}+n) so a table CBV may start at any 16-byte-aligned address (xbox_one_title={xbox_one})", tombox_xshader::cbv_raw_hlsl::space_base()));
         } else if mode == Mode::Off {
             record("d3d12_xs", "cbv_raw", &format!("{why}: constant buffers stay PC CBVs (BufferLocation must be 256-byte aligned)"));
         }
@@ -133,6 +133,10 @@ fn wr(b: &mut [u8], o: usize, v: u32) {
 
 
 pub fn patch_rts0(b: &mut [u8]) -> Result<RsPatch, String> {
+    patch_rts0_with(b, true)
+}
+
+pub fn patch_rts0_with(b: &mut [u8], roots: bool) -> Result<RsPatch, String> {
     let version = rd(b, 0)?;
     let range_size = match version {
         1 => 20,
@@ -157,7 +161,7 @@ pub fn patch_rts0(b: &mut [u8]) -> Result<RsPatch, String> {
                     }
                 }
             }
-            PARAM_CBV => {
+            PARAM_CBV if roots => {
                 let space = map_space(rd(b, payload + 4)?)?;
                 wr(b, at, PARAM_SRV);
                 wr(b, payload + 4, space);
@@ -179,9 +183,25 @@ pub fn alias_blob(blob: &[u8]) -> Result<Option<Vec<u8>>, String> {
 }
 
 pub fn patch_blob(blob: &[u8]) -> Result<Option<(Vec<u8>, RsPatch)>, String> {
+    patch_blob_with(blob, true)
+}
+
+pub fn table_blob(blob: &[u8]) -> Result<Option<(Vec<u8>, RsPatch)>, String> {
+    patch_blob_with(blob, false)
+}
+
+pub fn copy_mode_blob(blob: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    if copy_on() {
+        table_blob(blob).map(|r| r.map(|(b, _)| b))
+    } else {
+        alias_blob(blob)
+    }
+}
+
+fn patch_blob_with(blob: &[u8], roots: bool) -> Result<Option<(Vec<u8>, RsPatch)>, String> {
     let (o, n) = crate::console_slots_mesh::rts0_range(blob).ok_or("root signature blob has no RTS0 part")?;
     let mut body = blob.get(o..o + n).ok_or("RTS0 chunk out of bounds")?.to_vec();
-    let mut p = patch_rts0(&mut body)?;
+    let mut p = patch_rts0_with(&mut body, roots)?;
     if let Some(b) = crate::bl_alias::add_aliases(&body)? {
         body = b;
         p.aliased = true;
@@ -237,11 +257,12 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
     }
     if !enabled() {
         let given = unsafe { core::slice::from_raw_parts(blob, len) };
-        return match alias_blob(given) {
+        return match copy_mode_blob(given) {
             Ok(Some(b)) => {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 3 {
-                    record("d3d12_xs", "cbv_raw", &format!("cbv_raw={} root signature: CBVs kept, SRV/UAV ranges aliased for the translator's bindless spaces", if copy_on() { "copy" } else { "off" }));
+                    let what = if copy_on() { "copy root signature: root CBVs kept, descriptor-table CBV ranges rebound as raw SRVs" } else { "off root signature: CBVs kept" };
+                    record("d3d12_xs", "cbv_raw", &format!("cbv_raw={what}, SRV/UAV ranges aliased for the translator's bindless spaces"));
                 }
                 unsafe { f(this, mask, b.as_ptr(), b.len(), riid, ppv) }
             }
@@ -278,10 +299,7 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
 }
 
 unsafe extern "system" fn create_cbv(this: *mut c_void, pdesc: *const u8, dest: usize) {
-    if !enabled() {
-        if copy_on() && !pdesc.is_null() {
-            crate::cbv_copy::note_table_cbv(unsafe { core::ptr::read_unaligned(pdesc as *const u64) }, unsafe { core::ptr::read_unaligned(pdesc.add(8) as *const u32) });
-        }
+    if !enabled() && !copy_on() {
         let f: unsafe extern "system" fn(*mut c_void, *const u8, usize) = unsafe { core::mem::transmute(PREV_CBV.load(Ordering::Relaxed)) };
         return unsafe { f(this, pdesc, dest) };
     }
@@ -675,10 +693,10 @@ void main() {
     }
 
     #[test]
-    fn off_mode_shader_root_signature_gets_aliases_and_keeps_cbvs() {
+    fn non_raw_default_shader_root_signature_gets_aliases_and_keeps_cbvs() {
         let body = rts0(2, &[[0, u32::MAX, 0, 0]], true);
         let plain = crate::device_wrap::shader_root_container(&body, false);
-        assert!(!copy_on() && !enabled());
+        assert!(copy_on() && !enabled());
         let console = crate::device_wrap::wrap_root_signature(&body);
         let given = crate::rs_xbox::pc_blob(&console).unwrap_or(console);
         assert_eq!(Some(plain.clone()), alias_blob(&given).unwrap());
@@ -687,7 +705,10 @@ void main() {
         let only_cbv = rts0(2, &[[2, 1, 0, 0]], true);
         let c = crate::device_wrap::wrap_root_signature(&only_cbv);
         let g = crate::rs_xbox::pc_blob(&c).unwrap_or(c);
-        assert_eq!(crate::device_wrap::shader_root_container(&only_cbv, false), g);
+        let tbl = crate::device_wrap::shader_root_container(&only_cbv, false);
+        assert_eq!(Some(tbl.clone()), table_blob(&g).unwrap().map(|(b, _)| b));
+        assert_ne!(tbl, g, "cbv_raw=copy rebinds the descriptor-table CBV range as a raw SRV range");
+        assert_eq!(root_cbv_params(&tbl), root_cbv_params(&g));
     }
 
     #[test]
@@ -711,8 +732,9 @@ void main() {
 
     #[test]
     fn cbv_raw_mode_setting_is_validated() {
-        assert_eq!(parse_mode(None), Ok(Mode::Auto));
-        assert_eq!(parse_mode(Some("")), Ok(Mode::Auto));
+        assert_eq!(parse_mode(None), Ok(Mode::Copy));
+        assert_eq!(parse_mode(Some("")), Ok(Mode::Copy));
+        assert_eq!(parse_mode(Some("copy")), Ok(Mode::Copy));
         assert_eq!(parse_mode(Some("auto")), Ok(Mode::Auto));
         assert_eq!(parse_mode(Some(" ON ")), Ok(Mode::On));
         assert_eq!(parse_mode(Some("1")), Ok(Mode::On));
