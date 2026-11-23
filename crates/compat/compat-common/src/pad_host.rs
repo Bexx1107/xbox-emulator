@@ -162,7 +162,8 @@ pub fn parse_mode(v: Option<&str>) -> Mode {
     match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("0" | "off" | "false" | "no") => Mode::Off,
         Some("1" | "on" | "force" | "always") => Mode::Force,
-        _ => Mode::Auto,
+        Some("auto") => Mode::Auto,
+        _ => Mode::Off,
     }
 }
 
@@ -425,7 +426,8 @@ mod tests {
 
     #[test]
     fn modes_and_title_window_classes() {
-        assert_eq!(parse_mode(None), Mode::Auto);
+        assert_eq!(parse_mode(None), Mode::Off);
+        assert_eq!(parse_mode(Some("yes please")), Mode::Off);
         assert_eq!(parse_mode(Some(" 0 ")), Mode::Off);
         assert_eq!(parse_mode(Some("off")), Mode::Off);
         assert_eq!(parse_mode(Some("Force")), Mode::Force);

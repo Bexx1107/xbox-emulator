@@ -59,7 +59,7 @@ fn foreground_key_reaches_the_published_pad_reading() {
     log.push("tombox_pad_host_test.log");
     std::env::set_var("TOMBOX_LOG", log);
     std::env::set_var("TOMBOX_PAD_XINPUT", "0");
-    std::env::remove_var("TOMBOX_PAD_KEYS");
+    std::env::set_var("TOMBOX_PAD_KEYS", "auto");
     assert_eq!(core::mem::size_of::<Input>(), 40);
     let (cls, name) = (wide("Static"), wide("tombox pad host test"));
     let h = unsafe { CreateWindowExW(0, cls.as_ptr(), name.as_ptr(), 0x10CF_0000, 50, 50, 300, 120, core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut()) };
