@@ -819,10 +819,14 @@ elease`, the log shows one install and every interface is emulated.
     - On WARP it checks the counter total, that inactive lanes are untouched, and that no other GDS dword changes.
     - With TOMBOX_EXEC_HW=1 on the RTX 5060 (wave32) it also checks the per-wave return values.
   - Limits: a wave64 source is refused, because it spans two host waves. The LDS (GDS=0) form is not lowered.
-- OPEN, ds_gws_init / ds_gws_sema_v / ds_gws_sema_br / ds_gws_sema_p / ds_gws_sema_release_all / ds_gws_barrier: these remain translator refusals.
+- UPDATE 2026-11-23, ds_gws_init / ds_gws_sema_v / ds_gws_sema_br are no longer refusals: 9584ffa lowers them as one wave-uniform GWS counter update (hlsl/gds.rs emit_gws_counter).
+  - The first active lane of each guest wave is chosen with InterlockedMin over its thread id, and only that lane does one InterlockedExchange (init, S1) or InterlockedAdd (sema_v +1, sema_br +S1) at M0[31:16] + simm in the 64-resource GWS table. The 12-bit counter mask is the gfx103 register definition (Mesa, THIRD_PARTY/CREDITS, #134). The value is wave-uniform, not per lane.
+  - Limits, each a named refusal: a stage other than compute, a group that is not wave32 or has more than 64 z groups, any control flow, and a resource encoding outside the 6-bit simm.
+  - Tests, WARP 2026-11-23: exec_mem::gds::ds_gws_counter_updates_once_per_guest_wave, ds_gws_concurrent_posts_preserve_all_increments, ds_gws_bulk_post_uses_first_active_lane_in_each_group and ds_gws_counter_boundaries_across_rows_and_partial_waves pass; ds_gws_refuses_unsupported_group_and_wait pins the refusals.
+- OPEN, ds_gws_sema_p / ds_gws_sema_release_all / ds_gws_barrier: these remain translator refusals ("global wave sync counts hardware waves across thread groups; no lowering in the one-lane-per-thread model").
   - The XML describes them as GWS resources that queue the wave until a semaphore release or a barrier count is reached, across waves and thread groups.
   - D3D12 has no cross-group blocking primitive and no forward-progress guarantee for spin waits, so a lowering could hang or would only appear to work.
-  - No title shader uses them (mnemonics.txt: 0 uses).
+  - No title shader uses any ds_gws_* (tools/progress/data/mnemonics.txt: 0 uses).
 - OPEN, ds_ordered_count: remains a translator refusal. The XML says it adds count_bits(exec) to one of 4 dedicated ordered-count packers in wave-launch order. D3D12 does not expose dispatch order. Atomics would give unique slots but not ordered ones, so the result would only appear to work. 0 uses.
 
 ## D3D12.X last slots, verifier notes (2026-11-21)
@@ -1185,14 +1189,17 @@ Headless runs straight into each title's test scene, on the staged release of 11
 
 - On Xbox the CPU and GPU share memory, so a CPU write into a placed texture is visible to the GPU straight away. On PC each placed texture is a committed copy that upload.rs refills. Event mode (the default) only re-uploaded after a TomboxNoteTitleMemory note. In Trackmania the note link from xmem was dead: the 65536-miss cap latched "absent" before d3d12_xs.dll loaded. The libvpx video planes (memtype 3, fmt 61, layout 264) therefore stayed zero: notes=0, still-zero=198 subresources (24 MB), zero->data=0.
 - What the emulator now does:
-  - xmem reserves its own GPU-visible memory with MEM_WRITE_WATCH: XMemAllocDefault, pool granules and XMemVirtualAlloc reservations. The patch was handed to the xmem owner. It also exports TomboxWriteWatchOwner.
+  - xmem reserves its own GPU-visible memory with MEM_WRITE_WATCH: XMemAllocDefault, pool granules and XMemVirtualAlloc reservations (crates/compat/xmem/src/write_watch.rs, alloc.rs, pool.rs; 6a1a4b1, extended in e67e3d4). It also exports TomboxWriteWatchOwner.
   - At each PresentX pump, upload.rs calls GetWriteWatch with WRITE_WATCH_FLAG_RESET on the emulator-owned ranges, and re-uploads only the dirty subresources. For linear and tiled layouts alike, an upload covers only the rows whose element offsets touch a dirty page.
   - Every resource that keeps the hash path is logged once with the reason. Any CPU write that cannot be uploaded is counted (lost) and logged once per resource. TOMBOX_WRITE_WATCH=0 restores the old behaviour.
 - OPEN, cannot be watched:
   - Memory the title reserved with MEM_WRITE_WATCH itself is title-owned. A RESET there would corrupt the title's XMemGetWriteWatch results, so such resources keep the hash or notes path.
   - Physical-page or file-mapped views (xmem phys.rs MapViewOfFile3 placeholders) cannot carry write watch on Windows. Resources on them keep the hash/poll path (TOMBOX_UPLOAD_POLL=1).
 - DEFERRED: a guard-page (PAGE_GUARD / VEH) tracker for those views. It would fault on each first write per page per frame, and it conflicts with the title's own VEH and with the xmem range hooks. Not started.
-- OPEN, stage B: the dirty check runs only at PresentX. A CPU write followed by ExecuteCommandLists in the same frame is still seen one present late. The hook in present.rs exec_lists_x needs a re-entry guard (the pump's own ExecuteCommandLists goes through it), a cross-queue fence Wait and a list ring. Not done yet.
+- UPDATE 2026-11-23, stage B: the dirty check also runs at submission now. present.rs exec_lists_x calls upload::submit_hook before the title's ExecuteCommandLists, so a CPU write after recording is uploaded into that submission instead of one present late (6a1a4b1).
+  - The pump re-entry guard is a thread-local (UploadGuard); the upload work runs on a ring of 16 fence-tracked allocator/list pairs and waits on the upload fence for at most 2 s (counted as ring_waits). A title queue other than the upload queue records the ring value and inserts a Wait on the upload fence (cross_queue).
+  - When the ring is exhausted the dirty subresources are re-queued for the next submit or PresentX, logged once, so nothing is dropped silently. TOMBOX_WW_SUBMIT=0 restores the PresentX-only pump.
+  - Not re-run here: d3d12_xs cannot link on this machine, so hw_cpu_write_between_record_and_submit_reaches_that_submit_linear / _tiled and hw_a_dirty_page_with_unchanged_texels_is_not_re_uploaded (crates/compat/d3d12_xs/src/upload_ww_hw.rs) were not executed for this entry.
 
 ## Title memory accounting gaps (xmem title_acct + d3d12_xs title_gpu) - 2026-11-22
 
@@ -1239,3 +1246,7 @@ Headless runs straight into each title's test scene, on the staged release of 11
 - OPEN, unverified: whether the console fails a signed-out token request at the Begin call or at completion. We complete the async call with E_GAMEUSER_SIGNED_OUT.
 - OPEN: XUserFindControllerForUserWithUiAsync with no pad connected completes with E_ABORT, the way a dismissed pairing dialog does, because there is no pairing UI offline.
 - OPEN: ForceRefresh cannot renew a user-supplied xbl_token offline; that token is returned unchanged.
+
+## rectlist expansion for stream-built PSOs (d3d12_xs) - 2026-11-23, steward from #280
+- OPEN: draws with IA topology RECTLIST (17) on a PSO built from a pipeline state stream are not expanded. rectlist.rs finds no recorded PC description for those PSOs and refuses them, so each rect draws only its first triangle. #280 fixes the PSO side (console topology type 0x13 becomes TRIANGLE in non-mesh streams). The draw side still needs a PC description recorded for stream-built PSOs so the existing expansion can run.
+- Done when: a WARP test draws a rect list through a stream-built PSO and checks that every pixel of the full rect is covered.
