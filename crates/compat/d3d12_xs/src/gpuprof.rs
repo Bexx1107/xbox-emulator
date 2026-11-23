@@ -80,7 +80,22 @@ const IID_FENCE: Guid = Guid { d1: 0x0a75_3dcf, d2: 0xc4d8, d3: 0x4b91, d4: [0xa
 const IID_LIST: Guid = Guid { d1: 0x5b16_0d0f, d2: 0xac1b, d3: 0x4185, d4: [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55] };
 type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
 
+struct SubRec {
+    ty: u32,
+    queue: usize,
+    s0: u32,
+    s1: u32,
+    lists: Vec<(u32, u32)>,
+    n_lists: u32,
+    missing: u32,
+    cpu: [i64; 4],
+}
+
 struct State {
+    closed: HashMap<usize, (u32, u32, bool)>,
+    subs: Vec<SubRec>,
+    sub_open: HashMap<usize, SubRec>,
+    calib: HashMap<usize, (u32, Vec<crate::gpuprof_tl::Calib>)>,
     heap: usize,
     cheap: usize,
     rb: usize,
@@ -149,6 +164,10 @@ fn windows_on() -> bool {
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let s = g.get_or_insert_with(|| State {
+        closed: HashMap::new(),
+        subs: Vec::new(),
+        sub_open: HashMap::new(),
+        calib: HashMap::new(),
         heap: 0,
         cheap: 0,
         rb: 0,
@@ -491,29 +510,71 @@ unsafe fn submit_stamp(queue: *mut c_void, exec: ExecFn, ty: u32) -> Option<u32>
     Some(slot)
 }
 
-pub unsafe fn ecl_begin(queue: *mut c_void, exec: ExecFn) {
+pub unsafe fn ecl_begin(queue: *mut c_void, exec: ExecFn, lists: &[*mut c_void], enter: i64) {
     if !ARMED.load(Ordering::Relaxed) || queue.is_null() || !enabled() {
         return;
     }
     let ty = unsafe { crate::gpuprof_q::queue_type(queue) };
-    if let Some(s0) = unsafe { submit_stamp(queue, exec, ty) } {
+    let need = with(|s| !s.calib.contains_key(&(queue as usize)));
+    if need {
+        let c = unsafe { crate::gpuprof_tl::calibrate(queue) };
         with(|s| {
-            s.open.insert(queue as usize, (ty, s0));
+            s.calib.entry(queue as usize).or_insert((ty, Vec::new())).1.extend(c);
         });
     }
+    let mut rec = with(|s| {
+        let mut r = SubRec { ty, queue: queue as usize, s0: 0, s1: 0, lists: Vec::new(), n_lists: lists.len() as u32, missing: 0, cpu: [enter, 0, 0, 0] };
+        for l in lists {
+            match s.closed.get(&(*l as usize)) {
+                Some(&(a, b, true)) => r.lists.push((a, b)),
+                _ => r.missing += 1,
+            }
+        }
+        r
+    });
+    rec.cpu[1] = crate::frame::qpc();
+    if let Some(s0) = unsafe { submit_stamp(queue, exec, ty) } {
+        rec.s0 = s0;
+        with(|s| {
+            s.open.insert(queue as usize, (ty, s0));
+            s.sub_open.insert(queue as usize, rec);
+        });
+    }
+}
+
+pub fn ecl_exit(queue: *mut c_void) {
+    if !enabled() {
+        return;
+    }
+    let t = crate::frame::qpc();
+    with(|s| {
+        if let Some(r) = s.subs.iter_mut().rev().find(|r| r.queue == queue as usize) {
+            if r.cpu[3] == 0 {
+                r.cpu[3] = t;
+            }
+        }
+    });
 }
 
 pub unsafe fn ecl_end(queue: *mut c_void, exec: ExecFn) {
     if !enabled() {
         return;
     }
-    let open = with(|s| s.open.remove(&(queue as usize)));
-    let Some((ty, s0)) = open else { return };
+    let post = crate::frame::qpc();
+    let open = with(|s| (s.open.remove(&(queue as usize)), s.sub_open.remove(&(queue as usize))));
+    let (Some((ty, s0)), rec) = open else { return };
     if !ARMED.load(Ordering::Relaxed) {
         return;
     }
     if let Some(s1) = unsafe { submit_stamp(queue, exec, ty) } {
-        with(|s| s.spans.push(Span { ty, s0, s1 }));
+        with(|s| {
+            s.spans.push(Span { ty, s0, s1 });
+            if let Some(mut r) = rec {
+                r.s1 = s1;
+                r.cpu[2] = post;
+                s.subs.push(r);
+            }
+        });
     }
 }
 
@@ -584,7 +645,31 @@ unsafe extern "system" fn op_clear_dsv(this: *mut c_void, h: usize, flags: u32, 
     unsafe { f(this, h, flags, depth, stencil, n, rects) }
 }
 
+static COMMON: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+
+pub fn common_count(b: &[u8], title: bool, c: &mut [u64; 4]) {
+    for e in b.chunks_exact(32) {
+        let w = |o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
+        if w(0) != 0 {
+            continue;
+        }
+        let k = if title { 0 } else { 2 };
+        c[k] += (w(20) == 0) as u64;
+        c[k + 1] += (w(24) == 0) as u64;
+    }
+}
+
+fn common_text(c: &[u64; 4], nf: u64) -> String {
+    let f = |v: u64| v as f64 / nf.max(1) as f64;
+    format!("COMMON-state transitions per frame (implicit promotion and decay are not visible to the API): title from COMMON {:.1}, to COMMON {:.1} | emulator from COMMON {:.1}, to COMMON {:.1}", f(c[0]), f(c[1]), f(c[2]), f(c[3]))
+}
+
 unsafe extern "system" fn real_barrier(this: *mut c_void, n: u32, b: *const u8) {
+    if ARMED.load(Ordering::Relaxed) && !b.is_null() && n > 0 && n < 65536 {
+        let title = IN_TITLE_BARRIER.with(|c| c.get());
+        let sl = unsafe { core::slice::from_raw_parts(b, n as usize * 32) };
+        common_count(sl, title, &mut COMMON.lock().unwrap_or_else(|e| e.into_inner()));
+    }
     if ARMED.load(Ordering::Relaxed) && !IN_TITLE_BARRIER.with(|c| c.get()) {
         EMU_BARRIER_CALLS.fetch_add(1, Ordering::Relaxed);
         EMU_BARRIER_COUNT.fetch_add(n, Ordering::Relaxed);
@@ -697,6 +782,7 @@ unsafe fn close_list(list: *mut c_void) {
             unsafe { core::mem::transmute(real(54)) };
         unsafe { end(list, heap as *mut c_void, QUERY_TIMESTAMP, slot) };
         evs.push(Ev { slot, label: Label { a: 0, b: 0, compute: false }, kind: KIND_CLOSE, count: false, frame: FRAME_IX.load(Ordering::Relaxed) });
+        s.closed.insert(list as usize, (evs[0].slot, slot, evs.len() >= 2));
         let mut slots: Vec<u32> = evs.iter().map(|e| e.slot).collect();
         slots.sort_unstable();
         let mut i = 0;
@@ -784,6 +870,26 @@ unsafe fn report(s: &mut State) {
         q.0 += t1 - t0;
         q.1 += 1;
     }
+    let qfreq = crate::gpuprof_q::freqs();
+    let mut tl: Vec<crate::gpuprof_tl::SubT> = Vec::new();
+    for r in &s.subs {
+        let (h, t) = (ts(r.s0), ts(r.s1));
+        if h == 0 || t < h {
+            continue;
+        }
+        let mut st = crate::gpuprof_tl::SubT { ty: r.ty, queue: r.queue, head: h, tail: t, lists: Vec::new(), n_lists: r.n_lists, missing: r.missing, cpu: r.cpu, head_qpc: None };
+        for &(a, b) in &r.lists {
+            let (ta, tb) = (ts(a), ts(b));
+            if ta == 0 || tb < ta {
+                st.missing += 1;
+            } else {
+                st.lists.push((ta, tb));
+            }
+        }
+        let gf = qfreq.iter().find(|e| e.0 == r.ty).map_or(freq, |e| e.1);
+        st.head_qpc = s.calib.get(&r.queue).and_then(|c| crate::gpuprof_tl::gpu_to_qpc(&c.1, gf, crate::frame::qpf(), h));
+        tl.push(st);
+    }
     unsafe { unmap(s.rb as *mut c_void, 0, core::ptr::null()) };
     let covered = union_ticks(&mut iv);
     let mut rows: Vec<_> = agg.into_iter().collect();
@@ -800,6 +906,10 @@ unsafe fn report(s: &mut State) {
     out.push_str(&format!("[gpuprof]   {}\n", inject_text(&i0, &i1, nf)));
     out.push_str(&format!("[gpuprof]   {}\n", ops_summary(&rows, &per, nf, EMU_BARRIER_CALLS.load(Ordering::Relaxed), EMU_BARRIER_COUNT.load(Ordering::Relaxed))));
     out.push_str(&format!("[gpuprof]   {}\n", queue_summary(&ecl_q, &list_q, ecl_bad, &per, nf, if hi > lo { hi - lo } else { 0 }, covered)));
+    for l in crate::gpuprof_tl::analyse(&mut tl, tick_ms, crate::frame::qpf(), nf).lines() {
+        out.push_str(&format!("[gpuprof]   {l}\n"));
+    }
+    out.push_str(&format!("[gpuprof]   {}\n", common_text(&COMMON.lock().unwrap_or_else(|e| e.into_inner()), nf)));
     out.push_str(&format!("[gpuprof]   {}\n", crate::gpuprof_q::freq_note(&crate::gpuprof_q::freqs(), freq)));
     out.push_str(&format!("[gpuprof]   {}\n", crate::gpuprof_q::report_line()));
     if let Some((wf, wt, med)) = worst_frame(&per_frame) {
@@ -913,6 +1023,14 @@ pub fn on_present() {
             if s.presents >= start + frames() {
                 ARMED.store(false, Ordering::Relaxed);
                 crate::gpuprof_q::disarm();
+                let qs: Vec<usize> = s.calib.keys().copied().collect();
+                for q in qs {
+                    if let Some(c) = unsafe { crate::gpuprof_tl::calibrate(q as *mut c_void) } {
+                        if let Some(e) = s.calib.get_mut(&q) {
+                            e.1.push(c);
+                        }
+                    }
+                }
                 INJ.lock().unwrap_or_else(|e| e.into_inner()).1 = crate::inject::totals();
                 s.window = None;
                 s.finalize_at = Some(s.presents + SETTLE);
@@ -934,6 +1052,11 @@ pub fn on_present() {
             s.done_ty.clear();
             s.spans.clear();
             s.open.clear();
+            s.closed.clear();
+            s.subs.clear();
+            s.sub_open.clear();
+            s.calib.clear();
+            *COMMON.lock().unwrap_or_else(|e| e.into_inner()) = [0; 4];
             unsafe { sweep_retired(s) };
             SLOT.store(0, Ordering::Relaxed);
             FRAME_IX.store(0, Ordering::Relaxed);
@@ -1105,6 +1228,19 @@ mod tests {
 
     unsafe extern "system" fn rec_dsv(_t: *mut c_void, h: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const c_void) {
         SEEN.lock().unwrap().extend([h as u64, flags as u64, depth.to_bits() as u64, stencil as u64, n as u64, rects as u64]);
+    }
+
+    #[test]
+    fn common_count_splits_title_and_emulator_transitions() {
+        let mut b = vec![0u8; 96];
+        b[24..28].copy_from_slice(&4u32.to_le_bytes());
+        b[32 + 20..32 + 24].copy_from_slice(&0x80u32.to_le_bytes());
+        b[64..68].copy_from_slice(&1u32.to_le_bytes());
+        let mut c = [0u64; 4];
+        common_count(&b, true, &mut c);
+        common_count(&b[..32], false, &mut c);
+        assert_eq!(c, [1, 1, 1, 0]);
+        assert!(common_text(&c, 2).contains("title from COMMON 0.5, to COMMON 0.5 | emulator from COMMON 0.5, to COMMON 0.0"));
     }
 
     #[test]
