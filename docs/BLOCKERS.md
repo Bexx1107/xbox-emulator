@@ -1468,3 +1468,8 @@ Headless runs straight into each title's test scene, on the staged release of 11
   - The desc is remembered, so every later identical creation runs synchronously and returns the real HRESULT to the title.
 - What cannot be done: undo the S_OK that went to the title for the first creation of such a desc. The only fully truthful fix is to never return early. That is TOMBOX_PSO_ASYNC=0, which costs the hitch the async path exists to hide.
 - Root cause of the Trackmania failures: the root signatures in those builds lacked the translator's bindless alias spaces (space 4200000/4300000, t65 x62) that the pixel shader binds. No "aliased for the translator's bindless spaces" line appears in those runs, but it does in the passing run 180534 with the same translator. Root signatures created directly on the real device skip cbv_raw's wrapper hook. The patch for real_create_root_signature, which applies idempotent aliasing there and notes the final blob for the pso_lib key, was handed to the device_wrap.rs owner.
+
+## XGameSave gaps (compat-common gdk/save.rs) - 2026-11-23
+- OPEN: slots 30-32 of XGameSaveImpl (XGameSaveFilesGetFolderWithUiAsync, XGameSaveFilesGetFolderWithUiResult, XGameSaveFilesGetRemainingQuota) are not served and fall to the stub table. A title that uses XGameSaveFiles gets stubs. Trackmania does not call them (r32e run).
+- OPEN: closed provider, container and update handles are not tracked. A call with a handle after its Close dereferences freed memory instead of returning E_GS_HANDLE_EXPIRED (0x8083000D). Leonida de67135 tracks live handles and returns that code.
+- DONE: every served save slot logs its first call once ("first call (slot N)"), so a run shows which save path a title uses.
