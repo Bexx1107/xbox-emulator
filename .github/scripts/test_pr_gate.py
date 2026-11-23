@@ -55,12 +55,17 @@ class AddedLinesTests(unittest.TestCase):
                 "pub const OFF: u64 = 0x0014_5e90;\n"
                 "const SMALL: usize = 0x1f0;\n"
                 "const PADDED: u64 = 0x0000_00ff;\n"
-                "const WORD: u32 = 0x8007_0057;\n")
+                "const WORD: u32 = 0x8007_0057;\n"
+                "const SENTINEL: usize = 0x5842_4F58_4F45_4D11;\n"
+                "const MASK: u64 = 0xffff_ffff_ff00_0000;\n"
+                "const NINE: u64 = 0x1_2345_6789;\n"
+                "const SEVEN: usize = 0x0001_2345_67;\n")
         self.commit("crates/compat/x/src/a.rs", body)
         self.commit("crates/other/src/a.rs", body)
-        why = "title RVA-style constant (usize/u64 with 6+ hex digits) in a compat crate"
+        why = "title RVA-style constant (usize/u64 with 6-8 significant hex digits) in a compat crate"
         self.assertEqual(pr_gate.check_lines("HEAD~2", "HEAD", ["crates/compat/x/src/a.rs", "crates/other/src/a.rs"]),
-                         [("crates/compat/x/src/a.rs:1", why), ("crates/compat/x/src/a.rs:2", why)])
+                         [("crates/compat/x/src/a.rs:1", why), ("crates/compat/x/src/a.rs:2", why),
+                          ("crates/compat/x/src/a.rs:9", why)])
 
     def test_added_rust_comment_lines_are_rejected(self):
         self.commit("c.rs", "fn c() {}\n// note\n    //! doc\nlet u = \"http://x\";\n")

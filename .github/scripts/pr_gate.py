@@ -94,8 +94,8 @@ def check_lines(base, head, paths):
                     errors.append(("%s:%d" % (p, n), why))
             if RVA_PATH.search(p):
                 m = RVA_CONST.search(text)
-                if m and len(m.group(2).replace("_", "").lstrip("0")) >= 6:
-                    errors.append(("%s:%d" % (p, n), "title RVA-style constant (usize/u64 with 6+ hex digits) in a compat crate"))
+                if m and 6 <= len(m.group(2).replace("_", "").lstrip("0")) <= 8:
+                    errors.append(("%s:%d" % (p, n), "title RVA-style constant (usize/u64 with 6-8 significant hex digits) in a compat crate"))
             if rule and rule.search(text) and not (n == 1 and text.startswith("#!")) and not COMMENT_OK.search(text):
                 errors.append(("%s:%d" % (p, n), "comment line (the project keeps code free of comment lines)"))
     return errors
