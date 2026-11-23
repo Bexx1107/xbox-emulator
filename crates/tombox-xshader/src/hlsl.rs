@@ -4647,12 +4647,6 @@ impl<'a> Emitter<'a> {
         let hres = |e: String| -> String {
             let mut e = e;
             if ins.enc == Enc::Vop3 {
-                e = match ins.aux.imm2 {
-                    1 => format!("(({e}) * 2.0)"),
-                    2 => format!("(({e}) * 4.0)"),
-                    3 => format!("(({e}) * 0.5)"),
-                    _ => e,
-                };
                 if ins.aux.imm != 0 {
                     e = format!("saturate({e})");
                 }
@@ -4689,7 +4683,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             let e = format!("tb_t16({op}u, {x})");
-            if ins.enc == Enc::Vop3 && (ins.aux.imm2 != 0 || ins.aux.imm != 0) {
+            if ins.enc == Enc::Vop3 && ins.aux.imm != 0 {
                 return self.wv(&d, &hres(format!("f16tof32({e})")));
             }
             return self.wv(&d, &e);
