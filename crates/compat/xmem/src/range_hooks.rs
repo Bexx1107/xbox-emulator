@@ -6,6 +6,11 @@ use crate::sys::MEM_RELEASE;
 use compat_common::record;
 
 const M: &str = "xmem";
+const MEM_DECOMMIT: u32 = 0x4000;
+const STATUS_SUCCESS: i32 = 0;
+const STATUS_UNSUCCESSFUL: i32 = 0xc000_0001u32 as i32;
+const STATUS_INVALID_PARAMETER: i32 = 0xc000_000du32 as i32;
+const STATUS_FREE_VM_NOT_AT_BASE: i32 = 0xc000_009fu32 as i32;
 
 static UNMAP_ORIG: [AtomicUsize; MEM_SLOTS] = [const { AtomicUsize::new(0) }; MEM_SLOTS];
 static UNMAPEX_ORIG: [AtomicUsize; MEM_SLOTS] = [const { AtomicUsize::new(0) }; MEM_SLOTS];
@@ -87,6 +92,43 @@ unsafe extern "system" fn ntprotect_w<const I: usize>(process: usize, base: *mut
     st
 }
 
+unsafe fn ntfree_inner(slot: usize, process: usize, base: *mut usize, size: *mut usize, kind: u32) -> i32 {
+    let addr = *base;
+    let len = *size;
+    if kind & MEM_RELEASE != 0 {
+        let extent = crate::phys::region_extent(addr);
+        if let Some(r) = crate::phys::release_region(addr, len) {
+            if r != 0 {
+                if let Some(total) = extent {
+                    *base = addr;
+                    *size = total;
+                }
+                return STATUS_SUCCESS;
+            }
+            return if len != 0 { STATUS_INVALID_PARAMETER } else { STATUS_UNSUCCESSFUL };
+        }
+        if crate::phys::owns(addr) {
+            return STATUS_FREE_VM_NOT_AT_BASE;
+        }
+    } else if kind & MEM_DECOMMIT != 0 {
+        if let Some(r) = crate::phys::decommit_owned(addr, len) {
+            if r != 0 {
+                if let Some((rbase, rend)) = crate::phys::owned_extent(addr) {
+                    let eff = if len == 0 { rend.saturating_sub(addr) } else { len };
+                    let lo = addr & !0xfff;
+                    let hi = addr.saturating_add(eff).saturating_add(0xfff) & !0xfff;
+                    *base = lo.max(rbase);
+                    *size = hi.min(rend).saturating_sub(*base);
+                }
+                return STATUS_SUCCESS;
+            }
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+    let f = core::mem::transmute::<usize, unsafe extern "system" fn(usize, *mut usize, *mut usize, u32) -> i32>(NTFREE_ORIG[slot].load(Ordering::Acquire));
+    f(process, base, size, kind)
+}
+
 unsafe extern "system" fn ntfree_w<const I: usize>(process: usize, base: *mut usize, size: *mut usize, kind: u32) -> i32 {
     let f = core::mem::transmute::<usize, unsafe extern "system" fn(usize, *mut usize, *mut usize, u32) -> i32>(NTFREE_ORIG[I].load(Ordering::Acquire));
     if process == 0 || !is_self(process) || base.is_null() || size.is_null() {
@@ -95,7 +137,7 @@ unsafe extern "system" fn ntfree_w<const I: usize>(process: usize, base: *mut us
     let addr = *base;
     let len = *size;
     let (lo, hi) = crate::epoch::bump_free(addr, len);
-    let st = crate::title_acct::track_free_nt(addr, len, kind, || f(process, base, size, kind));
+    let st = crate::title_acct::track_free_nt(addr, len, kind, || ntfree_inner(I, process, base, size, kind));
     if st >= 0 {
         let out_addr = *base;
         let out_len = *size;
@@ -178,7 +220,6 @@ mod tests {
     use crate::epoch::{TomboxAddressSpaceChangedSince, TomboxAddressSpaceEpoch};
     use crate::sys::{GetCurrentProcess, VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 
-    const MEM_DECOMMIT: u32 = 0x4000;
     const PAGE_READONLY: u32 = 0x02;
 
     #[link(name = "kernel32")]
@@ -321,5 +362,58 @@ mod tests {
         unsafe {
             assert_ne!(VirtualFree(other as *mut _, 0, MEM_RELEASE), 0);
         }
+    }
+
+    #[test]
+    fn nt_free_virtual_memory_handles_xmem_physical_region() {
+        let _g = crate::phys::map_test_guard();
+        let nt_real = resolve_proc(b"ntdll.dll\0", b"NtFreeVirtualMemory\0");
+        let w = rule(b"ntdll.dll", Some(b"NtFreeVirtualMemory"), nt_real).expect("NtFreeVirtualMemory hook");
+        let ntf: unsafe extern "system" fn(usize, *mut usize, *mut usize, u32) -> i32 = unsafe { core::mem::transmute(w) };
+        let valloc: unsafe extern "system" fn(usize, usize, u32, u32) -> usize = unsafe { core::mem::transmute(crate::hooks::valloc_wrapper()) };
+
+        let page = crate::phys::PAGE;
+        let va = crate::virt::XMemVirtualAlloc(core::ptr::null_mut(), 4 * page, MEM_RESERVE | crate::virt::XMEM_64K_PAGES, 0, PAGE_READWRITE) as usize;
+        assert_ne!(va, 0);
+        let mut n = 1usize;
+        let mut pfn = [0u64; 1];
+        assert_eq!(unsafe { crate::virt::XMemAllocatePhysicalPages(crate::virt::XMEM_64K_PAGES as u64, &mut n, pfn.as_mut_ptr()) }, 1);
+        assert_eq!(unsafe { crate::virt::XMemMapPhysicalPages(va as *mut _, 1, pfn.as_mut_ptr()) } as usize, va);
+        assert_eq!(unsafe { valloc(va + page + 0x1000, 0x2000, MEM_COMMIT, PAGE_READWRITE) }, va + page + 0x1000);
+
+        let me = unsafe { GetCurrentProcess() } as usize;
+        let mut base = va + page + 0x1000;
+        let mut size = 0x1000usize;
+        let s0 = TomboxAddressSpaceEpoch();
+        assert_eq!(unsafe { ntf(me, &mut base, &mut size, MEM_DECOMMIT) }, STATUS_SUCCESS);
+        assert_eq!(base, va + page + 0x1000);
+        assert_eq!(size, 0x1000);
+        assert_ne!(TomboxAddressSpaceChangedSince(s0, va + page + 0x1000, va + page + 0x2000), 0);
+        let mut info = crate::virt::XMemBasicInformation::default();
+        unsafe { crate::virt::XMemVirtualQuery(GetCurrentProcess(), (va + page + 0x1000) as *const _, &mut info) };
+        assert_eq!(info.state, MEM_RESERVE);
+
+        let mut bad_base = va + page;
+        let mut bad_size = 0usize;
+        assert_eq!(unsafe { ntf(me, &mut bad_base, &mut bad_size, MEM_RELEASE) }, STATUS_FREE_VM_NOT_AT_BASE);
+        assert_eq!(crate::phys::owned_extent(va), Some((va, va + 4 * page)));
+
+        let mut nz_base = va;
+        let mut nz_size = 0x1000usize;
+        assert_eq!(unsafe { ntf(me, &mut nz_base, &mut nz_size, MEM_RELEASE) }, STATUS_INVALID_PARAMETER);
+        assert_eq!(crate::phys::owned_extent(va), Some((va, va + 4 * page)));
+
+        base = va;
+        size = 0;
+        let s1 = TomboxAddressSpaceEpoch();
+        assert_eq!(unsafe { ntf(me, &mut base, &mut size, MEM_RELEASE) }, STATUS_SUCCESS);
+        assert_eq!(base, va);
+        assert_eq!(size, 4 * page);
+        assert_ne!(TomboxAddressSpaceChangedSince(s1, va, va + 4 * page), 0);
+        assert_eq!(crate::phys::owned_extent(va), None);
+        for i in 0..4 {
+            assert_eq!(crate::phys::released(va + i * page), Ok(()));
+        }
+        assert_eq!(unsafe { crate::virt::XMemFreePhysicalPages(1, pfn.as_mut_ptr()) }, 1);
     }
 }
